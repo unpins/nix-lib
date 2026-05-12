@@ -119,6 +119,11 @@
 
       applyPackageFix = pkgs: name: drv:
         let
+          # `p` is the package set we want fixes built against. For
+          # native callers (linux/darwin) pkgs is plain nixpkgs and we
+          # want `pkgs.pkgsStatic`. For windows callers (see
+          # `applyMingwFix` below) `pkgs` is already the cross set and
+          # this branch is unused.
           p = pkgs.pkgsStatic;
 
           # lm_sensors propagates perl + bash for sensors-detect (a
@@ -153,12 +158,87 @@
           fixHtopLinux = h: h.override {
             lm_sensors = slimLmSensors p.lm_sensors;
           };
+
         in
         if name == "htop" then
           if p.stdenv.hostPlatform.isDarwin then fixHtopDarwin drv
           else if p.stdenv.hostPlatform.isLinux then fixHtopLinux drv
           else drv
         else drv;
+
+      # ---------------------------------------------------------------
+      # Windows static cross set.
+      #
+      # `mingwStaticCross pkgs` returns `pkgs.pkgsCross.mingwW64` with
+      # an overlay that swaps `stdenv` for `makeStaticLibraries stdenv`
+      # — but ONLY when the evaluated package set's host is mingw.
+      # That conditional is load-bearing: `pkgsBuildHost` of the cross
+      # set is linux (the build platform), so the overlay's then-branch
+      # never fires there and `pkgsBuildHost.stdenv` keeps its
+      # cache.nixos.org hash. Same goes for `cc`/`bintools` inside the
+      # mingw stdenv — `makeStaticLibraries` only wraps mkDerivation,
+      # leaving cc untouched, so the cached cross gcc stays referenced
+      # verbatim and never rebuilds.
+      #
+      # The end result mirrors `pkgs.pkgsStatic` on linux/darwin: every
+      # package transparently builds static archives without consumer
+      # configuration. Problem packages get a per-package branch in
+      # `applyMingwFix` below.
+      #
+      # Why not `pkgsCross.mingwW64.pkgsStatic`? It re-instantiates
+      # with `crossSystem.isStatic = true`, picking
+      # mingw-w64-static/mcfgthread-static and rebuilding gcc against
+      # those — even though the static variants of those libs produce
+      # byte-identical outputs to the shared variants. ~30 min of
+      # toolchain rebuild that this overlay-based set sidesteps.
+      # ---------------------------------------------------------------
+
+      mingwStaticCross = pkgs: pkgs.pkgsCross.mingwW64.appendOverlays [
+        (self: super:
+          if super.stdenv.hostPlatform.isMinGW or false
+          then { stdenv = super.stdenvAdapters.makeStaticLibraries super.stdenv; }
+          else { })
+      ];
+
+      # ---------------------------------------------------------------
+      # Per-package fixes applied on top of `mingwStaticCross`.
+      #
+      # Most packages get the unmodified static-cross drv. Only
+      # packages whose upstream nixpkgs definition assumes a non-mingw
+      # target (filename suffix, runtime libs not in propagated inputs,
+      # libtool not forcing `-all-static`, ...) need a branch here.
+      # ---------------------------------------------------------------
+
+      applyMingwFix = pkgs: name:
+        let
+          cross = mingwStaticCross pkgs;
+
+          # jq:
+          # - buildInputs += windows.pthreads. jq #includes <pthread.h>
+          #   on mingw; mingw-w64 ships winpthreads as a separate
+          #   package not in jq's default propagatedBuildInputs.
+          # - makeFlags += LDFLAGS=-all-static so libtool's final link
+          #   resolves only against `.a` archives. Without it,
+          #   `windows.pthreads` ships both libwinpthread.a and
+          #   libwinpthread.dll.a; the linker prefers the .dll.a and
+          #   nixpkgs' DLL-link hook then copies the matching .dll
+          #   next to jq.exe — failing the single-binary contract.
+          # - postFixup: nixpkgs jq.nix hard-codes `$bin/bin/jq`; on
+          #   mingw the file is jq.exe, so sed bails on no input.
+          fixJq = j: j.overrideAttrs (old: {
+            buildInputs = (old.buildInputs or []) ++ [ cross.windows.pthreads ];
+            makeFlags = (old.makeFlags or []) ++ [ "LDFLAGS=-all-static" ];
+            postFixup = ''
+              remove-references-to \
+                -t "$dev" -t "$man" -t "$doc" \
+                "$bin/bin/${name}.exe"
+            '';
+          });
+
+          raw = cross.${name};
+        in
+        if name == "jq" then fixJq raw
+        else raw;
 
       # ---------------------------------------------------------------
       # Cross-prefix discovery. Both pkgsStatic and pkgsCross.mingwW64
@@ -171,13 +251,16 @@
       crossPrefix = pkgs: "${pkgs.stdenv.hostPlatform.config}-";
 
       # ---------------------------------------------------------------
-      # Cross-mingw single-binary wrapper. Forces --disable-shared
+      # Legacy cross-mingw single-binary wrapper used by hand-rolled
+      # flakes (curl, ffmpeg, vim). Forces --disable-shared
       # --enable-static at configure-time and -all-static at make-time.
       #
-      # Why not pkgsCross.mingwW64.pkgsStatic.<pkg>? It regenerates the
-      # host triple as `x86_64-w64-windows-gnu` (config.sub rejects),
-      # and `crossSystem.isStatic = true` rebuilds the entire xgcc
-      # without a binary cache hit.
+      # New code should prefer `mkStandaloneFlake { ...; windows = true; }`,
+      # which uses `pkgsCross.mingwW64.pkgsStatic.<pkg>` directly (with
+      # the triple round-trip fixed). That pays a one-time xgcc rebuild
+      # populating unpins.cachix.org, then every subsequent build is a
+      # cache hit — same model as the darwin pkgsStatic toolchain. This
+      # helper exists only until those legacy flakes migrate.
       #
       # `staticDeps` is passed via .override so libtool sees the .a in
       # the dep's lib output (NOT applied as overlay — would touch the
@@ -245,6 +328,7 @@
         , name
         , build ? null
         , binName ? name
+        , windows ? false
         , package_data ? true
         , bootstrap_naming ? false
         , own_software ? false
@@ -256,12 +340,28 @@
             then (pkgs: applyPackageFix pkgs name pkgs.pkgsStatic.${name})
             else build;
           stripped = pkgs: (rawBuild pkgs).overrideAttrs (_: { stripAllList = [ "bin" ]; });
+
+          # Windows build runs on x86_64-linux runners. allowUnsupportedSystem
+          # because most nixpkgs `meta.platforms` lists exclude mingw,
+          # so the cross-built drv would otherwise be filtered out.
+          # We use *plain* pkgsCross.mingwW64 (cached) and apply
+          # `makeStaticLibraries` as a stdenv adapter per-package —
+          # see `applyMingwFix` for the rationale.
+          windowsPkgs = import nixpkgs {
+            system = "x86_64-linux";
+            config.allowUnsupportedSystem = true;
+          };
+          windowsCross = applyMingwFix windowsPkgs name;
+          windowsPkg = packageWithMan windowsPkgs name windowsCross;
         in {
           packages = forAllNative (system:
             let pkgs = nixpkgsFor.${system}; in
             { default = stripped pkgs; }
             // nixpkgs.lib.optionalAttrs (system == "aarch64-darwin") {
               "darwin-x86_64" = stripped pkgs.pkgsCross.x86_64-darwin;
+            }
+            // nixpkgs.lib.optionalAttrs (windows && system == "x86_64-linux") {
+              "windows-x86_64" = windowsPkg;
             });
 
           apps = forAllNative (system: {
