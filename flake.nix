@@ -310,6 +310,20 @@
         };
 
       # ---------------------------------------------------------------
+      # Strip-only for single-output drvs; symlinkJoin (bin + man) for
+      # multi-output. Either way the resulting drv has a single output
+      # so `nix build` creates the bare `result` symlink that
+      # action-build's verify step looks for at `result/bin/<pkg>`.
+      # Without this, multi-output packages like jq end up as
+      # `result-bin`/`result-man` and the verify step bails on
+      # `readlink -f result/bin/jq` returning empty.
+      # ---------------------------------------------------------------
+      strippedOrJoined = pkgs: name: drv:
+        if (drv.outputs or [ "out" ]) == [ "out" ]
+        then drv.overrideAttrs (_: { stripAllList = [ "bin" ]; })
+        else packageWithMan pkgs name drv;
+
+      # ---------------------------------------------------------------
       # Standalone-binary flake template. Returns { packages, apps }
       # with the same shape every unpins/* small package uses:
       #   packages.<system>.default            = pkgsStatic build
@@ -339,7 +353,7 @@
             if build == null
             then (pkgs: applyPackageFix pkgs name pkgs.pkgsStatic.${name})
             else build;
-          stripped = pkgs: (rawBuild pkgs).overrideAttrs (_: { stripAllList = [ "bin" ]; });
+          stripped = pkgs: strippedOrJoined pkgs name (rawBuild pkgs);
 
           # Windows build runs on x86_64-linux runners. allowUnsupportedSystem
           # because most nixpkgs `meta.platforms` lists exclude mingw,
