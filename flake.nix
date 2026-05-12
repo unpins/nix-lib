@@ -96,43 +96,23 @@
         then drv else drv.override { shared = false; };
 
       # ---------------------------------------------------------------
-      # Darwin "almost-static" pkgs set. pkgsStatic doesn't work on
-      # Darwin (libSystem must stay dynamic, but pkgsStatic adds
-      # `-static` LDFLAG that breaks autoconf link probes). Instead
-      # we use the regular darwin pkgs and patch individual libraries
-      # whose default build leaves a .dylib that the linker would
-      # pick over the .a.
+      # Static-binary patches. Overlays applied to every pkgs view
+      # `mkStandaloneFlake` hands to consumer flakes — so a package
+      # flake can write `pkgs.pkgsStatic.<name>` and just work, even
+      # for packages whose stock pkgsStatic build is broken or pulls
+      # in unwanted runtime dependencies.
       #
-      # Each override below targets a library whose static-only knob
-      # differs from the autoconf default (so staticOnlyAuto silently
-      # fails). Grows as we hit new cases. Use in the darwin branch
-      # of standalone flakes (htop, tmux, vim, …); linux/cross-mingw
-      # keep using pkgsStatic.
+      # Adding an entry here = adopting a workaround once, instead of
+      # repeating it in every consumer's `build` function. Each entry
+      # documents what it patches and why.
       # ---------------------------------------------------------------
 
-      pkgsDarwinStatic = pkgs: pkgs.appendOverlays [
-        # ncurses knob is --with-shared / --without-shared, not the
-        # autoconf default --enable-shared / --disable-shared.
-        # nixpkgs maps `enableStatic = true` to --without-shared.
-        (_: prev: {
-          ncurses = prev.ncurses.override { enableStatic = true; };
-        })
-      ];
-
-      # ---------------------------------------------------------------
-      # Per-library "slim" overlays. Each removes propagated bloat or
-      # auxiliary tools we don't ship in a standalone-binary package.
-      # They're functions `pkgs -> pkgs` so consumers can compose them
-      # by chaining (e.g. `slimLmSensors pkgs |> pkgsDarwinStatic` if
-      # ever needed). Grows as we hit packages with similar issues.
-      # ---------------------------------------------------------------
-
-      # lm_sensors propagates perl + bash because sensors-detect (a
-      # Perl script) needs them, and ships that script + a config
-      # converter in $out/bin. Anything that links libsensors but
-      # doesn't ship the userland tools (htop, glances, conky, …)
-      # wants those gone.
-      slimLmSensors = pkgs: pkgs.appendOverlays [
+      staticPatches = [
+        # lm_sensors propagates perl + bash because sensors-detect (a
+        # Perl script) needs them, and ships that script + a config
+        # converter in $out/bin. Anything that links libsensors but
+        # doesn't ship the userland tools (htop, glances, conky, …)
+        # wants those gone. Top-level overlay also affects pkgsStatic.
         (_: prev: {
           lm_sensors = prev.lm_sensors.overrideAttrs (old: {
             propagatedBuildInputs = prev.lib.filter
@@ -144,7 +124,36 @@
             '';
           });
         })
+
+        # Darwin: pkgsStatic adds `-static` to NIX_LDFLAGS, which
+        # breaks autoconf link probes because libSystem must stay
+        # dynamic (no libSystem.a exists). Per-package `--disable-shared`
+        # is applied independently by each derivation, so stripping
+        # only the global `-static` should leave us with: internal
+        # deps `.a`-only, libSystem dynamic, configure probes pass,
+        # final binary mostly-static.
+        #
+        # Experimental and applied per-package (htop) to keep cache
+        # hits for everything else. If this works we generalise via
+        # stdenvAdapters.addAttrsToDerivation on pkgsStatic.stdenv.
+        (_: prev: prev.lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
+          pkgsStatic = prev.pkgsStatic.appendOverlays [
+            (_: pprev: {
+              htop = pprev.htop.overrideAttrs (old: {
+                preBuild = (old.preBuild or "") + ''
+                  export NIX_LDFLAGS="''${NIX_LDFLAGS//-static/}"
+                '';
+              });
+            })
+          ];
+        })
       ];
+
+      # Applies `staticPatches` to a nixpkgs view. `mkStandaloneFlake`
+      # does this automatically; expose it for the rare consumer that
+      # builds its own pkgs (e.g. unpin's own flake with extra cross
+      # overlays).
+      applyStaticPatches = pkgs: pkgs.appendOverlays staticPatches;
 
       # ---------------------------------------------------------------
       # Cross-prefix discovery. Both pkgsStatic and pkgsCross.mingwW64
@@ -220,9 +229,10 @@
       #   apps.<system>.default                = `nix run` entry
       #
       # `name` is the nixpkgs attribute and the resulting bin name. Use
-      # `binName` when they differ. Override `build` for darwin dep
-      # gymnastics; the default `pkgs.pkgsStatic.${name}` is fine for
-      # everything with no autoconf link probes.
+      # `binName` when they differ. The pkgs handed to `build` (or used
+      # by the default `pkgs.pkgsStatic.${name}`) has `staticPatches`
+      # applied — packages with cross-darwin link probe issues
+      # (htop, …) or runtime bloat (lm_sensors → perl) just work.
       # ---------------------------------------------------------------
 
       mkStandaloneFlake =
@@ -235,7 +245,8 @@
         , own_software ? false
         }:
         let
-          nixpkgsFor = forAllNative (system: import nixpkgs { inherit system; });
+          nixpkgsFor = forAllNative (system:
+            applyStaticPatches (import nixpkgs { inherit system; }));
           rawBuild = if build == null then (pkgs: pkgs.pkgsStatic.${name}) else build;
           stripped = pkgs: (rawBuild pkgs).overrideAttrs (_: { stripAllList = [ "bin" ]; });
         in {
