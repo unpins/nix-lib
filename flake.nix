@@ -140,12 +140,11 @@
           # link probes (libSystem.a doesn't exist) → configure fails
           # on `checking for access... no` / `NaN support... no`.
           # Filter those flags out of configureFlags so htop doesn't
-          # auto-add -static; ncurses needs its own knob to produce
-          # static-only output (--with-shared/--without-shared, not
-          # the autoconf default) so the final link picks .a.
-          fixHtopDarwin = h: (h.override {
-            ncurses = p.ncurses.override { enableStatic = true; };
-          }).overrideAttrs (old: {
+          # auto-add -static. ncurses doesn't need a separate override
+          # — pkgsStatic.ncurses in nixpkgs already passes
+          # `--without-shared` (verified: its default configureFlags
+          # start with --without-shared, and its output ships only .a).
+          fixHtopDarwin = h: h.overrideAttrs (old: {
             configureFlags = p.lib.filter
               (f: f != "--enable-static" && f != "--disable-shared")
               (old.configureFlags or [ ]);
