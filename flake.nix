@@ -96,74 +96,70 @@
         then drv else drv.override { shared = false; };
 
       # ---------------------------------------------------------------
-      # Static-binary patches. Overlays applied to every pkgs view
-      # `mkStandaloneFlake` hands to consumer flakes — so a package
-      # flake can write `pkgs.pkgsStatic.<name>` and just work, even
-      # for packages whose stock pkgsStatic build is broken or pulls
-      # in unwanted runtime dependencies.
+      # Per-package fixes applied to pkgsStatic-<name> derivations.
       #
-      # Adding an entry here = adopting a workaround once, instead of
-      # repeating it in every consumer's `build` function. Each entry
-      # documents what it patches and why.
+      # Why not an overlay? `pkgs.appendOverlays` (and even
+      # `pkgsStatic.appendOverlays`) invalidates `pkgsBuildHost.stdenv`
+      # → cascade rebuild of compiler-rt-libc-static, ninja, python3
+      # in pkgsStatic-darwin (none of which are in cache.nixos.org for
+      # that variant; Hydra only builds pkgsStatic-linux). 30-60 min
+      # of darwin CI just to add `--enable-static` to a single
+      # nativeBuildInput.
+      #
+      # `drv.override` and `drv.overrideAttrs` applied per-package
+      # don't touch the package set — they produce a new drv whose
+      # build inputs are *still* the original cached pkgsStatic
+      # stdenv. The drv itself rebuilds (input hash changed), but
+      # everything below it (toolchain) stays cached.
+      #
+      # `applyPackageFix pkgs name drv` returns `drv` with the
+      # adjustments needed for `name`. Add a branch when adopting a
+      # new package whose pkgsStatic build is broken on some host.
       # ---------------------------------------------------------------
 
-      staticPatches = [
-        # lm_sensors propagates perl + bash because sensors-detect (a
-        # Perl script) needs them, and ships that script + a config
-        # converter in $out/bin. Anything that links libsensors but
-        # doesn't ship the userland tools (htop, glances, conky, …)
-        # wants those gone. Top-level overlay also affects pkgsStatic.
-        (_: prev: {
-          lm_sensors = prev.lm_sensors.overrideAttrs (old: {
-            propagatedBuildInputs = prev.lib.filter
-              (p: !builtins.elem (p.pname or "") [ "perl" "bash" ])
-              (old.propagatedBuildInputs or []);
+      applyPackageFix = pkgs: name: drv:
+        let
+          p = pkgs.pkgsStatic;
+
+          # lm_sensors propagates perl + bash for sensors-detect (a
+          # Perl script we don't ship) and installs the script in
+          # $out/bin. Trim both.
+          slimLmSensors = ls: ls.overrideAttrs (old: {
+            propagatedBuildInputs = p.lib.filter
+              (i: !builtins.elem (i.pname or "") [ "perl" "bash" ])
+              (old.propagatedBuildInputs or [ ]);
             postInstall = (old.postInstall or "") + ''
               rm -f $out/bin/sensors-detect $out/bin/sensors-conf-convert
               rm -f $out/sbin/sensors-detect $out/sbin/sensors-conf-convert
             '';
           });
-        })
 
-        # Darwin pkgsStatic.htop fix.
-        #
-        # Diagnosis (from config.log dump on a prior failed CI run):
-        # htop's own configure.ac interprets `--enable-static` as
-        # "pass -static globally to the linker", NOT the autoconf
-        # standard meaning ("build a static library"). htop doesn't
-        # use libtool, so there's no normal handler for the flag.
-        # Result: htop adds `-static` to CFLAGS and LDFLAGS, which
-        # then breaks the link probes against libSystem (libSystem.a
-        # does not exist on darwin), and configure aborts on
-        # `checking for access... no` / `NaN support... no`.
-        #
-        # nixpkgs's makeStaticLibraries adapter injects
-        # `--enable-static --disable-shared` into every package's
-        # configureFlags (assuming the autoconf standard meaning).
-        # For htop on darwin we filter those flags back out, so
-        # htop's configure doesn't auto-add `-static`. Internal deps
-        # still build static — ncurses needs its own knob
-        # (`enableStatic = true` → `--without-shared`) because its
-        # autoconf doesn't honour the standard `--disable-shared`.
-        (_: prev: prev.lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
-          pkgsStatic = prev.pkgsStatic.appendOverlays [
-            (_: pprev: {
-              ncurses = pprev.ncurses.override { enableStatic = true; };
-              htop = pprev.htop.overrideAttrs (old: {
-                configureFlags = pprev.lib.filter
-                  (f: f != "--enable-static" && f != "--disable-shared")
-                  (old.configureFlags or [ ]);
-              });
-            })
-          ];
-        })
-      ];
+          # htop's own configure.ac interprets `--enable-static` as
+          # "pass -static globally to the linker" (no libtool, no
+          # autoconf standard handler). On darwin that breaks libSystem
+          # link probes (libSystem.a doesn't exist) → configure fails
+          # on `checking for access... no` / `NaN support... no`.
+          # Filter those flags out of configureFlags so htop doesn't
+          # auto-add -static; ncurses needs its own knob to produce
+          # static-only output (--with-shared/--without-shared, not
+          # the autoconf default) so the final link picks .a.
+          fixHtopDarwin = h: (h.override {
+            ncurses = p.ncurses.override { enableStatic = true; };
+          }).overrideAttrs (old: {
+            configureFlags = p.lib.filter
+              (f: f != "--enable-static" && f != "--disable-shared")
+              (old.configureFlags or [ ]);
+          });
 
-      # Applies `staticPatches` to a nixpkgs view. `mkStandaloneFlake`
-      # does this automatically; expose it for the rare consumer that
-      # builds its own pkgs (e.g. unpin's own flake with extra cross
-      # overlays).
-      applyStaticPatches = pkgs: pkgs.appendOverlays staticPatches;
+          fixHtopLinux = h: h.override {
+            lm_sensors = slimLmSensors p.lm_sensors;
+          };
+        in
+        if name == "htop" then
+          if p.stdenv.hostPlatform.isDarwin then fixHtopDarwin drv
+          else if p.stdenv.hostPlatform.isLinux then fixHtopLinux drv
+          else drv
+        else drv;
 
       # ---------------------------------------------------------------
       # Cross-prefix discovery. Both pkgsStatic and pkgsCross.mingwW64
@@ -239,10 +235,10 @@
       #   apps.<system>.default                = `nix run` entry
       #
       # `name` is the nixpkgs attribute and the resulting bin name. Use
-      # `binName` when they differ. The pkgs handed to `build` (or used
-      # by the default `pkgs.pkgsStatic.${name}`) has `staticPatches`
-      # applied — packages with cross-darwin link probe issues
-      # (htop, …) or runtime bloat (lm_sensors → perl) just work.
+      # `binName` when they differ. The default `build` is
+      # `pkgs.pkgsStatic.${name}` passed through `applyPackageFix`, so
+      # the pkgsStatic toolchain (stdenv, compiler-rt-static, …) stays
+      # cached — only the package itself rebuilds with the fix.
       # ---------------------------------------------------------------
 
       mkStandaloneFlake =
@@ -255,9 +251,11 @@
         , own_software ? false
         }:
         let
-          nixpkgsFor = forAllNative (system:
-            applyStaticPatches (import nixpkgs { inherit system; }));
-          rawBuild = if build == null then (pkgs: pkgs.pkgsStatic.${name}) else build;
+          nixpkgsFor = forAllNative (system: import nixpkgs { inherit system; });
+          rawBuild =
+            if build == null
+            then (pkgs: applyPackageFix pkgs name pkgs.pkgsStatic.${name})
+            else build;
           stripped = pkgs: (rawBuild pkgs).overrideAttrs (_: { stripAllList = [ "bin" ]; });
         in {
           packages = forAllNative (system:
