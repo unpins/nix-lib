@@ -140,7 +140,9 @@
           pkgsStatic = prev.pkgsStatic.appendOverlays [
             (_: pprev: {
               htop = pprev.htop.overrideAttrs (old: {
-                preBuild = (old.preBuild or "") + ''
+                # preConfigure (not preBuild) so the strip applies
+                # before autoconf's link probes run.
+                preConfigure = (old.preConfigure or "") + ''
                   export NIX_LDFLAGS="''${NIX_LDFLAGS//-static/}"
                 '';
               });
