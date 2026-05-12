@@ -174,7 +174,15 @@
       # everything with no autoconf link probes.
       # ---------------------------------------------------------------
 
-      mkStandaloneFlake = { self, name, build ? null, binName ? name }:
+      mkStandaloneFlake =
+        { self
+        , name
+        , build ? null
+        , binName ? name
+        , package_data ? true
+        , bootstrap_naming ? false
+        , own_software ? false
+        }:
         let
           nixpkgsFor = forAllNative (system: import nixpkgs { inherit system; });
           rawBuild = if build == null then (pkgs: pkgs.pkgsStatic.${name}) else build;
@@ -193,6 +201,12 @@
               program = "${self.packages.${system}.default}/bin/${binName}";
             };
           });
+
+          # Read by unpins/action-build to drive CI config — keeps consumer
+          # workflow files down to triggers + `secrets: inherit`.
+          manifest = {
+            inherit name package_data bootstrap_naming own_software;
+          };
         };
     };
   };
