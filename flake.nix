@@ -125,25 +125,21 @@
           });
         })
 
-        # Darwin: pkgsStatic adds `-static` to NIX_LDFLAGS, which
-        # breaks autoconf link probes because libSystem must stay
-        # dynamic (no libSystem.a exists). Per-package `--disable-shared`
-        # is applied independently by each derivation, so stripping
-        # only the global `-static` should leave us with: internal
-        # deps `.a`-only, libSystem dynamic, configure probes pass,
-        # final binary mostly-static.
-        #
-        # Experimental and applied per-package (htop) to keep cache
-        # hits for everything else. If this works we generalise via
-        # stdenvAdapters.addAttrsToDerivation on pkgsStatic.stdenv.
+        # Debug: dump config.log when pkgsStatic.htop fails on
+        # darwin so we can see exactly which gcc invocation breaks
+        # the autoconf link probes (access, NAN, isgreater). The
+        # earlier theory that `-static` was injected globally was
+        # wrong — pkgsStatic-darwin uses makeStaticDarwin (only adds
+        # `-static-libgcc` when isGNU; clang skips) and
+        # makeStaticLibraries (passes --enable-static --disable-shared
+        # to configures); no global `-static` in NIX_CFLAGS_LINK.
+        # Cause of probe failure is elsewhere; this dumps config.log.
         (_: prev: prev.lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
           pkgsStatic = prev.pkgsStatic.appendOverlays [
             (_: pprev: {
               htop = pprev.htop.overrideAttrs (old: {
-                # preConfigure (not preBuild) so the strip applies
-                # before autoconf's link probes run.
                 preConfigure = (old.preConfigure or "") + ''
-                  export NIX_LDFLAGS="''${NIX_LDFLAGS//-static/}"
+                  trap 'echo "=== config.log dump (last 200 lines) ==="; tail -n 200 config.log >&2 || true' EXIT
                 '';
               });
             })
