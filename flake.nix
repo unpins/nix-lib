@@ -1,11 +1,15 @@
 {
   description = "Shared Nix helpers for unpins/* packages";
 
-  outputs = { self }: {
+  # nixpkgs is bundled so packages that consume `mkStandaloneFlake`
+  # don't have to declare it themselves; bumping nixpkgs across all
+  # unpins/* becomes a one-line change here. Consumers that need
+  # their own pin can still override via `inputs.unpins-lib.inputs.nixpkgs.follows = "nixpkgs"`.
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+
+  outputs = { self, nixpkgs }: {
     # Helpers exposed as a flat attrset. Consumers add this flake as
-    # an input and use `unpins-lib.lib`. Functions take `lib` (from
-    # nixpkgs) where needed — no nixpkgs input here so the helpers
-    # work with whatever nixpkgs version the consumer pins.
+    # an input and use `unpins-lib.lib`.
     lib = rec {
       # ---------------------------------------------------------------
       # System lists shared across unpins/* flakes.
@@ -155,6 +159,40 @@
           name = "${name}-${stripped.version}";
           paths = [ stripped.bin stripped.man ];
           passthru = { inherit (stripped) version pname; };
+        };
+
+      # ---------------------------------------------------------------
+      # Standalone-binary flake template. Returns { packages, apps }
+      # with the same shape every unpins/* small package uses:
+      #   packages.<system>.default            = pkgsStatic build
+      #   packages.aarch64-darwin."darwin-x86_64" = cross-built x86_64-darwin
+      #   apps.<system>.default                = `nix run` entry
+      #
+      # `name` is the nixpkgs attribute and the resulting bin name. Use
+      # `binName` when they differ. Override `build` for darwin dep
+      # gymnastics; the default `pkgs.pkgsStatic.${name}` is fine for
+      # everything with no autoconf link probes.
+      # ---------------------------------------------------------------
+
+      mkStandaloneFlake = { self, name, build ? null, binName ? name }:
+        let
+          nixpkgsFor = forAllNative (system: import nixpkgs { inherit system; });
+          rawBuild = if build == null then (pkgs: pkgs.pkgsStatic.${name}) else build;
+          stripped = pkgs: (rawBuild pkgs).overrideAttrs (_: { stripAllList = [ "bin" ]; });
+        in {
+          packages = forAllNative (system:
+            let pkgs = nixpkgsFor.${system}; in
+            { default = stripped pkgs; }
+            // nixpkgs.lib.optionalAttrs (system == "aarch64-darwin") {
+              "darwin-x86_64" = stripped pkgs.pkgsCross.x86_64-darwin;
+            });
+
+          apps = forAllNative (system: {
+            default = {
+              type = "app";
+              program = "${self.packages.${system}.default}/bin/${binName}";
+            };
+          });
         };
     };
   };
