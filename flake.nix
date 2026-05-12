@@ -125,22 +125,34 @@
           });
         })
 
-        # Debug: dump config.log when pkgsStatic.htop fails on
-        # darwin so we can see exactly which gcc invocation breaks
-        # the autoconf link probes (access, NAN, isgreater). The
-        # earlier theory that `-static` was injected globally was
-        # wrong — pkgsStatic-darwin uses makeStaticDarwin (only adds
-        # `-static-libgcc` when isGNU; clang skips) and
-        # makeStaticLibraries (passes --enable-static --disable-shared
-        # to configures); no global `-static` in NIX_CFLAGS_LINK.
-        # Cause of probe failure is elsewhere; this dumps config.log.
+        # Darwin pkgsStatic.htop fix.
+        #
+        # Diagnosis (from config.log dump on a prior failed CI run):
+        # htop's own configure.ac interprets `--enable-static` as
+        # "pass -static globally to the linker", NOT the autoconf
+        # standard meaning ("build a static library"). htop doesn't
+        # use libtool, so there's no normal handler for the flag.
+        # Result: htop adds `-static` to CFLAGS and LDFLAGS, which
+        # then breaks the link probes against libSystem (libSystem.a
+        # does not exist on darwin), and configure aborts on
+        # `checking for access... no` / `NaN support... no`.
+        #
+        # nixpkgs's makeStaticLibraries adapter injects
+        # `--enable-static --disable-shared` into every package's
+        # configureFlags (assuming the autoconf standard meaning).
+        # For htop on darwin we filter those flags back out, so
+        # htop's configure doesn't auto-add `-static`. Internal deps
+        # still build static — ncurses needs its own knob
+        # (`enableStatic = true` → `--without-shared`) because its
+        # autoconf doesn't honour the standard `--disable-shared`.
         (_: prev: prev.lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
           pkgsStatic = prev.pkgsStatic.appendOverlays [
             (_: pprev: {
+              ncurses = pprev.ncurses.override { enableStatic = true; };
               htop = pprev.htop.overrideAttrs (old: {
-                preConfigure = (old.preConfigure or "") + ''
-                  trap 'echo "=== config.log dump (last 200 lines) ==="; tail -n 200 config.log >&2 || true' EXIT
-                '';
+                configureFlags = pprev.lib.filter
+                  (f: f != "--enable-static" && f != "--disable-shared")
+                  (old.configureFlags or [ ]);
               });
             })
           ];
