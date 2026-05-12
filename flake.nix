@@ -96,6 +96,57 @@
         then drv else drv.override { shared = false; };
 
       # ---------------------------------------------------------------
+      # Darwin "almost-static" pkgs set. pkgsStatic doesn't work on
+      # Darwin (libSystem must stay dynamic, but pkgsStatic adds
+      # `-static` LDFLAG that breaks autoconf link probes). Instead
+      # we use the regular darwin pkgs and patch individual libraries
+      # whose default build leaves a .dylib that the linker would
+      # pick over the .a.
+      #
+      # Each override below targets a library whose static-only knob
+      # differs from the autoconf default (so staticOnlyAuto silently
+      # fails). Grows as we hit new cases. Use in the darwin branch
+      # of standalone flakes (htop, tmux, vim, …); linux/cross-mingw
+      # keep using pkgsStatic.
+      # ---------------------------------------------------------------
+
+      pkgsDarwinStatic = pkgs: pkgs.appendOverlays [
+        # ncurses knob is --with-shared / --without-shared, not the
+        # autoconf default --enable-shared / --disable-shared.
+        # nixpkgs maps `enableStatic = true` to --without-shared.
+        (_: prev: {
+          ncurses = prev.ncurses.override { enableStatic = true; };
+        })
+      ];
+
+      # ---------------------------------------------------------------
+      # Per-library "slim" overlays. Each removes propagated bloat or
+      # auxiliary tools we don't ship in a standalone-binary package.
+      # They're functions `pkgs -> pkgs` so consumers can compose them
+      # by chaining (e.g. `slimLmSensors pkgs |> pkgsDarwinStatic` if
+      # ever needed). Grows as we hit packages with similar issues.
+      # ---------------------------------------------------------------
+
+      # lm_sensors propagates perl + bash because sensors-detect (a
+      # Perl script) needs them, and ships that script + a config
+      # converter in $out/bin. Anything that links libsensors but
+      # doesn't ship the userland tools (htop, glances, conky, …)
+      # wants those gone.
+      slimLmSensors = pkgs: pkgs.appendOverlays [
+        (_: prev: {
+          lm_sensors = prev.lm_sensors.overrideAttrs (old: {
+            propagatedBuildInputs = prev.lib.filter
+              (p: !builtins.elem (p.pname or "") [ "perl" "bash" ])
+              (old.propagatedBuildInputs or []);
+            postInstall = (old.postInstall or "") + ''
+              rm -f $out/bin/sensors-detect $out/bin/sensors-conf-convert
+              rm -f $out/sbin/sensors-detect $out/sbin/sensors-conf-convert
+            '';
+          });
+        })
+      ];
+
+      # ---------------------------------------------------------------
       # Cross-prefix discovery. Both pkgsStatic and pkgsCross.mingwW64
       # ship cc-wrappers with ONLY prefixed binaries (no plain `cc`
       # or `gcc`). Consumers like ffmpeg's configure can use
