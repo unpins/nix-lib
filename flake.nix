@@ -216,13 +216,24 @@
       # The trick: nixpkgs decides "is this cross?" by comparing the
       # GNU triple (`stdenv.hostPlatform.config`) of build vs host,
       # NOT by comparing systems. Forcing a non-canonical config
-      # string (`<cpu>-pc-darwin` instead of the canonical
-      # `<cpu>-apple-darwin`) for the same system flips the package
-      # set into cross mode. From there, `pkgsBuildHost` separates
-      # from `pkgs`, and our overlay condition fires only on the host
-      # side. The pkgsBuildHost cc/ld binaries cache-hit verbatim;
-      # only a thin cc-wrapper drv is rebuilt under the new prefix
-      # (cheap, ~10s).
+      # string for the same system flips the package set into cross
+      # mode. From there, `pkgsBuildHost` separates from `pkgs`, and
+      # our overlay condition fires only on the host side. The
+      # build-side toolchain (gcc/clang, cmake/ninja/python from
+      # `pkgsBuildBuild`) stays cached; host-side compiler-rt and
+      # libcxx do rebuild for the new triple — acceptable since they
+      # cache in unpins.cachix.org after the first run.
+      #
+      # Config choice: `${cpu}-apple-darwin99`. The canonical native
+      # darwin triples are `arm64-apple-darwin` (aarch64) and
+      # `x86_64-apple-darwin` (x86_64); appending a fake macOS major
+      # version `99` differs as a string without changing the parse
+      # (kernel = "darwin", abi defaulted). Critically it stays
+      # autotools-compatible: GNU `config.sub` accepts arbitrary
+      # darwin version numbers, so packages like apple-sdk's `atf`
+      # that validate triples via `config.sub` don't bail out. The
+      # earlier attempt with `<cpu>-pc-darwin-unknown` failed config.sub
+      # ("OS 'unknown' not recognized") even though nixpkgs parsed it.
       #
       # When the caller's pkgs is already a real cross set (e.g.
       # `pkgsCross.x86_64-darwin` from aarch64-darwin), the config
@@ -235,14 +246,7 @@
           alreadyCross =
             pkgs.stdenv.hostPlatform.config != pkgs.stdenv.buildPlatform.config;
           cpu = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
-          # 4-component triple: nixpkgs' parse.nix only accepts `apple`
-          # as the 3-component darwin vendor, so a 3-comp `<cpu>-pc-darwin`
-          # is rejected. Falling back to 4-comp `<cpu>-pc-darwin-unknown`
-          # (vendor=pc, kernel=darwin, abi=unknown) parses fine, still
-          # marks the platform as darwin (`isDarwin` checks kernel only),
-          # and differs from the canonical `<cpu>-apple-darwin` so
-          # nixpkgs treats it as a cross.
-          customConfig = "${cpu}-pc-darwin-unknown";
+          customConfig = "${cpu}-apple-darwin99";
           base =
             if alreadyCross
             then pkgs
