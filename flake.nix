@@ -36,36 +36,82 @@
           (map (sys: { name = sys; value = f sys; }) nativeSystems);
 
       # ---------------------------------------------------------------
-      # Per-package fixes applied on top of the static package set
-      # returned by `staticPkgsForSystem` (pkgsStatic on linux,
-      # `darwinStaticCross` on darwin, `mingwStaticCross` on mingw).
+      # Drop shared libraries from a drv's outputs, leaving the .a
+      # and the rest of $out (headers, .pc files, binaries) intact.
+      # Build-system agnostic — operates post-install, so it works
+      # for autotools, cmake, meson, custom builders alike.
       #
-      # These are `drv.override` / `drv.overrideAttrs` applied to a
-      # single drv at a time — they produce a new drv but don't touch
-      # the package set, so the cached static stdenv stays referenced
-      # verbatim and only the package itself rebuilds.
+      # Why this matters: both GNU ld and Apple ld64 prefer
+      # .so/.dylib over .a when both sit in the same -L path, and
+      # ld64 has no `-Bstatic` analog. Removing the shared artifact
+      # post-build is the only platform-neutral way to force a
+      # static link without patching the consumer.
+      #
+      # Self-guarded: pkgsStatic drvs (`stdenv.hostPlatform.isStatic`)
+      # already produce only .a, so re-overriding them would only
+      # bust cache.nixos.org without changing the output. Skip those.
+      #
+      # Caveat: a lib that ships shared-only (no .a built) will end
+      # up with an empty $out/lib after this hook. When that comes
+      # up in practice, add a per-pkg branch in `applyPackageFix`
+      # below that flips on the static target first.
+      # ---------------------------------------------------------------
+      dropSharedLibs = drv:
+        let isStatic = drv.stdenv.hostPlatform.isStatic or false;
+        in if isStatic then drv
+        else drv.overrideAttrs (old: {
+          postFixup = (old.postFixup or "") + ''
+            for o in $outputs; do
+              d="''${!o}"
+              [ -d "$d/lib" ] || continue
+              find "$d/lib" \( \
+                     -name '*.dylib' -o -name '*.dylib.*' \
+                  -o -name '*.so'    -o -name '*.so.*'    \
+                  -o -name '*.la'                          \
+                  -o -name '*.dll'   -o -name '*.dll.a'    \
+                \) -delete 2>/dev/null || true
+            done
+          '';
+        });
+
+      # ---------------------------------------------------------------
+      # Per-package fixes applied to pkgsStatic-<name> derivations.
+      #
+      # Why not an overlay? `pkgs.appendOverlays` (and even
+      # `pkgsStatic.appendOverlays`) invalidates `pkgsBuildHost.stdenv`
+      # → cascade rebuild of compiler-rt-libc-static, ninja, python3
+      # in pkgsStatic-darwin (none of which are in cache.nixos.org for
+      # that variant; Hydra only builds pkgsStatic-linux). 30-60 min
+      # of darwin CI just to add `--enable-static` to a single
+      # nativeBuildInput. A fake-cross config-string trick was tried
+      # to side-step the cascade and broke autotools instead: any
+      # `hostPlatform.config != buildPlatform.config` flips configure
+      # into cross mode and disables `AC_RUN_IFELSE`, which apple-sdk's
+      # atf depends on. So the cascade is structural; per-package
+      # `drv.override` / `drv.overrideAttrs` is the only path that
+      # keeps both the cached toolchain AND the autotools-native-mode
+      # configure runs.
       #
       # `applyPackageFix pkgs name drv` returns `drv` with the
-      # adjustments needed for `name`, where `pkgs` is the static
-      # package set the drv was pulled from. Add a branch when
-      # adopting a new package whose static build is broken on some
-      # host.
+      # adjustments needed for `name`. Add a branch when adopting a
+      # new package whose pkgsStatic build is broken on some host.
+      # Every return path is wrapped by `dropSharedLibs` so any
+      # shared artifacts in the output are pruned uniformly.
       # ---------------------------------------------------------------
 
       applyPackageFix = pkgs: name: drv:
         let
-          # `p` aliases the static package set the caller passed in.
-          # Use `p.lib.*` for nixpkgs lib helpers, `p.<attr>` to refer
-          # to other packages in the same set (e.g. lm_sensors below).
-          p = pkgs;
+          # `p` is the package set we want fixes built against. For
+          # native callers (linux/darwin) pkgs is plain nixpkgs and we
+          # want `pkgs.pkgsStatic`. For windows callers (see
+          # `applyMingwFix` below) `pkgs` is already the cross set and
+          # this branch is unused.
+          p = pkgs.pkgsStatic;
 
           # Whether the caller's stdenv already produces static-only
-          # libraries by default (pkgsStatic on Linux). When true, the
-          # lib-level static knob branches below are no-ops: the
-          # underlying drv already ships only `.a`. On darwin/mingw
-          # the static set is a `makeStaticLibraries`-adapter overlay
-          # whose hostPlatform is NOT marked `isStatic`, so the lib
-          # fixes do still need to fire there.
+          # libraries by default (pkgsStatic on Linux/Darwin). When
+          # true, the lib-level static knob branches below are no-ops:
+          # the underlying drv already ships only `.a`.
           isStatic = pkgs.stdenv.hostPlatform.isStatic or false;
 
           # lm_sensors propagates perl + bash for sensors-detect (a
@@ -101,20 +147,46 @@
             lm_sensors = slimLmSensors p.lm_sensors;
           };
 
-          # tmux: same libSystem problem as htop. configure.ac
-          # interprets `--enable-static` as a global `-static` to the
-          # linker, which fails libSystem probes (libSystem.a doesn't
-          # exist on darwin). `darwinStaticCross` injects both flags
-          # via `makeStaticLibraries`; filter them out so tmux's
-          # configure falls back to default linking. tmux's deps
-          # (ncurses, libevent, utf8proc) still come from the
-          # static-adapter stdenv, so they ship only `.a` and the
-          # final tmux binary ends up statically linked anyway.
-          fixTmuxDarwin = t: t.overrideAttrs (old: {
-            configureFlags = p.lib.filter
-              (f: f != "--enable-static" && f != "--disable-shared")
-              (old.configureFlags or [ ]);
-          });
+          # Generically prune shared libs from every dep a consumer
+          # pulls in. Walks `drv.override.__functionArgs`, identifies
+          # which args resolve to derivations in `pkgs`, and rebuilds
+          # the consumer with each of those wrapped in dropSharedLibs.
+          # No package names listed: works for any consumer whose
+          # build can't tolerate the stdenv-level static adapter but
+          # still needs its deps to ship .a-only.
+          #
+          # dropSharedLibs's own isStatic guard handles the cache
+          # question per-dep: pkgsStatic-stdenv deps are skipped (no
+          # cache miss); regular-stdenv deps get the postFixup.
+          # Non-lib deps (tools like pkg-config) take a cache miss
+          # but stay functionally unchanged.
+          withDepsSharedPruned = drv:
+            let
+              fnArgs = drv.override.__functionArgs or {};
+              isPrunableDrv = v:
+                builtins.isAttrs v
+                && (v.type or null) == "derivation"
+                && v ? overrideAttrs;
+              overrides = builtins.listToAttrs (
+                builtins.filter (x: x != null) (
+                  map (name:
+                    let v = pkgs.${name} or null;
+                    in if v != null && isPrunableDrv v
+                       then { inherit name; value = dropSharedLibs v; }
+                       else null
+                  ) (builtins.attrNames fnArgs)
+                )
+              );
+            in drv.override overrides;
+
+          # tmux: on Darwin, pkgsStatic.tmux fails because tmux's
+          # configure.ac handles `--enable-static` itself (passes
+          # `-static` globally to ld) and libSystem.a doesn't exist,
+          # which makes link probes fail. Fall back to the regular
+          # tmux drv with shared-pruned deps — runtime closure ends
+          # up libSystem-only either way. On Linux/cross the
+          # unmodified pkgsStatic.tmux is fine.
+          fixTmuxDarwin = _: withDepsSharedPruned pkgs.tmux;
 
           # ----------------------------------------------------------
           # Library knobs that mingwStaticCross's makeStaticLibraries
@@ -167,7 +239,7 @@
             else if name == "x264" then fixX264 drv
             else drv;
         in
-          fixed;
+          dropSharedLibs fixed;
 
       # ---------------------------------------------------------------
       # Windows static cross set.
@@ -202,83 +274,6 @@
           then { stdenv = super.stdenvAdapters.makeStaticLibraries super.stdenv; }
           else { })
       ];
-
-      # ---------------------------------------------------------------
-      # Darwin static cross set. Same idea as `mingwStaticCross`: wrap
-      # stdenv with `makeStaticLibraries` so every package builds .a
-      # archives without consumer configuration.
-      #
-      # Native darwin is special because `pkgs.appendOverlays` on a
-      # non-cross set invalidates `pkgsBuildHost.stdenv` → cascade
-      # rebuild of compiler-rt-static, ninja, python3 in pkgsStatic
-      # variants that Hydra doesn't pre-build for darwin.
-      #
-      # The trick: nixpkgs decides "is this cross?" by comparing the
-      # GNU triple (`stdenv.hostPlatform.config`) of build vs host,
-      # NOT by comparing systems. Forcing a non-canonical config
-      # string for the same system flips the package set into cross
-      # mode. From there, `pkgsBuildHost` separates from `pkgs`, and
-      # our overlay condition fires only on the host side. The
-      # build-side toolchain (gcc/clang, cmake/ninja/python from
-      # `pkgsBuildBuild`) stays cached; host-side compiler-rt and
-      # libcxx do rebuild for the new triple — acceptable since they
-      # cache in unpins.cachix.org after the first run.
-      #
-      # Config choice: `${cpu}-apple-darwin99`. The canonical native
-      # darwin triples are `arm64-apple-darwin` (aarch64) and
-      # `x86_64-apple-darwin` (x86_64); appending a fake macOS major
-      # version `99` differs as a string without changing the parse
-      # (kernel = "darwin", abi defaulted). Critically it stays
-      # autotools-compatible: GNU `config.sub` accepts arbitrary
-      # darwin version numbers, so packages like apple-sdk's `atf`
-      # that validate triples via `config.sub` don't bail out. The
-      # earlier attempt with `<cpu>-pc-darwin-unknown` failed config.sub
-      # ("OS 'unknown' not recognized") even though nixpkgs parsed it.
-      #
-      # When the caller's pkgs is already a real cross set (e.g.
-      # `pkgsCross.x86_64-darwin` from aarch64-darwin), the config
-      # strings already differ, so we skip the re-import and just
-      # append the overlay.
-      # ---------------------------------------------------------------
-
-      darwinStaticCross = pkgs:
-        let
-          alreadyCross =
-            pkgs.stdenv.hostPlatform.config != pkgs.stdenv.buildPlatform.config;
-          cpu = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
-          customConfig = "${cpu}-apple-darwin99";
-          base =
-            if alreadyCross
-            then pkgs
-            else import nixpkgs {
-              localSystem = {
-                inherit (pkgs.stdenv.buildPlatform) system config;
-              };
-              crossSystem = {
-                inherit (pkgs.stdenv.hostPlatform) system;
-                config = customConfig;
-              };
-            };
-        in
-          base.appendOverlays [
-            (self: super:
-              if (super.stdenv.hostPlatform.isDarwin or false)
-                && super.stdenv.hostPlatform.config != super.stdenv.buildPlatform.config
-              then { stdenv = super.stdenvAdapters.makeStaticLibraries super.stdenv; }
-              else { })
-          ];
-
-      # ---------------------------------------------------------------
-      # Pick the right static-producing package set for the caller's
-      # platform. Linux uses plain `pkgsStatic` (Hydra-cached). Darwin
-      # uses `darwinStaticCross` (fake-cross config trick). MinGW
-      # callers go through `applyMingwFix` instead, not this helper.
-      # ---------------------------------------------------------------
-
-      staticPkgsForSystem = pkgs:
-        if pkgs.stdenv.hostPlatform.isDarwin or false
-        then darwinStaticCross pkgs
-        else pkgs.pkgsStatic;
 
       # ---------------------------------------------------------------
       # Per-package fixes applied on top of `mingwStaticCross`.
@@ -318,7 +313,7 @@
           raw = cross.${name};
           fixed = if name == "jq" then fixJq raw else raw;
         in
-          fixed;
+          dropSharedLibs fixed;
 
       # ---------------------------------------------------------------
       # Cross-prefix discovery. Both pkgsStatic and pkgsCross.mingwW64
@@ -437,9 +432,7 @@
           nixpkgsFor = forAllNative (system: import nixpkgs { inherit system; });
           rawBuild =
             if build == null
-            then (pkgs:
-              let sp = staticPkgsForSystem pkgs;
-              in applyPackageFix sp name sp.${name})
+            then (pkgs: applyPackageFix pkgs name pkgs.pkgsStatic.${name})
             else build;
           stripped = pkgs: strippedOrJoined pkgs name (rawBuild pkgs);
 
@@ -464,7 +457,7 @@
           };
           windowsRaw =
             if windowsBuild != null
-            then windowsBuild windowsPkgs
+            then dropSharedLibs (windowsBuild windowsPkgs)
             else applyMingwFix windowsPkgs name;
           windowsPkg = strippedOrJoined windowsPkgs name windowsRaw;
         in {
