@@ -108,12 +108,6 @@
           # this branch is unused.
           p = pkgs.pkgsStatic;
 
-          # Whether the caller's stdenv already produces static-only
-          # libraries by default (pkgsStatic on Linux/Darwin). When
-          # true, the lib-level static knob branches below are no-ops:
-          # the underlying drv already ships only `.a`.
-          isStatic = pkgs.stdenv.hostPlatform.isStatic or false;
-
           # lm_sensors propagates perl + bash for sensors-detect (a
           # Perl script we don't ship) and installs the script in
           # $out/bin. Trim both.
@@ -188,44 +182,18 @@
           # unmodified pkgsStatic.tmux is fine.
           fixTmuxDarwin = _: withDepsSharedPruned pkgs.tmux;
 
-          # ----------------------------------------------------------
-          # Library knobs that mingwStaticCross's makeStaticLibraries
-          # adapter doesn't reach. Each branch is a no-op when the
-          # underlying stdenv is already pkgsStatic (`isStatic`), so
-          # consumers can call this unconditionally regardless of
-          # whether `pkgs` is pkgsStatic or mingwStaticCross.
-          #
-          # zlib: nixpkgs uses a custom builder that ignores
-          # configureFlags/cmakeFlags/mesonFlags. Its only static
-          # knob is `shared = !isStatic`. Under mingw cross
-          # (isStatic = false) it ships only .dll + .dll.a, not .a.
-          # Force `shared = false`.
-          fixZlib = z: if isStatic then z else z.override { shared = false; };
-
-          # zstd: cmake, but its CMakeLists uses its own switches —
-          # `ZSTD_BUILD_SHARED` and `ZSTD_BUILD_STATIC` — and silently
-          # ignores the generic `BUILD_SHARED_LIBS` that the adapter
-          # injects. Drive both via the package-level `static` knob.
-          fixZstd = z: if isStatic then z else z.override { static = true; };
-
-          # x264: configure is a hand-rolled shell+perl script (not
-          # autoconf), so it doesn't recognize the adapter-injected
-          # `--disable-shared`. Pass static flags it does understand.
-          # Plus: x264.h decorates symbols with `__declspec(dllimport)`
-          # when `X264_API_IMPORTS` is set, and nixpkgs leaves it in
-          # the .pc — so consumers (ffmpeg) end up looking for
-          # `__imp_x264_*` against the static .a. Strip it.
-          fixX264 = x: x.overrideAttrs (old: {
-            configureFlags = (old.configureFlags or [ ])
-              ++ pkgs.lib.optionals (!isStatic)
-                [ "--enable-static" "--disable-shared" "--enable-pic" ];
-            postFixup = (old.postFixup or "") + ''
-              for d in "$dev" "$out"; do
-                pc="$d/lib/pkgconfig/x264.pc"
-                [ -f "$pc" ] && sed -i 's| -DX264_API_IMPORTS||g' "$pc" || true
-              done
-            '';
-          });
+          # Note on zlib/zstd/x264: previously they had per-package
+          # branches here to force static-only output under mingw
+          # cross (whose stdenv is non-pkgsStatic by default).
+          # mingwStaticCross now declares
+          # `stdenv.hostPlatform.isStatic = true`, which trips the
+          # upstream nixpkgs recipes' own static-aware paths
+          # (zlib `shared ? !isStatic`, zstd's static knob, x264's
+          # `X264_API_IMPORTS` gating). Verified empirically:
+          # mingwStaticCross.{zlib,zstd,x264} produce .a only and
+          # clean .pc files with no manual override needed. The
+          # branches are dropped; if a future package needs a
+          # similar fix, add a branch below.
 
           fixed =
             if name == "htop" then (
@@ -234,9 +202,6 @@
               else drv
             )
             else if name == "tmux" && p.stdenv.hostPlatform.isDarwin then fixTmuxDarwin drv
-            else if name == "zlib" then fixZlib drv
-            else if name == "zstd" then fixZstd drv
-            else if name == "x264" then fixX264 drv
             else drv;
         in
           dropSharedLibs fixed;
@@ -245,33 +210,102 @@
       # Windows static cross set.
       #
       # `mingwStaticCross pkgs` returns `pkgs.pkgsCross.mingwW64` with
-      # an overlay that swaps `stdenv` for `makeStaticLibraries stdenv`
-      # — but ONLY when the evaluated package set's host is mingw.
-      # That conditional is load-bearing: `pkgsBuildHost` of the cross
-      # set is linux (the build platform), so the overlay's then-branch
-      # never fires there and `pkgsBuildHost.stdenv` keeps its
-      # cache.nixos.org hash. Same goes for `cc`/`bintools` inside the
-      # mingw stdenv — `makeStaticLibraries` only wraps mkDerivation,
-      # leaving cc untouched, so the cached cross gcc stays referenced
-      # verbatim and never rebuilds.
+      # an overlay that, when host=mingw:
       #
-      # The end result mirrors `pkgs.pkgsStatic` on linux/darwin: every
-      # package transparently builds static archives without consumer
-      # configuration. Problem packages get a per-package branch in
-      # `applyMingwFix` below.
+      # (1) Wraps stdenv with `makeStaticLibraries`, which injects
+      #     `--enable-static --disable-shared` (autotools),
+      #     `-DBUILD_SHARED_LIBS=OFF` (cmake), and
+      #     `-Ddefault_library=static` (meson) into every mkDerivation.
+      #     Catches libs whose build system respects the standard
+      #     switches.
+      #
+      # (2) Marks `stdenv.hostPlatform.isStatic = true`. The underlying
+      #     stdenv is the cached pkgsCross.mingwW64 stdenv (which
+      #     itself has isStatic = false) — this is a "white lie" at
+      #     the platform attr level only, NOT a re-instantiation. The
+      #     reason: many upstream recipes key off
+      #     `stdenv.hostPlatform.isStatic` directly (zlib's
+      #     `shared ? !isStatic`, zstd's static knob, libpsl's .pc
+      #     handling, ...) and produce static-only outputs without
+      #     any consumer override when they see isStatic = true.
+      #     Without this fudge, we had to per-package-override every
+      #     such recipe (fixZlib, fixZstd, fixX264 ...) to undo the
+      #     shared default.
+      #
+      # Safe for mingw: isStatic in mingw context is a build-flag
+      # convention; mingw-w64 / mcfgthread produce byte-identical .a
+      # for either path, and there's no libc swap analogous to
+      # glibc→musl on Linux. The fudge is contained to platform attrs
+      # the recipes read; cc/bintools and the cross gcc stay
+      # referenced verbatim from cache.nixos.org (overlay only wraps
+      # mkDerivation).
+      #
+      # Conditional `if isMinGW`: pkgsBuildHost of the cross set is
+      # linux (build platform), so the then-branch never fires there
+      # and pkgsBuildHost.stdenv keeps its cache hash.
       #
       # Why not `pkgsCross.mingwW64.pkgsStatic`? It re-instantiates
-      # with `crossSystem.isStatic = true`, picking
-      # mingw-w64-static/mcfgthread-static and rebuilding gcc against
-      # those — even though the static variants of those libs produce
-      # byte-identical outputs to the shared variants. ~30 min of
-      # toolchain rebuild that this overlay-based set sidesteps.
+      # nixpkgs with `crossSystem.isStatic = true`, which changes
+      # the configureFlags of windows.mingw_w64 / windows.mcfgthread
+      # → different drv hash → cross gcc rebuilds against them →
+      # ~30 min of toolchain rebuild even though built bytes are
+      # byte-identical. The fudge above sidesteps this entirely.
       # ---------------------------------------------------------------
 
       mingwStaticCross = pkgs: pkgs.pkgsCross.mingwW64.appendOverlays [
         (self: super:
           if super.stdenv.hostPlatform.isMinGW or false
-          then { stdenv = super.stdenvAdapters.makeStaticLibraries super.stdenv; }
+          then
+            let base = super.stdenvAdapters.makeStaticLibraries super.stdenv;
+            in {
+              stdenv = base // {
+                hostPlatform = base.hostPlatform // { isStatic = true; };
+              };
+
+              # libidn2: ships idn2.exe. Without `-all-static` at the
+              # final libtool link, idn2.exe resolves -liconv via the
+              # `dll.a` import library and the DLL-link hook pulls
+              # libiconv-2.dll into idn2.exe's runtime closure — which
+              # then poisons curl's closure transitively. `-all-static`
+              # forces archive-only resolution so idn2.exe is
+              # self-contained.
+              # Also propagate libunistring: nixpkgs lists it as a
+              # plain buildInput, so strictDeps consumers (curl) don't
+              # see -L /.../libunistring/lib without help.
+              libidn2 = super.libidn2.overrideAttrs (old: {
+                makeFlags = (old.makeFlags or [ ]) ++ [ "LDFLAGS=-all-static" ];
+                propagatedBuildInputs = (old.propagatedBuildInputs or [ ])
+                  ++ [ self.libunistring ];
+              });
+
+              # libpsl static fixes:
+              # (1) The default .pc puts libidn2/libunistring/libiconv
+              #     in Libs.private; consumers using
+              #     `pkg-config --libs-only-l libpsl` (curl's autoconf
+              #     probe) only honor Libs:. Promote them, and order
+              #     them for single-pass static linking (consumer
+              #     before provider: libidn2 before libunistring,
+              #     libunistring before libiconv).
+              # (2) Propagate libunistring/libiconv so strictDeps
+              #     consumers see -L paths without redeclaring.
+              # The `.override { libidn2 = ... }` re-threads our
+              # overlay'd libidn2 into libpsl's deps (overrideAttrs
+              # alone doesn't re-evaluate the call's args).
+              libpsl = (super.libpsl.override {
+                inherit (self) libidn2;
+              }).overrideAttrs (old: {
+                propagatedBuildInputs = (old.propagatedBuildInputs or [ ])
+                  ++ [ self.libunistring self.libiconv ];
+                postFixup = (old.postFixup or "") + ''
+                  pc="$dev/lib/pkgconfig/libpsl.pc"
+                  if [ -f "$pc" ]; then
+                    sed -i '/^Libs:/c\
+Libs: -L''${libdir} -L${self.libunistring}/lib -L${self.libiconv}/lib -lpsl -lidn2 -lunistring -liconv -lws2_32
+' "$pc"
+                  fi
+                '';
+              });
+            }
           else { })
       ];
 
@@ -349,6 +383,7 @@
         , staticDeps ? {}
         , extraInputs ? []
         , extraConfigureFlags ? []
+        , extraCFlags ? []
         , filterConfigureFlag ? (_: true)
         , extraOverrides ? (_: {})
         }:
@@ -368,7 +403,20 @@
             # Passing it to configure via NIX_LDFLAGS would break
             # autoconf's "C compiler works" probe — make-time only.
             makeFlags = (old.makeFlags or []) ++ [ "LDFLAGS=-all-static" ];
-          } // extraOverrides old);
+          }
+          // (nixpkgs.lib.optionalAttrs (extraCFlags != []) {
+            # mingw headers (nghttp2, libpsl, libcurl, ...) declare
+            # their public API as __declspec(dllimport) by default;
+            # static consumers need *_STATICLIB defined or the link
+            # leaves __imp_* relocations unresolved.
+            env = (old.env or {}) // {
+              NIX_CFLAGS_COMPILE = builtins.concatStringsSep " " (
+                (nixpkgs.lib.optional (old ? env && old.env ? NIX_CFLAGS_COMPILE)
+                  old.env.NIX_CFLAGS_COMPILE)
+                ++ extraCFlags);
+            };
+          })
+          // extraOverrides old);
 
       # ---------------------------------------------------------------
       # Packaging: combine multi-output drv (bin + man + …) into one
@@ -417,12 +465,19 @@
       # cached — only the package itself rebuilds with the fix.
       # ---------------------------------------------------------------
 
+      # `nativeBuild = false` skips the linux/darwin static builds entirely
+      # and exposes only `packages.x86_64-linux.windows-x86_64` (and no
+      # `apps.<system>.default`, since there's no native runnable binary).
+      # Mirror of bash's "native-only by design" for the inverse case:
+      # gvim is windows-only because static GTK on Linux is infeasible
+      # and macOS gvim is its own bundle (MacVim).
       mkStandaloneFlake =
         { self
         , name
         , build ? null
         , windowsBuild ? null
         , binName ? name
+        , nativeBuild ? true
         , windows ? false
         , package_data ? true
         , bootstrap_naming ? false
@@ -463,25 +518,25 @@
         in {
           packages = forAllNative (system:
             let pkgs = nixpkgsFor.${system}; in
-            { default = stripped pkgs; }
-            // nixpkgs.lib.optionalAttrs (system == "aarch64-darwin") {
+            nixpkgs.lib.optionalAttrs nativeBuild { default = stripped pkgs; }
+            // nixpkgs.lib.optionalAttrs (nativeBuild && system == "aarch64-darwin") {
               "darwin-x86_64" = stripped pkgs.pkgsCross.x86_64-darwin;
             }
             // nixpkgs.lib.optionalAttrs (windowsEnabled && system == "x86_64-linux") {
               "windows-x86_64" = windowsPkg;
             });
 
-          apps = forAllNative (system: {
+          apps = nixpkgs.lib.optionalAttrs nativeBuild (forAllNative (system: {
             default = {
               type = "app";
               program = "${self.packages.${system}.default}/bin/${binName}";
             };
-          });
+          }));
 
           # Read by unpins/action-build to drive CI config — keeps consumer
           # workflow files down to triggers + `secrets: inherit`.
           manifest = {
-            inherit name package_data bootstrap_naming own_software;
+            inherit name package_data bootstrap_naming own_software nativeBuild;
           };
         };
     };
