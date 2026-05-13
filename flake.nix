@@ -36,95 +36,37 @@
           (map (sys: { name = sys; value = f sys; }) nativeSystems);
 
       # ---------------------------------------------------------------
-      # Static-only build-system knobs.
+      # Per-package fixes applied on top of the static package set
+      # returned by `staticPkgsForSystem` (pkgsStatic on linux,
+      # `darwinStaticCross` on darwin, `mingwStaticCross` on mingw).
       #
-      # The unifying insight: ffmpeg-class consumers pass `-static`
-      # to ld via `--extra-ldflags=-static` (or equivalent), which
-      # makes the linker prefer `.a` over `.dll.a`. Producers just
-      # need to ensure `.a` exists in the lib output.
-      #
-      # Each helper handles one build system. Cache-aware variants
-      # (no-op when the consumer's pkgs is already pkgsStatic) live
-      # in `keepStatic*` below.
-      # ---------------------------------------------------------------
-
-      # Autotools: --enable-static + --disable-shared. dontDisableStatic
-      # tells nixpkgs not to delete .a in the strip phase.
-      staticOnlyAuto = drv: drv.overrideAttrs (old: {
-        dontDisableStatic = true;
-        configureFlags = (old.configureFlags or [])
-          ++ [ "--enable-static" "--disable-shared" ];
-      });
-
-      # Meson: default_library=static. Don't use 'both' under
-      # pkgsStatic — its toolchain can't link shared objects
-      # (crtbeginT.o R_X86_64_32 against hidden symbol error).
-      staticOnlyMeson = drv: drv.overrideAttrs (old: {
-        mesonFlags = (old.mesonFlags or [])
-          ++ [ "-Ddefault_library=static" ];
-      });
-
-      # CMake: BUILD_SHARED_LIBS=OFF. Some projects ignore this and
-      # have their own option (e.g. openapv: OAPV_BUILD_SHARED_LIB).
-      # Inspect the project's CMakeLists when this isn't enough.
-      staticOnlyCmake = extraFlags: drv: drv.overrideAttrs (old: {
-        cmakeFlags = (old.cmakeFlags or [])
-          ++ [ "-DBUILD_SHARED_LIBS=OFF" ] ++ extraFlags;
-      });
-
-      # ---------------------------------------------------------------
-      # Cache-aware wrappers. Use these when the same code path runs
-      # for both pkgsStatic (where libs already build static-only —
-      # overriding would bust cache.nixos.org) and cross-mingw
-      # (default shared, override required).
-      # ---------------------------------------------------------------
-
-      keepStaticAuto = pkgs: drv:
-        if pkgs.stdenv.hostPlatform.isStatic or false
-        then drv else staticOnlyAuto drv;
-
-      keepStaticMeson = pkgs: drv:
-        if pkgs.stdenv.hostPlatform.isStatic or false
-        then drv else staticOnlyMeson drv;
-
-      keepStaticCmake = pkgs: extraFlags: drv:
-        if pkgs.stdenv.hostPlatform.isStatic or false
-        then drv else staticOnlyCmake extraFlags drv;
-
-      keepStaticZlib = pkgs: drv:
-        if pkgs.stdenv.hostPlatform.isStatic or false
-        then drv else drv.override { shared = false; };
-
-      # ---------------------------------------------------------------
-      # Per-package fixes applied to pkgsStatic-<name> derivations.
-      #
-      # Why not an overlay? `pkgs.appendOverlays` (and even
-      # `pkgsStatic.appendOverlays`) invalidates `pkgsBuildHost.stdenv`
-      # → cascade rebuild of compiler-rt-libc-static, ninja, python3
-      # in pkgsStatic-darwin (none of which are in cache.nixos.org for
-      # that variant; Hydra only builds pkgsStatic-linux). 30-60 min
-      # of darwin CI just to add `--enable-static` to a single
-      # nativeBuildInput.
-      #
-      # `drv.override` and `drv.overrideAttrs` applied per-package
-      # don't touch the package set — they produce a new drv whose
-      # build inputs are *still* the original cached pkgsStatic
-      # stdenv. The drv itself rebuilds (input hash changed), but
-      # everything below it (toolchain) stays cached.
+      # These are `drv.override` / `drv.overrideAttrs` applied to a
+      # single drv at a time — they produce a new drv but don't touch
+      # the package set, so the cached static stdenv stays referenced
+      # verbatim and only the package itself rebuilds.
       #
       # `applyPackageFix pkgs name drv` returns `drv` with the
-      # adjustments needed for `name`. Add a branch when adopting a
-      # new package whose pkgsStatic build is broken on some host.
+      # adjustments needed for `name`, where `pkgs` is the static
+      # package set the drv was pulled from. Add a branch when
+      # adopting a new package whose static build is broken on some
+      # host.
       # ---------------------------------------------------------------
 
       applyPackageFix = pkgs: name: drv:
         let
-          # `p` is the package set we want fixes built against. For
-          # native callers (linux/darwin) pkgs is plain nixpkgs and we
-          # want `pkgs.pkgsStatic`. For windows callers (see
-          # `applyMingwFix` below) `pkgs` is already the cross set and
-          # this branch is unused.
-          p = pkgs.pkgsStatic;
+          # `p` aliases the static package set the caller passed in.
+          # Use `p.lib.*` for nixpkgs lib helpers, `p.<attr>` to refer
+          # to other packages in the same set (e.g. lm_sensors below).
+          p = pkgs;
+
+          # Whether the caller's stdenv already produces static-only
+          # libraries by default (pkgsStatic on Linux). When true, the
+          # lib-level static knob branches below are no-ops: the
+          # underlying drv already ships only `.a`. On darwin/mingw
+          # the static set is a `makeStaticLibraries`-adapter overlay
+          # whose hostPlatform is NOT marked `isStatic`, so the lib
+          # fixes do still need to fire there.
+          isStatic = pkgs.stdenv.hostPlatform.isStatic or false;
 
           # lm_sensors propagates perl + bash for sensors-detect (a
           # Perl script we don't ship) and installs the script in
@@ -159,12 +101,73 @@
             lm_sensors = slimLmSensors p.lm_sensors;
           };
 
+          # tmux: same libSystem problem as htop. configure.ac
+          # interprets `--enable-static` as a global `-static` to the
+          # linker, which fails libSystem probes (libSystem.a doesn't
+          # exist on darwin). `darwinStaticCross` injects both flags
+          # via `makeStaticLibraries`; filter them out so tmux's
+          # configure falls back to default linking. tmux's deps
+          # (ncurses, libevent, utf8proc) still come from the
+          # static-adapter stdenv, so they ship only `.a` and the
+          # final tmux binary ends up statically linked anyway.
+          fixTmuxDarwin = t: t.overrideAttrs (old: {
+            configureFlags = p.lib.filter
+              (f: f != "--enable-static" && f != "--disable-shared")
+              (old.configureFlags or [ ]);
+          });
+
+          # ----------------------------------------------------------
+          # Library knobs that mingwStaticCross's makeStaticLibraries
+          # adapter doesn't reach. Each branch is a no-op when the
+          # underlying stdenv is already pkgsStatic (`isStatic`), so
+          # consumers can call this unconditionally regardless of
+          # whether `pkgs` is pkgsStatic or mingwStaticCross.
+          #
+          # zlib: nixpkgs uses a custom builder that ignores
+          # configureFlags/cmakeFlags/mesonFlags. Its only static
+          # knob is `shared = !isStatic`. Under mingw cross
+          # (isStatic = false) it ships only .dll + .dll.a, not .a.
+          # Force `shared = false`.
+          fixZlib = z: if isStatic then z else z.override { shared = false; };
+
+          # zstd: cmake, but its CMakeLists uses its own switches —
+          # `ZSTD_BUILD_SHARED` and `ZSTD_BUILD_STATIC` — and silently
+          # ignores the generic `BUILD_SHARED_LIBS` that the adapter
+          # injects. Drive both via the package-level `static` knob.
+          fixZstd = z: if isStatic then z else z.override { static = true; };
+
+          # x264: configure is a hand-rolled shell+perl script (not
+          # autoconf), so it doesn't recognize the adapter-injected
+          # `--disable-shared`. Pass static flags it does understand.
+          # Plus: x264.h decorates symbols with `__declspec(dllimport)`
+          # when `X264_API_IMPORTS` is set, and nixpkgs leaves it in
+          # the .pc — so consumers (ffmpeg) end up looking for
+          # `__imp_x264_*` against the static .a. Strip it.
+          fixX264 = x: x.overrideAttrs (old: {
+            configureFlags = (old.configureFlags or [ ])
+              ++ pkgs.lib.optionals (!isStatic)
+                [ "--enable-static" "--disable-shared" "--enable-pic" ];
+            postFixup = (old.postFixup or "") + ''
+              for d in "$dev" "$out"; do
+                pc="$d/lib/pkgconfig/x264.pc"
+                [ -f "$pc" ] && sed -i 's| -DX264_API_IMPORTS||g' "$pc" || true
+              done
+            '';
+          });
+
+          fixed =
+            if name == "htop" then (
+              if p.stdenv.hostPlatform.isDarwin then fixHtopDarwin drv
+              else if p.stdenv.hostPlatform.isLinux then fixHtopLinux drv
+              else drv
+            )
+            else if name == "tmux" && p.stdenv.hostPlatform.isDarwin then fixTmuxDarwin drv
+            else if name == "zlib" then fixZlib drv
+            else if name == "zstd" then fixZstd drv
+            else if name == "x264" then fixX264 drv
+            else drv;
         in
-        if name == "htop" then
-          if p.stdenv.hostPlatform.isDarwin then fixHtopDarwin drv
-          else if p.stdenv.hostPlatform.isLinux then fixHtopLinux drv
-          else drv
-        else drv;
+          fixed;
 
       # ---------------------------------------------------------------
       # Windows static cross set.
@@ -199,6 +202,79 @@
           then { stdenv = super.stdenvAdapters.makeStaticLibraries super.stdenv; }
           else { })
       ];
+
+      # ---------------------------------------------------------------
+      # Darwin static cross set. Same idea as `mingwStaticCross`: wrap
+      # stdenv with `makeStaticLibraries` so every package builds .a
+      # archives without consumer configuration.
+      #
+      # Native darwin is special because `pkgs.appendOverlays` on a
+      # non-cross set invalidates `pkgsBuildHost.stdenv` → cascade
+      # rebuild of compiler-rt-static, ninja, python3 in pkgsStatic
+      # variants that Hydra doesn't pre-build for darwin.
+      #
+      # The trick: nixpkgs decides "is this cross?" by comparing the
+      # GNU triple (`stdenv.hostPlatform.config`) of build vs host,
+      # NOT by comparing systems. Forcing a non-canonical config
+      # string (`<cpu>-pc-darwin` instead of the canonical
+      # `<cpu>-apple-darwin`) for the same system flips the package
+      # set into cross mode. From there, `pkgsBuildHost` separates
+      # from `pkgs`, and our overlay condition fires only on the host
+      # side. The pkgsBuildHost cc/ld binaries cache-hit verbatim;
+      # only a thin cc-wrapper drv is rebuilt under the new prefix
+      # (cheap, ~10s).
+      #
+      # When the caller's pkgs is already a real cross set (e.g.
+      # `pkgsCross.x86_64-darwin` from aarch64-darwin), the config
+      # strings already differ, so we skip the re-import and just
+      # append the overlay.
+      # ---------------------------------------------------------------
+
+      darwinStaticCross = pkgs:
+        let
+          alreadyCross =
+            pkgs.stdenv.hostPlatform.config != pkgs.stdenv.buildPlatform.config;
+          cpu = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
+          # 4-component triple: nixpkgs' parse.nix only accepts `apple`
+          # as the 3-component darwin vendor, so a 3-comp `<cpu>-pc-darwin`
+          # is rejected. Falling back to 4-comp `<cpu>-pc-darwin-unknown`
+          # (vendor=pc, kernel=darwin, abi=unknown) parses fine, still
+          # marks the platform as darwin (`isDarwin` checks kernel only),
+          # and differs from the canonical `<cpu>-apple-darwin` so
+          # nixpkgs treats it as a cross.
+          customConfig = "${cpu}-pc-darwin-unknown";
+          base =
+            if alreadyCross
+            then pkgs
+            else import nixpkgs {
+              localSystem = {
+                inherit (pkgs.stdenv.buildPlatform) system config;
+              };
+              crossSystem = {
+                inherit (pkgs.stdenv.hostPlatform) system;
+                config = customConfig;
+              };
+            };
+        in
+          base.appendOverlays [
+            (self: super:
+              if (super.stdenv.hostPlatform.isDarwin or false)
+                && super.stdenv.hostPlatform.config != super.stdenv.buildPlatform.config
+              then { stdenv = super.stdenvAdapters.makeStaticLibraries super.stdenv; }
+              else { })
+          ];
+
+      # ---------------------------------------------------------------
+      # Pick the right static-producing package set for the caller's
+      # platform. Linux uses plain `pkgsStatic` (Hydra-cached). Darwin
+      # uses `darwinStaticCross` (fake-cross config trick). MinGW
+      # callers go through `applyMingwFix` instead, not this helper.
+      # ---------------------------------------------------------------
+
+      staticPkgsForSystem = pkgs:
+        if pkgs.stdenv.hostPlatform.isDarwin or false
+        then darwinStaticCross pkgs
+        else pkgs.pkgsStatic;
 
       # ---------------------------------------------------------------
       # Per-package fixes applied on top of `mingwStaticCross`.
@@ -236,9 +312,9 @@
           });
 
           raw = cross.${name};
+          fixed = if name == "jq" then fixJq raw else raw;
         in
-        if name == "jq" then fixJq raw
-        else raw;
+          fixed;
 
       # ---------------------------------------------------------------
       # Cross-prefix discovery. Both pkgsStatic and pkgsCross.mingwW64
@@ -251,16 +327,15 @@
       crossPrefix = pkgs: "${pkgs.stdenv.hostPlatform.config}-";
 
       # ---------------------------------------------------------------
-      # Legacy cross-mingw single-binary wrapper used by hand-rolled
-      # flakes (curl, ffmpeg, vim). Forces --disable-shared
-      # --enable-static at configure-time and -all-static at make-time.
+      # Cross-mingw single-binary wrapper. Used by curl/ffmpeg/vim
+      # consumed via `mkStandaloneFlake`'s `windowsBuild` arg for
+      # packages whose Windows build needs more than the default
+      # `mingwStaticCross.${name}` (e.g. Schannel for curl, from-source
+      # mkDerivation for ffmpeg, Make_ming.mak for vim).
       #
-      # New code should prefer `mkStandaloneFlake { ...; windows = true; }`,
-      # which uses `pkgsCross.mingwW64.pkgsStatic.<pkg>` directly (with
-      # the triple round-trip fixed). That pays a one-time xgcc rebuild
-      # populating unpins.cachix.org, then every subsequent build is a
-      # cache hit — same model as the darwin pkgsStatic toolchain. This
-      # helper exists only until those legacy flakes migrate.
+      # Forces --disable-shared --enable-static at configure-time and
+      # -all-static at make-time, so libtool resolves only `.a` and
+      # nixpkgs' DLL-link hook doesn't copy DLLs next to the binary.
       #
       # `staticDeps` is passed via .override so libtool sees the .a in
       # the dep's lib output (NOT applied as overlay — would touch the
@@ -302,10 +377,16 @@
       # ---------------------------------------------------------------
 
       packageWithMan = pkgs: name: drv:
-        let stripped = drv.overrideAttrs (_: { stripAllList = [ "bin" ]; });
+        let
+          stripped = drv.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; });
+          outs = stripped.outputs or [ "out" ];
+          # jq-style drvs declare a dedicated `bin` output; bash/coreutils-style
+          # drvs put binaries in `out`. Pick whichever holds the executables.
+          primary = if builtins.elem "bin" outs then stripped.bin else stripped.out;
+          hasMan = builtins.elem "man" outs;
         in pkgs.symlinkJoin {
           name = "${name}-${stripped.version}";
-          paths = [ stripped.bin stripped.man ];
+          paths = [ primary ] ++ nixpkgs.lib.optional hasMan stripped.man;
           passthru = { inherit (stripped) version pname; };
         };
 
@@ -320,7 +401,7 @@
       # ---------------------------------------------------------------
       strippedOrJoined = pkgs: name: drv:
         if (drv.outputs or [ "out" ]) == [ "out" ]
-        then drv.overrideAttrs (_: { stripAllList = [ "bin" ]; })
+        then drv.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
         else packageWithMan pkgs name drv;
 
       # ---------------------------------------------------------------
@@ -341,6 +422,7 @@
         { self
         , name
         , build ? null
+        , windowsBuild ? null
         , binName ? name
         , windows ? false
         , package_data ? true
@@ -351,22 +433,36 @@
           nixpkgsFor = forAllNative (system: import nixpkgs { inherit system; });
           rawBuild =
             if build == null
-            then (pkgs: applyPackageFix pkgs name pkgs.pkgsStatic.${name})
+            then (pkgs:
+              let sp = staticPkgsForSystem pkgs;
+              in applyPackageFix sp name sp.${name})
             else build;
           stripped = pkgs: strippedOrJoined pkgs name (rawBuild pkgs);
 
           # Windows build runs on x86_64-linux runners. allowUnsupportedSystem
           # because most nixpkgs `meta.platforms` lists exclude mingw,
           # so the cross-built drv would otherwise be filtered out.
-          # We use *plain* pkgsCross.mingwW64 (cached) and apply
-          # `makeStaticLibraries` as a stdenv adapter per-package —
-          # see `applyMingwFix` for the rationale.
+          #
+          # Two modes:
+          #   - `windows = true` (default cross via nixpkgs attr): we use
+          #     plain pkgsCross.mingwW64 (cached) and apply
+          #     `makeStaticLibraries` as a stdenv adapter per-package —
+          #     see `applyMingwFix` for the rationale.
+          #   - `windowsBuild = pkgs: drv` (custom): consumer constructs
+          #     the drv from scratch with full access to `windowsPkgs`
+          #     (plain nixpkgs at x86_64-linux). Used by curl (Schannel
+          #     + libpsl chain), ffmpeg (from-source mingw cross),
+          #     vim (Make_ming.mak custom).
+          windowsEnabled = windows || windowsBuild != null;
           windowsPkgs = import nixpkgs {
             system = "x86_64-linux";
             config.allowUnsupportedSystem = true;
           };
-          windowsCross = applyMingwFix windowsPkgs name;
-          windowsPkg = packageWithMan windowsPkgs name windowsCross;
+          windowsRaw =
+            if windowsBuild != null
+            then windowsBuild windowsPkgs
+            else applyMingwFix windowsPkgs name;
+          windowsPkg = strippedOrJoined windowsPkgs name windowsRaw;
         in {
           packages = forAllNative (system:
             let pkgs = nixpkgsFor.${system}; in
@@ -374,7 +470,7 @@
             // nixpkgs.lib.optionalAttrs (system == "aarch64-darwin") {
               "darwin-x86_64" = stripped pkgs.pkgsCross.x86_64-darwin;
             }
-            // nixpkgs.lib.optionalAttrs (windows && system == "x86_64-linux") {
+            // nixpkgs.lib.optionalAttrs (windowsEnabled && system == "x86_64-linux") {
               "windows-x86_64" = windowsPkg;
             });
 
