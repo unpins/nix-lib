@@ -82,6 +82,32 @@
             '';
           });
 
+        # GNU tar (gnutar) forks to external gzip/xz/bzip2/zstd binaries via
+        # compress.c — incompatible with single-binary shipping. libarchive's
+        # bsdtar links zlib/liblzma/libbz2/libzstd as libraries and handles every
+        # format in-process. Ship bsdtar renamed to `tar`; drop the other utils
+        # libarchive installs (bsdcat/bsdcpio/bsdunzip) so the package stays
+        # one binary.
+        tar.native = pkgs:
+          pkgs.pkgsStatic.libarchive.overrideAttrs (old: {
+            postInstall = (old.postInstall or "") + ''
+              mv "$out/bin/bsdtar" "$out/bin/tar"
+              find "$out/bin" -type f -not -name tar -delete
+            '';
+          });
+
+        # mingw: same shape. Imports stay system-only (bcrypt/KERNEL32/msvcrt);
+        # mingwStaticCross's stdenv adapter handles --enable-static --disable-shared
+        # for libarchive + its deps (zlib, xz, bzip2, zstd, openssl, lzo).
+        tar.mingw = pkgs:
+          let cross = lib.mingwStaticCross pkgs; in
+          cross.libarchive.overrideAttrs (old: {
+            postInstall = (old.postInstall or "") + ''
+              mv "$out/bin/bsdtar.exe" "$out/bin/tar.exe"
+              find "$out/bin" -type f -not -name "tar.exe" -delete
+            '';
+          });
+
         # Three things upstream nixpkgs doesn't do for jq on mingw:
         # - winpthreads in buildInputs (mingw-w64 ships it separately; jq #includes <pthread.h>).
         # - LDFLAGS=-all-static: windows.pthreads ships .a + .dll.a; without it libtool picks
