@@ -153,10 +153,16 @@ Libs: -L''${libdir} -L${self.libunistring}/lib -L${self.libiconv}/lib -lpsl -lid
       # `fixes` entries is the only path keeping both the cached toolchain AND
       # autotools-native-mode configure runs.
 
-      # Rebuild `drv` with every dep in `drv.override.__functionArgs` wrapped in
-      # `dropSharedLibs`. Used by `fixes.tmux.native` on darwin (pkgsStatic.tmux fails
-      # to link against libSystem; fall back to regular tmux but force deps' shared
-      # libs out). dropSharedLibs's isStatic guard skips already-static deps.
+      # Rebuild `drv` with every dep in `drv.override.__functionArgs` swapped for
+      # its `pkgsStatic` counterpart (.a-only, no shared libs at all), falling back
+      # to `dropSharedLibs` on the regular version when no pkgsStatic variant exists.
+      #
+      # Used by `fixes.tmux.native` on darwin: pkgsStatic.tmux itself fails to link
+      # (configure.ac passes `-static` globally → libSystem probe fails), so we keep
+      # regular tmux but swap its deps for the static variants. Preferring pkgsStatic
+      # over postFixup-delete dodges the dyld-at-build-time pitfall (ncurses ships
+      # `tic`/`infocmp` binaries dynamically linked to `libncursesw.dylib`; deleting
+      # the dylib breaks tmux-terminfo, which `tic`s at build time).
       withDepsSharedPruned = pkgs: drv:
         let
           fnArgs = drv.override.__functionArgs or {};
@@ -164,15 +170,19 @@ Libs: -L''${libdir} -L${self.libunistring}/lib -L${self.libiconv}/lib -lpsl -lid
             builtins.isAttrs v
             && (v.type or null) == "derivation"
             && v ? overrideAttrs;
+          pruneOne = name:
+            let
+              staticDep  = pkgs.pkgsStatic.${name} or null;
+              regularDep = pkgs.${name} or null;
+            in
+              if staticDep != null && isPrunableDrv staticDep
+              then { inherit name; value = staticDep; }
+              else if regularDep != null && isPrunableDrv regularDep
+              then { inherit name; value = dropSharedLibs regularDep; }
+              else null;
           overrides = builtins.listToAttrs (
-            builtins.filter (x: x != null) (
-              map (name:
-                let v = pkgs.${name} or null;
-                in if v != null && isPrunableDrv v
-                   then { inherit name; value = dropSharedLibs v; }
-                   else null
-              ) (builtins.attrNames fnArgs)
-            )
+            builtins.filter (x: x != null)
+              (map pruneOne (builtins.attrNames fnArgs))
           );
         in drv.override overrides;
 
