@@ -46,26 +46,17 @@
         # link probe fails. Fall back to regular tmux with deps' shared libs pruned;
         # runtime closure ends up libSystem-only either way.
         #
-        # Plus postFixup: `darwin.libresolv` ships its own libresolv.9.dylib in
-        # /nix/store/.../libresolv-91/. Every macOS already has /usr/lib/libresolv.9.dylib,
-        # so retarget the install-name to the system path — leaving no /nix/store
-        # reference in `otool -L`.
+        # Plus postPatch: tmux's configure.ac probes `b64_ntop` against -lresolv;
+        # on darwin libresolv provides it so tmux links libresolv.9.dylib. We only
+        # want libSystem in the binary, so disable that probe — tmux falls back to
+        # its bundled compat/base64.c.
         tmux.native = pkgs:
           let p = pkgs.pkgsStatic; in
           if p.stdenv.hostPlatform.isDarwin
           then (lib.withDepsSharedPruned pkgs pkgs.tmux).overrideAttrs (old: {
-            postFixup = (old.postFixup or "") + ''
-              for f in $out/bin/*; do
-                [ -f "$f" ] || continue
-                while IFS= read -r line; do
-                  libpath="$(echo "$line" | awk '{print $1}')"
-                  case "$libpath" in
-                    /nix/store/*libresolv*/lib/libresolv.*.dylib)
-                      install_name_tool -change "$libpath" /usr/lib/libresolv.9.dylib "$f"
-                      ;;
-                  esac
-                done < <(otool -L "$f" | tail -n +2)
-              done
+            postPatch = (old.postPatch or "") + ''
+              substituteInPlace configure.ac \
+                --replace-fail 'LIBS="$OLD_LIBS -lresolv"' 'LIBS="$OLD_LIBS"'
             '';
           })
           else p.tmux;
