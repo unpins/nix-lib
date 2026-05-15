@@ -418,6 +418,9 @@ Libs: -L''${libdir} -L${self.libunistring}/lib -L${self.libiconv}/lib -lpsl -lid
             // nixpkgs.lib.optionalAttrs (nativeBuild && system == "aarch64-darwin") {
               "darwin-x86_64" = stripped pkgs.pkgsCross.x86_64-darwin;
             }
+            // nixpkgs.lib.optionalAttrs (nativeBuild && system == "x86_64-linux") {
+              "linux-i686" = stripped pkgs.pkgsCross.musl32;
+            }
             // nixpkgs.lib.optionalAttrs (windowsEnabled && system == "x86_64-linux") {
               "windows-x86_64" = windowsPkg;
             });
