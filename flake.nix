@@ -421,6 +421,15 @@ Libs: -L''${libdir} -L${self.libunistring}/lib -L${self.libiconv}/lib -lpsl -lid
             // nixpkgs.lib.optionalAttrs (nativeBuild && system == "x86_64-linux") {
               "linux-i686" = stripped pkgs.pkgsCross.musl32;
             }
+            // nixpkgs.lib.optionalAttrs (nativeBuild && system == "aarch64-linux") {
+              # muslpi = armv6l-unknown-linux-musleabihf. Baseline armv6 ISA
+              # (no NEON), runs on every ARM v6+ device (Pi 1/Zero through
+              # Pi 4/5 in 32-bit mode, BeagleBone, Odroid, etc.). Labeled
+              # "armv7l" because that's what `uname -m` returns on the
+              # dominant target hardware and matches the Rust ecosystem
+              # convention (ripgrep/fd/bat all use armv7 in this slot).
+              "linux-armv7l" = stripped pkgs.pkgsCross.muslpi;
+            }
             // nixpkgs.lib.optionalAttrs (windowsEnabled && system == "x86_64-linux") {
               "windows-x86_64" = windowsPkg;
             });
