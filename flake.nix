@@ -420,6 +420,16 @@ Libs: -L''${libdir} -L${self.libunistring}/lib -L${self.libiconv}/lib -lpsl -lid
             }
             // nixpkgs.lib.optionalAttrs (nativeBuild && system == "x86_64-linux") {
               "linux-i686" = stripped pkgs.pkgsCross.musl32;
+              # musl-power = powerpc64le-unknown-linux-musl. Debian calls it
+              # "ppc64el" but uname returns "ppc64le" and the Rust ecosystem
+              # (rustup, binstall) labels it the same way — we follow uname.
+              "linux-ppc64le" = stripped pkgs.pkgsCross.musl-power;
+              # riscv64 has no pre-cooked musl variant in nixpkgs.pkgsCross
+              # (only glibc). Spell the crossSystem out by triple.
+              "linux-riscv64" = stripped (import nixpkgs {
+                inherit system;
+                crossSystem = { config = "riscv64-unknown-linux-musl"; };
+              });
             }
             // nixpkgs.lib.optionalAttrs (nativeBuild && system == "aarch64-linux") {
               # muslpi = armv6l-unknown-linux-musleabihf. Baseline armv6 ISA
