@@ -1,23 +1,19 @@
-# Disable libedit on darwin only. nixpkgs 25.11's dash 0.5.13.2
-# tightened the libedit probe (AC_CHECK_LIB history_init), and darwin
-# pkgsStatic's libedit doesn't satisfy that probe — almost certainly
-# because the static link needs `-liconv` (a darwin-specific quirk
-# pkg-config doesn't surface). Without working line-editing libs,
-# configure aborts with "Can't find libedit." instead of falling back.
+# darwin: dash's configure.ac translates `--enable-static` into
+# `export LDFLAGS="-static"`. On darwin libSystem.a doesn't exist (only
+# libSystem.dylib), so every AC_CHECK_LIB probe that exec's a link
+# command afterwards fails — including the libedit probe that aborts
+# the build with "Can't find libedit." Same family as htop's
+# native/htop.nix darwin branch.
 #
-# Linux pkgsStatic.dash keeps libedit (CI green across musl variants),
-# so users on the dominant platform get arrow-key history. Darwin
-# matches Windows in losing it — both rely on bash/zsh for interactive
-# work anyway. TODO: try `LIBS="$LIBS -liconv"` preConfigure on darwin
-# to restore it; needs a darwin runner to iterate against.
+# Filter the flag like htop does. Dependency static linking still works
+# via the per-input .a libraries pkgsStatic supplies; only libSystem
+# remains implicitly-dynamic — matches the catalog's darwin policy.
 { lib }:
 pkgs:
 let p = pkgs.pkgsStatic; in
 if p.stdenv.hostPlatform.isDarwin then
   p.dash.overrideAttrs (oa: {
-    buildInputs = [ ];
-    configureFlags = [ "--without-libedit" ];
-    preConfigure = "";
+    configureFlags = p.lib.filter (f: f != "--enable-static") (oa.configureFlags or [ ]);
   })
 else
   p.dash
