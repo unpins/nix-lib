@@ -67,16 +67,20 @@ let
     };
   };
 
-  arch = pkgs.stdenv.hostPlatform.parsed.cpu.name;
-  archPrefix =
-    if arch == "x86_64" then "x86_64"
-    else if arch == "aarch64" then "aarch64"
-    else throw "cosmocc.nix: unsupported arch ${arch}";
+  supportedArches = [ "x86_64" "aarch64" ];
+  resolveArch = name:
+    if builtins.elem name supportedArches then name
+    else throw "cosmocc.nix: unsupported arch ${name}";
+  hostArch = resolveArch pkgs.stdenv.hostPlatform.parsed.cpu.name;
 
   # See docs/platforms/cosmocc.md "Toolchain wiring" traps for the why behind:
   # - single-arch driver ($COSMOS env honoured)
   # - shell shims (cosmocross arch-prefix check, APE bintools ENOEXEC)
-  cosmoCCUnwrapped = pkgs.runCommand "cosmocc-cc-${version}-unwrapped"
+  #
+  # Parameterized by `archPrefix` so cross-arch wiring (e.g. x86_64-linux
+  # build host targeting aarch64-cosmo) can synthesize the right driver.
+  # The native `cosmoStdenv` below always uses `hostArch`.
+  mkCcUnwrapped = archPrefix: pkgs.runCommand "cosmocc-cc-${version}-${archPrefix}-unwrapped"
     {
       passthru = {
         isGNU = true;
@@ -113,7 +117,7 @@ let
     chmod +x $out/bin/cpp
   '';
 
-  cosmoBintoolsUnwrapped = pkgs.runCommand "cosmocc-bintools-${version}-unwrapped"
+  mkBintoolsUnwrapped = archPrefix: pkgs.runCommand "cosmocc-bintools-${version}-${archPrefix}-unwrapped"
     {
       passthru = {
         isGNU = true;
@@ -131,6 +135,9 @@ let
       fi
     done
   '';
+
+  cosmoCCUnwrapped = mkCcUnwrapped hostArch;
+  cosmoBintoolsUnwrapped = mkBintoolsUnwrapped hostArch;
 
   cosmoBintools = pkgs.wrapBintoolsWith {
     bintools = cosmoBintoolsUnwrapped;
@@ -161,33 +168,45 @@ let
   # cc-wrapper looks for `${ccPath}/${targetPrefix}gcc` and bintools-wrapper
   # likewise — so we synthesize the target-prefixed names as symlinks back
   # to the shims we already built.
-  mkCrossWiring = { buildPackages, baseStdenv, targetPrefix }: rec {
+  #
+  # `targetArch` defaults to the build host's arch (cross-arch within cosmo
+  # is unusual: the cosmocc zip ships both x86_64 and aarch64 single-arch
+  # drivers, but emitting the wrong one for the target produces broken APEs).
+  mkCrossWiring =
+    { buildPackages
+    , baseStdenv
+    , targetPrefix
+    , targetArch ? hostArch
+    }: rec {
+    targetCcUnwrapped = mkCcUnwrapped (resolveArch targetArch);
+    targetBintoolsUnwrapped = mkBintoolsUnwrapped (resolveArch targetArch);
+
     ccUnwrappedCross = buildPackages.runCommand "cosmocc-cc-cross-unwrapped"
       {
-        inherit (cosmoCCUnwrapped) passthru;
+        inherit (targetCcUnwrapped) passthru;
       } ''
       mkdir -p $out/bin
-      for d in ${cosmoCCUnwrapped}/*; do
+      for d in ${targetCcUnwrapped}/*; do
         n=$(basename "$d")
         [ "$n" = bin ] && continue
         ln -sf "$d" "$out/$n"
       done
-      for f in ${cosmoCCUnwrapped}/bin/*; do
+      for f in ${targetCcUnwrapped}/bin/*; do
         ln -sf "$f" "$out/bin/$(basename "$f")"
       done
       for tool in gcc g++ cpp cc c++; do
-        if [ -e ${cosmoCCUnwrapped}/bin/$tool ]; then
-          ln -sf ${cosmoCCUnwrapped}/bin/$tool "$out/bin/${targetPrefix}$tool"
+        if [ -e ${targetCcUnwrapped}/bin/$tool ]; then
+          ln -sf ${targetCcUnwrapped}/bin/$tool "$out/bin/${targetPrefix}$tool"
         fi
       done
     '';
 
     bintoolsUnwrappedCross = buildPackages.runCommand "cosmocc-bintools-cross-unwrapped"
       {
-        inherit (cosmoBintoolsUnwrapped) passthru;
+        inherit (targetBintoolsUnwrapped) passthru;
       } ''
       mkdir -p $out/bin
-      for f in ${cosmoBintoolsUnwrapped}/bin/*; do
+      for f in ${targetBintoolsUnwrapped}/bin/*; do
         n=$(basename "$f")
         ln -sf "$f" "$out/bin/$n"
         ln -sf "$f" "$out/bin/${targetPrefix}$n"

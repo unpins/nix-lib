@@ -309,9 +309,17 @@
         # (small, see ./cosmo-lib-systems.patch). replaceCrossStdenv injects our
         # cosmocc cc-wrapper into the cross-stdenv that nixpkgs constructs.
         #
+        # `targetArch` picks the cosmocc single-arch driver. cosmocc ships both
+        # x86_64 and aarch64; arch must match `cosmoStdenv`'s host (see cosmocc.nix
+        # `archPrefix`). Cross-arch (e.g. x86_64-linux host building aarch64-cosmo)
+        # isn't wired — needs a buildPackages.pkgsCross stanza, not exposed yet.
+        #
         # Most packages need `NIXPKGS_ALLOW_UNSUPPORTED_SYSTEM=1` because their
         # `meta.platforms` doesn't list cosmo.
-        mkPkgsCosmo = { system ? "x86_64-linux" }:
+        mkPkgsCosmo =
+          { system ? "x86_64-linux"
+          , targetArch ? "x86_64"
+          }:
           let
             basePkgs = nixpkgs.legacyPackages.${system};
             nixpkgsPatched = basePkgs.applyPatches {
@@ -320,11 +328,12 @@
               patches = [ ./cosmo-lib-systems.patch ];
             };
             cosmoOverlay = import ./cosmo { inherit (nixpkgs) lib; };
+            targetConfig = "${targetArch}-unknown-cosmo-gnu";
           in
           import nixpkgsPatched {
             inherit system;
             crossSystem = {
-              config = "x86_64-unknown-cosmo-gnu";
+              config = targetConfig;
               libc = null;
             };
             overlays = [ cosmoOverlay ];
@@ -332,8 +341,8 @@
               let
                 cs = import ./cosmocc.nix { pkgs = buildPackages; };
                 wiring = cs.mkCrossWiring {
-                  inherit buildPackages baseStdenv;
-                  targetPrefix = "x86_64-unknown-cosmo-gnu-";
+                  inherit buildPackages baseStdenv targetArch;
+                  targetPrefix = "${targetConfig}-";
                 };
               in
               wiring.stdenv;
