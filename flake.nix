@@ -188,6 +188,10 @@
               nativeBuildInputs = (old.nativeBuildInputs or [ ])
                 ++ [
                   pkgs.buildPackages.llvm
+                  # `file` drives the per-format branch in __unpin_objcopy
+                  # (Mach-O sections need __SEG,__SECT form; ELF/PE use plain
+                  # names). Not in baseline stdenv on darwin.
+                  pkgs.buildPackages.file
                   # unzip/zip + python3Minimal are only exercised on cosmocc
                   # outputs (tail-ZIP detection, offset compute, stored append).
                   # ~10 MB of build closure, never linked into shipped artifacts.
@@ -278,15 +282,34 @@
                     exit 1
                   fi
 
-                  # `--remove-section .unpin_meta` before `--add-section` keeps
-                  # the embed idempotent — no-op when the section is missing,
-                  # cleans up a previous embed when chained or re-run.
+                  # `--remove-section` before `--add-section` keeps the embed
+                  # idempotent — no-op when the section is missing, cleans up
+                  # a previous embed when chained or re-run.
+                  #
+                  # llvm-objcopy's `--set-section-flags` is ELF-only and its
+                  # section-name format differs per object format: ELF/PE
+                  # accept a plain name (`.unpin_meta`), Mach-O requires
+                  # `SEGNAME,SECTNAME` (`__TEXT,__unpin_meta`, both ≤ 16 chars).
+                  # Branching on `file -b` keeps a single code path while
+                  # respecting each format's contract. The unpin reader scans
+                  # the raw file bytes for the 0xff-0xff sentinels regardless
+                  # of section name, so the alias payload is found either way.
                   __unpin_objcopy() {
-                    llvm-objcopy \
-                      --remove-section .unpin_meta \
-                      --add-section .unpin_meta="$__unpin_meta" \
-                      --set-section-flags .unpin_meta=readonly,noload \
-                      "$1"
+                    case "$(file -b "$1")" in
+                      *Mach-O*)
+                        llvm-objcopy \
+                          --remove-section __TEXT,__unpin_meta \
+                          --add-section __TEXT,__unpin_meta="$__unpin_meta" \
+                          "$1"
+                        ;;
+                      *)
+                        llvm-objcopy \
+                          --remove-section .unpin_meta \
+                          --add-section .unpin_meta="$__unpin_meta" \
+                          --set-section-flags .unpin_meta=readonly,noload \
+                          "$1"
+                        ;;
+                    esac
                   }
 
                   if unzip -l "$__unpin_bin" >/dev/null 2>&1; then
