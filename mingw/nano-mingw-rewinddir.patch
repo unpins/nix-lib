@@ -1,0 +1,22 @@
+--- a/src/browser.c
++++ b/src/browser.c
+@@ -72,7 +72,19 @@
+ 	if (gauge > COLS)
+ 		gauge = COLS;
+ 
++#ifdef _WIN32
++	/* gnulib redefines DIR as `struct gl_directory *` but leaves rewinddir
++	 * unreplaced (GL_GNULIB_REWINDDIR=0), so mingw's rewinddir(mingw_DIR *)
++	 * declaration clashes with the dir pointer's gl_directory type.
++	 * closedir+opendir has the same effect with a smaller blast radius
++	 * than patching gnulib. */
++	closedir(dir);
++	dir = opendir(path);
++	if (dir == NULL)
++		return;
++#else
+ 	rewinddir(dir);
++#endif
+ 
+ 	free_chararray(filelist, list_length);
+ 
