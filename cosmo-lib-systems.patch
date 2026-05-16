@@ -1,0 +1,27 @@
+diff --git a/lib/systems/parse.nix b/lib/systems/parse.nix
+--- a/lib/systems/parse.nix
++++ b/lib/systems/parse.nix
+@@ -636,6 +636,10 @@
+       mmixware = {
+         execFormat = unknown;
+         families = { };
++      };
++      cosmo = {
++        execFormat = elf;
++        families = { };
+       };
+     }
+     // {
+diff --git a/lib/systems/inspect.nix b/lib/systems/inspect.nix
+--- a/lib/systems/inspect.nix
++++ b/lib/systems/inspect.nix
+@@ -362,6 +362,9 @@
+     isNone = {
+       kernel = kernels.none;
+     };
++    isCosmo = {
++      kernel = kernels.cosmo;
++    };
+
+     isAndroid = [
+       {
