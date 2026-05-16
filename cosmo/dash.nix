@@ -1,17 +1,17 @@
 # dash via mkPkgsCosmo for Windows-x86_64.
 #
-# nixpkgs 25.11 ships dash 0.5.12 — same version superconfigure/playground
-# validated, no pin needed (unlike coreutils). The playground POC
-# (cosmoStdenv direct) compiled clean *without* superconfigure's
-# minimal.diff; we follow the same route here and only reach for the
-# diff if cosmocc trips on `mbstate_t = {}` empty-init.
+# nixpkgs 25.11 ships dash 0.5.13.2. Builds clean against cosmocc 4.0.2
+# without any source patches — superconfigure's minimal.diff (5 hunks of
+# `mbstate_t = {}` → `{0}`) turned out unnecessary at this cosmocc
+# version.
 #
-# Only two delta vs the nixpkgs derivation:
-#   - drop libedit (no cosmo build of it; dash --without-libedit just
-#     loses line editing in interactive mode, which is fine for a
-#     scripting shell).
-#   - apelink ELF -> PE32+ in postFixup so `bin/dash.exe` is what gets
-#     stripped/joined upstream.
+# Two deltas vs the nixpkgs derivation:
+#   - libedit's static link chain is satisfied by our cosmo libedit
+#     overlay (see ./libedit.nix); the upstream nixpkgs preConfigure
+#     already exports `LIBS="$(pkg-config --libs --static libedit)"`
+#     which now resolves cleanly under cosmo.
+#   - apelink ELF -> PE32+ in postFixup so `bin/dash.exe` is what
+#     gets stripped/joined upstream.
 { lib }:
 final: prev:
 let
@@ -19,13 +19,17 @@ let
 in
 if (prev.stdenv.hostPlatform.isCosmo or false) then {
   dash = (prev.dash.overrideAttrs (oa: {
-    # nixpkgs adds libedit as a buildInput and pkg-configs `--libs --static`
-    # for it under pkgsStatic. cosmo has neither libedit nor pkg-config
-    # for it; drop both. preConfigure is the LIBS export — nuke entirely
-    # since we no longer need libedit.
-    buildInputs = [ ];
-    configureFlags = [ "--without-libedit" ];
-    preConfigure = "";
+    # nixpkgs's preConfigure exports `LIBS` only when
+    # `hostPlatform.isStatic` is true — our cosmo cross doesn't match
+    # that gate, so the libedit-via-pkg-config flags never reach the
+    # final link step and `tputs`/`tigetstr` from ncurses come up
+    # undefined. Re-run the export unconditionally for cosmo.
+    nativeBuildInputs = (oa.nativeBuildInputs or [ ]) ++ [
+      final.buildPackages.pkg-config
+    ];
+    preConfigure = ''
+      export LIBS="$(''${PKG_CONFIG:-pkg-config} --libs --static libedit)"
+    '';
 
     env = (oa.env or { }) // {
       NIX_CFLAGS_COMPILE = builtins.concatStringsSep " " [
