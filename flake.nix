@@ -110,8 +110,65 @@
           let
             hasExplicit = aliases != null;
             hasAuto = aliasesFromSymlinksIn != null;
-            explicitCsv = nixpkgs.lib.concatStringsSep ","
-              (if hasExplicit then aliases else [ ]);
+
+            # Mirrors `validate_alias` in unpin/src/aliases.rs so a bogus
+            # name fails the build instead of the install. Kept in sync
+            # by hand — the Rust function is the canonical reference.
+            unpinBlockedNames = [
+              "sudo" "su" "doas" "ssh" "scp" "sftp"
+              "ssh-add" "ssh-agent" "ssh-keygen"
+              "git" "gh" "hg" "svn"
+              "gpg" "gpg2" "pinentry" "age" "rage"
+              "python" "python2" "python3" "node" "nodejs" "deno"
+              "npm" "npx" "yarn" "pnpm"
+              "cargo" "rustc" "rustup" "go" "java" "javac"
+              "ruby" "gem" "bundle" "perl" "php" "lua"
+              "bash" "sh" "zsh" "fish" "ksh" "dash" "csh" "tcsh"
+              "cmd" "powershell" "pwsh"
+              "unpin"
+            ];
+            unpinWindowsReserved = [
+              "CON" "PRN" "AUX" "NUL"
+              "COM1" "COM2" "COM3" "COM4" "COM5"
+              "COM6" "COM7" "COM8" "COM9"
+              "LPT1" "LPT2" "LPT3" "LPT4" "LPT5"
+              "LPT6" "LPT7" "LPT8" "LPT9"
+            ];
+            validateAliasName = name:
+              let
+                lib_ = nixpkgs.lib;
+                chars = lib_.stringToCharacters name;
+                isAlnum = c: builtins.match "[a-z0-9]" c != null;
+                isAllowed = c: builtins.match "[a-z0-9._-]" c != null;
+                stem = builtins.head (lib_.splitString "." name);
+              in
+              if name == "" then
+                throw "withAliases: empty alias name"
+              else if lib_.stringLength name > 64 then
+                throw "withAliases: alias `${name}` length ${toString (lib_.stringLength name)} exceeds 64"
+              else if !(isAlnum (builtins.head chars)) then
+                throw "withAliases: alias `${name}` must start with [a-z0-9]"
+              else if builtins.any (c: !(isAllowed c)) chars then
+                throw "withAliases: alias `${name}` has char outside [a-z0-9._-]"
+              else if builtins.elem (lib_.toUpper stem) unpinWindowsReserved then
+                throw "withAliases: alias `${name}` matches a Windows reserved device name"
+              else if builtins.elem name unpinBlockedNames then
+                throw "withAliases: alias `${name}` would shadow a sensitive command (blocklist)"
+              else name;
+
+            # Force validation by mapping validate over the list before
+            # concatenating. concatStringsSep is strict over its inputs,
+            # so every name is exercised at eval time.
+            validatedAliases =
+              if hasExplicit
+              then builtins.map validateAliasName aliases
+              else [ ];
+            explicitCsv = nixpkgs.lib.concatStringsSep "," validatedAliases;
+
+            # Shell-side blocklist — same set as unpinBlockedNames, rendered
+            # for `case` glob alternation. Kept lockstep with the Nix list.
+            shellBlockedPattern =
+              nixpkgs.lib.concatStringsSep "|" unpinBlockedNames;
             wrapped = drv.overrideAttrs (old: {
               nativeBuildInputs = (old.nativeBuildInputs or [ ])
                 ++ [
@@ -126,17 +183,41 @@
 
               postInstall = (old.postInstall or "")
                 + nixpkgs.lib.optionalString hasAuto ''
+                # Mirrors validate_alias (unpin/src/aliases.rs): names that
+                # the installer would reject get filtered at the source so
+                # the build embeds only legal entries. The patterns are
+                # one-to-one with the Rust validator — keep them in sync.
                 __unpin_aliases=""
+                __unpin_count=0
                 for f in "$out/${aliasesFromSymlinksIn}"/*; do
                   [ -L "$f" ] || continue
                   n="$(basename "$f")"
                   [ "$n" = "${primary}" ] && continue
-                  # Skip names the unpin reader's `validate_alias` would reject
-                  # (first char must be [a-z0-9]). Filters coreutils' `[`
-                  # applet and any future oddballs at the source.
+                  # First char must be [a-z0-9] — filters coreutils' `[`.
                   case "$n" in [a-z0-9]*) ;; *) continue ;; esac
+                  # Every char must be in [a-z0-9._-].
+                  case "$n" in *[!a-z0-9._-]*) continue ;; esac
+                  # Length cap (mirrors MAX_ALIAS_LEN = 64).
+                  [ "''${#n}" -le 64 ] || continue
+                  # Stem (chars before first dot) must not be a Windows
+                  # reserved device name (matters even on Unix builds
+                  # because the same package may run on Windows).
+                  case "''${n%%.*}" in
+                    con|prn|aux|nul|com[1-9]|lpt[1-9]) continue ;;
+                  esac
+                  # Blocklist (sudo/ssh/python/bash/…). Rendered from the
+                  # Nix unpinBlockedNames list to stay in lockstep.
+                  case "$n" in
+                    ${shellBlockedPattern}) continue ;;
+                  esac
                   __unpin_aliases="''${__unpin_aliases:+$__unpin_aliases,}$n"
+                  __unpin_count=$((__unpin_count + 1))
                 done
+                # Mirrors MAX_ALIASES = 256 in unpin/src/aliases.rs.
+                if [ "$__unpin_count" -gt 256 ]; then
+                  echo "withAliases: collected $__unpin_count aliases, exceeds limit of 256" >&2
+                  exit 1
+                fi
                 printf '%s' "$__unpin_aliases" > "$NIX_BUILD_TOP/.unpin-aliases"
                 find "$out/${aliasesFromSymlinksIn}" -maxdepth 1 -type l -delete
               '';
@@ -186,9 +267,13 @@ with zipfile.ZipFile(sys.argv[1]) as z:
                     # ZIP has functional content (zoneinfo etc.). Append our
                     # block as a stored entry — bytes appear verbatim so the
                     # scanner finds the sentinels; -X drops uid/gid for
-                    # reproducible builds.
+                    # reproducibility, and we pin the mtime via `touch`
+                    # because `zip` records DOS file-times from the source
+                    # mtime (build-clock-dependent without this).
+                    # 315532800 = 1980-01-01, the ZIP DOS-date epoch floor.
                     __unpin_stage="$(mktemp -d)"
                     cp "$__unpin_meta" "$__unpin_stage/.unpin_meta"
+                    touch -d "@''${SOURCE_DATE_EPOCH:-315532800}" "$__unpin_stage/.unpin_meta"
                     ( cd "$__unpin_stage" && zip -0 -X -j "$__unpin_bin" .unpin_meta ) >/dev/null
                     rm -rf "$__unpin_stage"
                   fi
@@ -208,7 +293,12 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             throw "withAliases: pass either `aliases` or `aliasesFromSymlinksIn`, not both"
           else if !hasExplicit && !hasAuto then
             throw "withAliases: requires `aliases` or `aliasesFromSymlinksIn`"
-          else wrapped;
+          else if hasExplicit && builtins.length aliases > 256 then
+            throw "withAliases: ${toString (builtins.length aliases)} aliases exceeds limit 256"
+          # deepSeq forces each `validateAliasName` invocation now instead
+          # of deferring it to when the postFixup string is constructed.
+          # Without this, throws fire at build-graph realization, not eval.
+          else builtins.deepSeq validatedAliases wrapped;
 
         # Why not overlays for per-package fixes? `appendOverlays` invalidates
         # `pkgsBuildHost.stdenv` → cascade rebuild of compiler-rt-libc-static, ninja,
