@@ -48,6 +48,168 @@
             '';
           });
 
+        # Embed an UNPIN_META alias block into `$out/bin/<primary>` so unpin's
+        # installer can spawn argv[0]-dispatch links (xz → xzcat/unxz/lzma…) at
+        # `unpin install` time. The block is a payload bracketed by 0xff-0xff
+        # sentinels (see unpin/src/aliases.rs) and the reader scans for the
+        # sentinels in the file bytes — section name is irrelevant to consumption.
+        #
+        # We write into a custom `.unpin_meta` section via
+        # `llvm-objcopy --add-section` (not append-after-EOF) for three reasons:
+        # (1) ELF/PE/Mach-O all accept a named SHT_PROGBITS section and
+        # llvm-objcopy adjusts the headers correctly across formats;
+        # (2) standard `strip` only removes debug/symbol sections by name, so
+        # `.unpin_meta` survives — a trailer would be lost by any tool that
+        # rewrites the file by declared image size; (3) future code-signing
+        # puts the section inside the signature envelope while a trailer
+        # would invalidate it. `noload` + no `SHF_ALLOC` means the section is
+        # a file-only artifact — zero runtime memory cost.
+        #
+        # NB: we deliberately AVOID the `.note.*` namespace. llvm-objcopy
+        # parses `.note.*` payloads as structured ELF note records (namesz +
+        # descsz + type + payload), enforces 4-byte alignment, and rejects raw
+        # bytes that don't fit the schema. SHT_PROGBITS with a non-`.note`
+        # name dodges that entirely.
+        #
+        # Two input modes (exactly one required):
+        #   aliases = [ "xzcat" "unxz" "lzma" ];   # explicit list, Nix-eval-time
+        #   aliasesFromSymlinksIn = "bin";         # harvest $out/bin/* symlinks
+        #
+        # `aliasesFromSymlinksIn` is the multicall pattern (coreutils,
+        # busybox): upstream creates one symlink per applet next to the real
+        # multicall binary. We collect them in postInstall, wipe the symlinks
+        # (we ship one binary, the alias links are unpin's job at install time)
+        # then embed the list in postFixup so the embed runs AFTER stdenv strip.
+        #
+        # Cosmocc / APE binaries: cosmocc emits PE-at-head + ZIP-at-tail. Naïve
+        # `llvm-objcopy` would parse only the PE half and silently drop the
+        # tail ZIP (losing `.symtab.amd64` and any embedded runtime resources).
+        # The embed step auto-detects the tail-ZIP case via `unzip -l` and
+        # picks the safe path:
+        #
+        #   (a) ZIP contains only debug/marker entries (`.symtab.*`, `.cosmo`):
+        #       truncate the ZIP entirely so the artifact is a pure PE/ELF/
+        #       Mach-O, then `llvm-objcopy --add-section`. Saves ~80–230 KB
+        #       per artifact by dropping debug symtab — affects crash-time
+        #       stack symbolication only, runtime behavior unaffected.
+        #
+        #   (b) ZIP carries functional data (e.g. `usr/share/zoneinfo/*` for
+        #       bash/coreutils on Windows where no system zoneinfo exists):
+        #       append our meta as a *stored* (not deflated) ZIP entry. The
+        #       0xff-0xff sentinels appear verbatim in the entry payload, so
+        #       the unpin scanner finds them; cosmocc's `/zip/<name>` lookups
+        #       are by name and our new entry doesn't conflict.
+        #
+        # Non-ZIP binaries (every native build, mingw cross): single branch
+        # straight to `llvm-objcopy`. No new dependencies along the hot path.
+        withAliases = pkgs:
+          { primary
+          , aliases ? null
+          , aliasesFromSymlinksIn ? null
+          }: drv:
+          let
+            hasExplicit = aliases != null;
+            hasAuto = aliasesFromSymlinksIn != null;
+            explicitCsv = nixpkgs.lib.concatStringsSep ","
+              (if hasExplicit then aliases else [ ]);
+            wrapped = drv.overrideAttrs (old: {
+              nativeBuildInputs = (old.nativeBuildInputs or [ ])
+                ++ [
+                  pkgs.buildPackages.llvm
+                  # unzip/zip + python3Minimal are only exercised on cosmocc
+                  # outputs (tail-ZIP detection, offset compute, stored append).
+                  # ~10 MB of build closure, never linked into shipped artifacts.
+                  pkgs.buildPackages.unzip
+                  pkgs.buildPackages.zip
+                  pkgs.buildPackages.python3Minimal
+                ];
+
+              postInstall = (old.postInstall or "")
+                + nixpkgs.lib.optionalString hasAuto ''
+                __unpin_aliases=""
+                for f in "$out/${aliasesFromSymlinksIn}"/*; do
+                  [ -L "$f" ] || continue
+                  n="$(basename "$f")"
+                  [ "$n" = "${primary}" ] && continue
+                  # Skip names the unpin reader's `validate_alias` would reject
+                  # (first char must be [a-z0-9]). Filters coreutils' `[`
+                  # applet and any future oddballs at the source.
+                  case "$n" in [a-z0-9]*) ;; *) continue ;; esac
+                  __unpin_aliases="''${__unpin_aliases:+$__unpin_aliases,}$n"
+                done
+                printf '%s' "$__unpin_aliases" > "$NIX_BUILD_TOP/.unpin-aliases"
+                find "$out/${aliasesFromSymlinksIn}" -maxdepth 1 -type l -delete
+              '';
+
+              postFixup = (old.postFixup or "") + ''
+                ${if hasExplicit
+                  then "__unpin_aliases='${explicitCsv}'"
+                  else ''__unpin_aliases="$(cat "$NIX_BUILD_TOP/.unpin-aliases")"''}
+                __unpin_meta="$(mktemp)"
+                # Octal escapes (\NNN) for portability — \xHH isn't POSIX,
+                # though every stdenv shell we use happens to support it.
+                # Marker bytes mirror aliases.rs MARKER_BEGIN/MARKER_END verbatim.
+                printf '\377\377UNPIN_META_v1_7f3a4e\377\377\nALIASES=%s\n\377\377UNPIN_META_END_7f3a4e\377\377\n' \
+                  "$__unpin_aliases" > "$__unpin_meta"
+
+                __unpin_bin="$out/bin/${primary}"
+
+                if unzip -l "$__unpin_bin" >/dev/null 2>&1; then
+                  # Cosmocc tail-ZIP detected. Decide between purify-then-objcopy
+                  # vs zip-append based on entry list.
+                  __unpin_pure=1
+                  while IFS= read -r __unpin_entry; do
+                    case "$__unpin_entry" in
+                      .symtab.*|.cosmo) ;;
+                      *) __unpin_pure=0; break ;;
+                    esac
+                  done < <(unzip -Z1 "$__unpin_bin")
+
+                  if [ "$__unpin_pure" = 1 ]; then
+                    # ZIP only carries throwaway debug/marker. Truncate it
+                    # entirely so the artifact becomes a pure PE/ELF/Mach-O.
+                    # Use python's zipfile to locate the first local-file-
+                    # header offset rather than `grep PK\x03\x04`, which
+                    # would false-positive on coincidental matches in PE
+                    # code. Crash-time symbolication is the only thing lost.
+                    __unpin_offset=$(python3 -c '
+import zipfile, sys
+with zipfile.ZipFile(sys.argv[1]) as z:
+    print(min(i.header_offset for i in z.infolist()))
+' "$__unpin_bin")
+                    truncate -s "$__unpin_offset" "$__unpin_bin"
+                    llvm-objcopy \
+                      --add-section .unpin_meta="$__unpin_meta" \
+                      --set-section-flags .unpin_meta=readonly,noload \
+                      "$__unpin_bin"
+                  else
+                    # ZIP has functional content (zoneinfo etc.). Append our
+                    # block as a stored entry — bytes appear verbatim so the
+                    # scanner finds the sentinels; -X drops uid/gid for
+                    # reproducible builds.
+                    __unpin_stage="$(mktemp -d)"
+                    cp "$__unpin_meta" "$__unpin_stage/.unpin_meta"
+                    ( cd "$__unpin_stage" && zip -0 -X -j "$__unpin_bin" .unpin_meta ) >/dev/null
+                    rm -rf "$__unpin_stage"
+                  fi
+                else
+                  # Plain PE/ELF/Mach-O — single objcopy pass.
+                  llvm-objcopy \
+                    --add-section .unpin_meta="$__unpin_meta" \
+                    --set-section-flags .unpin_meta=readonly,noload \
+                    "$__unpin_bin"
+                fi
+
+                rm -f "$__unpin_meta"
+              '';
+            });
+          in
+          if hasExplicit && hasAuto then
+            throw "withAliases: pass either `aliases` or `aliasesFromSymlinksIn`, not both"
+          else if !hasExplicit && !hasAuto then
+            throw "withAliases: requires `aliases` or `aliasesFromSymlinksIn`"
+          else wrapped;
+
         # Why not overlays for per-package fixes? `appendOverlays` invalidates
         # `pkgsBuildHost.stdenv` → cascade rebuild of compiler-rt-libc-static, ninja,
         # python3 in pkgsStatic-darwin (none cached; Hydra only builds pkgsStatic-linux).

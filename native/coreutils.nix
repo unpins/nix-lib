@@ -1,12 +1,15 @@
-# nixpkgs builds coreutils with `--enable-single-binary=symlinks` already,
-# so `$out/bin` ships one real `coreutils` multicall binary plus ~100
-# per-command symlinks (ls, cat, cp, ...). unpins ships only the multicall
-# — users dispatch via `coreutils --coreutils-prog=ls /tmp` or create
-# their own basename symlinks. Drop the upstream symlinks post-install.
+# Upstream coreutils builds the multicall binary with
+# `--enable-single-binary=symlinks`: one real `coreutils` in $out/bin plus a
+# symlink per applet (ls, cat, cp, …). We ship only the multicall; the
+# UNPIN_META block embedded by `lib.withAliases` tells unpin's installer to
+# create the alias links itself at install time (argv[0]-dispatch via the
+# multicall). Helper collects the applet names from the upstream symlinks
+# before wiping them — single source of truth, no hand-maintained list.
 { lib }:
 pkgs:
-pkgs.pkgsStatic.coreutils.overrideAttrs (old: {
-  postInstall = (old.postInstall or "") + ''
-    find "$out/bin" -type l -delete
-  '';
-})
+lib.withAliases pkgs
+  {
+    primary = "coreutils";
+    aliasesFromSymlinksIn = "bin";
+  }
+  pkgs.pkgsStatic.coreutils
