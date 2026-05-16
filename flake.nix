@@ -48,6 +48,31 @@
             '';
           });
 
+        # Strip `--enable-static`/`--disable-shared` from configureFlags on
+        # darwin. Background: pkgsStatic adds both flags to every derivation.
+        # The configure.ac in many GNU-ish packages (dash, htop, ...)
+        # translates `--enable-static` into `export LDFLAGS="-static"`, which
+        # then breaks every subsequent AC_CHECK_LIB probe — darwin has only
+        # libSystem.dylib, no libSystem.a. The probes fail and consumers
+        # think their deps are missing (libedit, libsensors, ...).
+        #
+        # Filtering the flags lets each pkgsStatic input still contribute a
+        # `.a` to the link line; only libSystem stays implicitly-dynamic,
+        # matching the catalog's darwin policy. Applied automatically inside
+        # `mkStandaloneFlake`'s native pipeline so individual fix files don't
+        # need to repeat the workaround.
+        #
+        # Not applied to mingw / cosmo cross builds (no libSystem issue, and
+        # --enable-static there is genuinely a static link request).
+        filterEnableStaticOnDarwin = drv:
+          if (drv.stdenv.hostPlatform.isDarwin or false)
+          then drv.overrideAttrs (old: {
+            configureFlags = nixpkgs.lib.filter
+              (f: f != "--enable-static" && f != "--disable-shared")
+              (old.configureFlags or [ ]);
+          })
+          else drv;
+
         # Embed an UNPIN_META alias block into `$out/bin/<primary>` so unpin's
         # installer can spawn argv[0]-dispatch links (xz → xzcat/unxz/lzma…) at
         # `unpin install` time. The block is a payload bracketed by 0xff-0xff
@@ -561,7 +586,9 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             rawBuild =
               if build != null then build
               else nativeFixes.${name} or (pkgs: pkgs.pkgsStatic.${name});
-            stripped = pkgs: strippedOrJoined pkgs name (dropSharedLibs (rawBuild pkgs));
+            stripped = pkgs:
+              strippedOrJoined pkgs name
+                (dropSharedLibs (filterEnableStaticOnDarwin (rawBuild pkgs)));
 
             # Windows runs on x86_64-linux runners. `allowUnsupportedSystem` because
             # most nixpkgs `meta.platforms` exclude mingw / cosmo → cross-built drv
