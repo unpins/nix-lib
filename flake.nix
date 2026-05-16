@@ -48,6 +48,65 @@
             '';
           });
 
+        # Curated terminfo entries baked into libtinfo.a via ncurses
+        # `--with-fallbacks=`. Covers what users actually hit across the
+        # three OSes: legacy (xterm/vt100/ansi/dumb), Linux console
+        # (linux), multiplexers (screen/tmux), Windows shells (mintty/
+        # cygwin/ms-terminal/vscode), modern emulators (alacritty/foot/
+        # kitty/ghostty), DE defaults (gnome/konsole), suckless (st),
+        # rxvt, putty, macOS Terminal.app (nsterm), iTerm2 direct-color.
+        #
+        # Why bake at all: the unpins promise is "single binary that
+        # runs anywhere" — we can't assume `/usr/share/terminfo` or
+        # `/etc/terminfo` exists on the host (scratch containers, Alpine
+        # without ncurses-terminfo-base, raw Windows, ...). Embedding
+        # ~35 essentials keeps libedit / ncurses-TUI consumers
+        # functional with zero data files. See docs/runtime-data.md for
+        # the "complete coverage" path (data archive) — not yet wired.
+        #
+        # `ghostty` predates our pinned ncurses (6.5 in nixpkgs 25.11);
+        # the entry comes from `extra-terminfo.src` (appended pre-tic
+        # via `embedFallbackTerminfo*`'s postPatch).
+        fallbackTerminals =
+          "xterm,xterm-color,xterm-256color,ansi,vt100,vt102,vt220,dumb,"
+          + "linux,mintty,cygwin,ms-terminal,vscode,"
+          + "screen,screen-256color,tmux,tmux-256color,"
+          + "alacritty,alacritty-direct,foot,kitty,ghostty,"
+          + "gnome,gnome-256color,konsole,konsole-256color,"
+          + "st,st-256color,rxvt,rxvt-256color,Eterm,"
+          + "iterm2-direct,nsterm,putty,putty-256color";
+
+        # Patch ncurses to (a) append `extra-terminfo.src` to the source
+        # database so newer entries (ghostty, ...) are known to tic at
+        # build time, then (b) add `--with-fallbacks=<fallbackTerminals>`
+        # so each entry is compiled into libtinfo.a as a C array. Host
+        # terminfo files still take precedence at runtime (database
+        # lookup stays enabled).
+        embedFallbackTerminfo = ncurses: ncurses.overrideAttrs (oa: {
+          postPatch = (oa.postPatch or "") + ''
+            cat ${./extra-terminfo.src} >> misc/terminfo.src
+          '';
+          configureFlags = (oa.configureFlags or [ ]) ++ [
+            "--with-fallbacks=${fallbackTerminals}"
+          ];
+        });
+
+        # Same as embedFallbackTerminfo plus `--disable-database` — the
+        # compiled libtinfo.a no longer tries the runtime path lookup.
+        # For Windows targets (cosmo, mingw) where the binary's
+        # compiled-in `/nix/store/.../share/terminfo` doesn't exist on
+        # the user's machine and there's no system convention to fall
+        # back on; the only source of truth becomes the baked array.
+        embedFallbackTerminfoOnly = ncurses: ncurses.overrideAttrs (oa: {
+          postPatch = (oa.postPatch or "") + ''
+            cat ${./extra-terminfo.src} >> misc/terminfo.src
+          '';
+          configureFlags = (oa.configureFlags or [ ]) ++ [
+            "--disable-database"
+            "--with-fallbacks=${fallbackTerminals}"
+          ];
+        });
+
         # Strip `--enable-static`/`--disable-shared` from configureFlags on
         # darwin. Background: pkgsStatic adds both flags to every derivation.
         # The configure.ac in many GNU-ish packages (dash, htop, ...)

@@ -13,16 +13,27 @@
 # ends up defining `_res_9_b64_ntop`, leaving `_b64_ntop` undefined.
 # Drop the unused `#include <resolv.h>` from compat/base64.c so the
 # function names match across translation units.
+#
+# All platforms: bake the curated terminfo fallback list into
+# ncurses → tmux's outer-terminal rendering works on hosts without
+# `/usr/share/terminfo`. Host terminfo still wins when present.
 { lib }:
 pkgs:
-let p = pkgs.pkgsStatic; in
+let
+  p = pkgs.pkgsStatic;
+  ncursesFB = lib.embedFallbackTerminfo p.ncurses;
+in
 if p.stdenv.hostPlatform.isDarwin
-then (lib.withDepsSharedPruned pkgs pkgs.tmux).overrideAttrs (old: {
-  postPatch = (old.postPatch or "") + ''
-    substituteInPlace configure.ac \
-      --replace-fail 'LIBS="$OLD_LIBS -lresolv"' 'LIBS="$OLD_LIBS"'
-    substituteInPlace compat/base64.c \
-      --replace-fail '#include <resolv.h>' ""
-  '';
-})
-else p.tmux
+then
+  ((lib.withDepsSharedPruned pkgs pkgs.tmux).override {
+    ncurses = ncursesFB;
+  }).overrideAttrs (old: {
+    postPatch = (old.postPatch or "") + ''
+      substituteInPlace configure.ac \
+        --replace-fail 'LIBS="$OLD_LIBS -lresolv"' 'LIBS="$OLD_LIBS"'
+      substituteInPlace compat/base64.c \
+        --replace-fail '#include <resolv.h>' ""
+    '';
+  })
+else
+  p.tmux.override { ncurses = ncursesFB; }

@@ -1,16 +1,23 @@
-# linux: htop's lm_sensors propagates perl+bash for sensors-detect (we don't
-# ship it). Slim both and rm the script.
+# linux: htop's lm_sensors propagates perl+bash for sensors-detect (we
+# don't ship it). Slim both and rm the script.
 #
-# darwin: pkgsStatic.htop's `--enable-static` translates to `LDFLAGS=-static`
-# which breaks libSystem probes (no libSystem.a). That filter now lives
-# centrally in `mkStandaloneFlake`'s pipeline as `filterEnableStaticOnDarwin`,
-# so this file no longer needs a darwin branch — the default
-# `pkgs.pkgsStatic.htop` lookup goes through the filter automatically.
+# All platforms: bake the curated terminfo fallback list into
+# ncurses → libtinfo.a so htop renders correctly on hosts without
+# `/usr/share/terminfo` (scratch/Alpine/minimal). Host terminfo still
+# wins when present.
+#
+# darwin's old `--enable-static`-via-LDFLAGS issue is handled centrally
+# now (see `filterEnableStaticOnDarwin` in `mkStandaloneFlake`); no
+# darwin branch here.
 { lib }:
 pkgs:
-let p = pkgs.pkgsStatic; in
+let
+  p = pkgs.pkgsStatic;
+  ncursesFB = lib.embedFallbackTerminfo p.ncurses;
+in
 if p.stdenv.hostPlatform.isLinux then
   p.htop.override {
+    ncurses = ncursesFB;
     lm_sensors = p.lm_sensors.overrideAttrs (old: {
       propagatedBuildInputs = p.lib.filter
         (i: !builtins.elem (i.pname or "") [ "perl" "bash" ])
@@ -22,4 +29,4 @@ if p.stdenv.hostPlatform.isLinux then
     });
   }
 else
-  p.htop
+  p.htop.override { ncurses = ncursesFB; }

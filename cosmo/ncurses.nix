@@ -13,11 +13,16 @@
 #     wchar.h split makes the widec build hit unresolved wint_t/wcwidth)
 # Override the args; gate at the overlay level so buildPackages.ncurses
 # (native glibc) stays vanilla.
+#
+# `embedFallbackTerminfoOnly` bakes the curated terminfo list into
+# libtinfo.a and strips file-based lookups (matching mingw — the
+# compiled-in `/nix/store/.../share/terminfo` path has no meaning on
+# the user's Windows machine, and Windows has no system terminfo dir).
 { lib }:
 final: prev:
 if (prev.stdenv.hostPlatform.isCosmo or false) then {
-  ncurses = prev.ncurses.override {
+  ncurses = lib.embedFallbackTerminfoOnly (prev.ncurses.override {
     enableStatic = true;
     unicodeSupport = false;
-  };
+  });
 } else { }
