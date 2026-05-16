@@ -678,15 +678,25 @@ with zipfile.ZipFile(sys.argv[1]) as z:
               libc = null;
             };
             overlays = [ cosmoOverlay ];
-            config.replaceCrossStdenv = { buildPackages, baseStdenv }:
-              let
-                cs = import ./cosmocc.nix { pkgs = buildPackages; };
-                wiring = cs.mkCrossWiring {
-                  inherit buildPackages baseStdenv targetArch;
-                  targetPrefix = "${targetConfig}-";
-                };
-              in
-              wiring.stdenv;
+            config = {
+              # Most upstream packages don't list `x86_64-cosmo` in
+              # `meta.platforms`, so the cross evaluation would refuse to
+              # build them — including the cosmo coreutils we ship. The
+              # flag mirrors what `windowsPkgs` (mkStandaloneFlake's
+              # mingw-routed pkgs) already does for the same reason.
+              # CI doesn't propagate `NIXPKGS_ALLOW_UNSUPPORTED_SYSTEM=1`
+              # so this has to live inside the import.
+              allowUnsupportedSystem = true;
+              replaceCrossStdenv = { buildPackages, baseStdenv }:
+                let
+                  cs = import ./cosmocc.nix { pkgs = buildPackages; };
+                  wiring = cs.mkCrossWiring {
+                    inherit buildPackages baseStdenv targetArch;
+                    targetPrefix = "${targetConfig}-";
+                  };
+                in
+                wiring.stdenv;
+            };
           };
       };
 
