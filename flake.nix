@@ -550,6 +550,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           , binName ? name
           , nativeBuild ? true
           , windows ? false
+          , windowsCosmo ? false
           , package_data ? true
           , bootstrap_naming ? false
           , own_software ? false
@@ -563,16 +564,25 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             stripped = pkgs: strippedOrJoined pkgs name (dropSharedLibs (rawBuild pkgs));
 
             # Windows runs on x86_64-linux runners. `allowUnsupportedSystem` because
-            # most nixpkgs `meta.platforms` exclude mingw → cross-built drv would be
-            # filtered out. `windows = true` → registry lookup. `windowsBuild` →
-            # consumer-supplied from scratch (curl Schannel, vim/gvim Make_ming.mak).
-            windowsEnabled = windows || windowsBuild != null;
+            # most nixpkgs `meta.platforms` exclude mingw / cosmo → cross-built drv
+            # would be filtered out. Dispatch order:
+            #   windowsBuild   → consumer-supplied closure (curl Schannel,
+            #                    vim/gvim Make_ming.mak)
+            #   windowsCosmo   → mkPkgsCosmo (cosmocc-as-cross-stdenv); the
+            #                    per-package fix lives in `cosmo/<name>.nix` as
+            #                    an overlay fragment. Used when mingw isn't viable
+            #                    (gnulib waitpid/fork POSIX assumptions: bash,
+            #                    git, coreutils).
+            #   windows        → mingw registry: `mingw/<name>.nix` or
+            #                    `(mingwStaticCross pkgs).${name}` fallback.
+            windowsEnabled = windows || windowsBuild != null || windowsCosmo;
             windowsPkgs = import nixpkgs {
               system = "x86_64-linux";
               config.allowUnsupportedSystem = true;
             };
             windowsRawBuild =
               if windowsBuild != null then windowsBuild
+              else if windowsCosmo then (_pkgs: (mkPkgsCosmo { }).${name})
               else mingwFixes.${name} or (pkgs: (mingwStaticCross pkgs).${name});
             windowsPkg = strippedOrJoined windowsPkgs name
               (dropSharedLibs (windowsRawBuild windowsPkgs));
@@ -656,7 +666,9 @@ with zipfile.ZipFile(sys.argv[1]) as z:
               src = nixpkgs.outPath;
               patches = [ ./cosmo-lib-systems.patch ];
             };
-            cosmoOverlay = import ./cosmo { inherit (nixpkgs) lib; };
+            # Pass fixLib so overlay fragments can call `lib.withAliases`
+            # (defined here in nix-lib's `lib`), not just nixpkgs.lib.
+            cosmoOverlay = import ./cosmo { lib = nixpkgs.lib // lib; };
             targetConfig = "${targetArch}-unknown-cosmo-gnu";
           in
           import nixpkgsPatched {
