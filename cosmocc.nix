@@ -205,14 +205,34 @@ let
       libc = null;
     };
 
+    # Setup hook that teaches every autotools package's config.sub about
+    # `cosmo-gnu`. Lives at build time inside the host package's source
+    # tree — no `gnu-config` derivation override, so xgcc/bootstrap stay
+    # cached. See ../cosmo-config-sub-hook.sh for the patch shape.
+    configSubHook = buildPackages.makeSetupHook
+      { name = "cosmo-config-sub-hook"; }
+      ./cosmo-config-sub-hook.sh;
+
     stdenv =
+      let
+        ccOverridden = buildPackages.overrideCC baseStdenv crossCC;
+        withHook = ccOverridden.override (old: {
+          extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ]) ++ [ configSubHook ];
+        });
+        # cosmocc is static-only (no .so). makeStaticLibraries injects
+        # `--disable-shared`/`--enable-static` (+ cmake/meson equivalents)
+        # into every mkDerivation. Applied here means it only affects the
+        # host-side cosmo stdenv — buildPackages stay glibc with default
+        # shared behaviour, no bootstrap cascade.
+        staticified = buildPackages.stdenvAdapters.makeStaticLibraries withHook;
+      in
       buildPackages.stdenvAdapters.addAttrsToDerivation
         {
           dontPatchELF = true;
           dontStrip = true;
           hardeningDisable = [ "all" ];
         }
-        (buildPackages.overrideCC baseStdenv crossCC);
+        staticified;
   };
 in
 cosmoStdenv // {
