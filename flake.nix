@@ -169,6 +169,21 @@
             # for `case` glob alternation. Kept lockstep with the Nix list.
             shellBlockedPattern =
               nixpkgs.lib.concatStringsSep "|" unpinBlockedNames;
+
+            # Pick the output the binary actually lives in. nixpkgs convention:
+            # multi-output drvs put bins under the `bin` output (jq, htop in
+            # some configs); pkgsStatic typically collapses to `out` even with
+            # `info`/`debug` siblings (so `bin` is absent → fall back to `out`).
+            # Coreutils on pkgsStatic is the latter — single binary in `$out/bin`.
+            # In the inline shell snippets below, `''${${binOutputName}}` renders
+            # as e.g. `${bin}` or `${out}` for bash to expand to the path.
+            binOutputName =
+              let outs = drv.outputs or [ "out" ];
+              in
+              if builtins.elem "bin" outs then "bin"
+              else if builtins.elem "out" outs then "out"
+              else builtins.head outs;
+
             wrapped = drv.overrideAttrs (old: {
               nativeBuildInputs = (old.nativeBuildInputs or [ ])
                 ++ [
@@ -185,30 +200,45 @@
                 + nixpkgs.lib.optionalString hasAuto ''
                 # Mirrors validate_alias (unpin/src/aliases.rs): names that
                 # the installer would reject get filtered at the source so
-                # the build embeds only legal entries. The patterns are
-                # one-to-one with the Rust validator — keep them in sync.
+                # the build embeds only legal entries. Each rejection prints
+                # to stderr so a surprised package author isn't left guessing
+                # why their applet didn't ship as an alias.
                 __unpin_aliases=""
                 __unpin_count=0
-                for f in "$out/${aliasesFromSymlinksIn}"/*; do
+                for f in "''${${binOutputName}}/${aliasesFromSymlinksIn}"/*; do
                   [ -L "$f" ] || continue
                   n="$(basename "$f")"
                   [ "$n" = "${primary}" ] && continue
-                  # First char must be [a-z0-9] — filters coreutils' `[`.
-                  case "$n" in [a-z0-9]*) ;; *) continue ;; esac
+                  # First char must be [a-z0-9] — coreutils' `[` lands here.
+                  case "$n" in
+                    [a-z0-9]*) ;;
+                    *) echo "withAliases: skip '$n' (first char not [a-z0-9])" >&2; continue ;;
+                  esac
                   # Every char must be in [a-z0-9._-].
-                  case "$n" in *[!a-z0-9._-]*) continue ;; esac
+                  case "$n" in
+                    *[!a-z0-9._-]*) echo "withAliases: skip '$n' (char outside [a-z0-9._-])" >&2; continue ;;
+                  esac
                   # Length cap (mirrors MAX_ALIAS_LEN = 64).
-                  [ "''${#n}" -le 64 ] || continue
+                  if [ "''${#n}" -gt 64 ]; then
+                    echo "withAliases: skip '$n' (length ''${#n} > 64)" >&2
+                    continue
+                  fi
                   # Stem (chars before first dot) must not be a Windows
                   # reserved device name (matters even on Unix builds
                   # because the same package may run on Windows).
                   case "''${n%%.*}" in
-                    con|prn|aux|nul|com[1-9]|lpt[1-9]) continue ;;
+                    con|prn|aux|nul|com[1-9]|lpt[1-9])
+                      echo "withAliases: skip '$n' (Windows reserved device name)" >&2
+                      continue
+                      ;;
                   esac
                   # Blocklist (sudo/ssh/python/bash/…). Rendered from the
                   # Nix unpinBlockedNames list to stay in lockstep.
                   case "$n" in
-                    ${shellBlockedPattern}) continue ;;
+                    ${shellBlockedPattern})
+                      echo "withAliases: skip '$n' (on blocklist)" >&2
+                      continue
+                      ;;
                   esac
                   __unpin_aliases="''${__unpin_aliases:+$__unpin_aliases,}$n"
                   __unpin_count=$((__unpin_count + 1))
@@ -219,73 +249,93 @@
                   exit 1
                 fi
                 printf '%s' "$__unpin_aliases" > "$NIX_BUILD_TOP/.unpin-aliases"
-                find "$out/${aliasesFromSymlinksIn}" -maxdepth 1 -type l -delete
+                find "''${${binOutputName}}/${aliasesFromSymlinksIn}" -maxdepth 1 -type l -delete
               '';
 
               postFixup = (old.postFixup or "") + ''
                 ${if hasExplicit
                   then "__unpin_aliases='${explicitCsv}'"
                   else ''__unpin_aliases="$(cat "$NIX_BUILD_TOP/.unpin-aliases")"''}
-                __unpin_meta="$(mktemp)"
-                # Octal escapes (\NNN) for portability — \xHH isn't POSIX,
-                # though every stdenv shell we use happens to support it.
-                # Marker bytes mirror aliases.rs MARKER_BEGIN/MARKER_END verbatim.
-                printf '\377\377UNPIN_META_v1_7f3a4e\377\377\nALIASES=%s\n\377\377UNPIN_META_END_7f3a4e\377\377\n' \
-                  "$__unpin_aliases" > "$__unpin_meta"
 
-                __unpin_bin="$out/bin/${primary}"
+                # Short-circuit: nothing to embed when the collected/declared
+                # list ended up empty (auto-mode: no symlinks matched the
+                # validator; explicit-mode: caller passed `aliases = [ ]`).
+                # Avoids a 60-byte ALIASES= block that the reader would just
+                # treat as no-aliases anyway.
+                if [ -z "$__unpin_aliases" ]; then
+                  echo "withAliases: no aliases to embed for ${primary}, skipping" >&2
+                else
+                  __unpin_meta="$(mktemp)"
+                  # Octal escapes (\NNN) for portability — \xHH isn't POSIX,
+                  # though every stdenv shell we use happens to support it.
+                  # Marker bytes mirror aliases.rs MARKER_BEGIN/MARKER_END verbatim.
+                  printf '\377\377UNPIN_META_v1_7f3a4e\377\377\nALIASES=%s\n\377\377UNPIN_META_END_7f3a4e\377\377\n' \
+                    "$__unpin_aliases" > "$__unpin_meta"
 
-                if unzip -l "$__unpin_bin" >/dev/null 2>&1; then
-                  # Cosmocc tail-ZIP detected. Decide between purify-then-objcopy
-                  # vs zip-append based on entry list.
-                  __unpin_pure=1
-                  while IFS= read -r __unpin_entry; do
-                    case "$__unpin_entry" in
-                      .symtab.*|.cosmo) ;;
-                      *) __unpin_pure=0; break ;;
-                    esac
-                  done < <(unzip -Z1 "$__unpin_bin")
+                  __unpin_bin="''${${binOutputName}}/bin/${primary}"
+                  if [ ! -f "$__unpin_bin" ]; then
+                    echo "withAliases: $__unpin_bin does not exist" >&2
+                    exit 1
+                  fi
 
-                  if [ "$__unpin_pure" = 1 ]; then
-                    # ZIP only carries throwaway debug/marker. Truncate it
-                    # entirely so the artifact becomes a pure PE/ELF/Mach-O.
-                    # Use python's zipfile to locate the first local-file-
-                    # header offset rather than `grep PK\x03\x04`, which
-                    # would false-positive on coincidental matches in PE
-                    # code. Crash-time symbolication is the only thing lost.
-                    __unpin_offset=$(python3 -c '
+                  # `--remove-section .unpin_meta` before `--add-section` keeps
+                  # the embed idempotent — no-op when the section is missing,
+                  # cleans up a previous embed when chained or re-run.
+                  __unpin_objcopy() {
+                    llvm-objcopy \
+                      --remove-section .unpin_meta \
+                      --add-section .unpin_meta="$__unpin_meta" \
+                      --set-section-flags .unpin_meta=readonly,noload \
+                      "$1"
+                  }
+
+                  if unzip -l "$__unpin_bin" >/dev/null 2>&1; then
+                    # Cosmocc tail-ZIP detected. Decide between purify-then-objcopy
+                    # vs zip-append based on entry list.
+                    __unpin_pure=1
+                    while IFS= read -r __unpin_entry; do
+                      case "$__unpin_entry" in
+                        .symtab.*|.cosmo) ;;
+                        *) __unpin_pure=0; break ;;
+                      esac
+                    done < <(unzip -Z1 "$__unpin_bin")
+
+                    if [ "$__unpin_pure" = 1 ]; then
+                      # ZIP only carries throwaway debug/marker. Truncate it
+                      # entirely so the artifact becomes a pure PE/ELF/Mach-O.
+                      # Use python's zipfile to locate the first local-file-
+                      # header offset rather than `grep PK\x03\x04`, which
+                      # would false-positive on coincidental matches in PE
+                      # code. Crash-time symbolication is the only thing lost.
+                      __unpin_offset=$(python3 -c '
 import zipfile, sys
 with zipfile.ZipFile(sys.argv[1]) as z:
     print(min(i.header_offset for i in z.infolist()))
 ' "$__unpin_bin")
-                    truncate -s "$__unpin_offset" "$__unpin_bin"
-                    llvm-objcopy \
-                      --add-section .unpin_meta="$__unpin_meta" \
-                      --set-section-flags .unpin_meta=readonly,noload \
-                      "$__unpin_bin"
+                      truncate -s "$__unpin_offset" "$__unpin_bin"
+                      __unpin_objcopy "$__unpin_bin"
+                    else
+                      # ZIP has functional content (zoneinfo etc.). Append our
+                      # block as a stored entry — bytes appear verbatim so the
+                      # scanner finds the sentinels; -X drops uid/gid for
+                      # reproducibility, and we pin the mtime via `touch`
+                      # because `zip` records DOS file-times from the source
+                      # mtime (build-clock-dependent without this). `zip` itself
+                      # is idempotent — re-adding an existing entry replaces it.
+                      # 315532800 = 1980-01-01, the ZIP DOS-date epoch floor.
+                      __unpin_stage="$(mktemp -d)"
+                      cp "$__unpin_meta" "$__unpin_stage/.unpin_meta"
+                      touch -d "@''${SOURCE_DATE_EPOCH:-315532800}" "$__unpin_stage/.unpin_meta"
+                      ( cd "$__unpin_stage" && zip -0 -X -j "$__unpin_bin" .unpin_meta ) >/dev/null
+                      rm -rf "$__unpin_stage"
+                    fi
                   else
-                    # ZIP has functional content (zoneinfo etc.). Append our
-                    # block as a stored entry — bytes appear verbatim so the
-                    # scanner finds the sentinels; -X drops uid/gid for
-                    # reproducibility, and we pin the mtime via `touch`
-                    # because `zip` records DOS file-times from the source
-                    # mtime (build-clock-dependent without this).
-                    # 315532800 = 1980-01-01, the ZIP DOS-date epoch floor.
-                    __unpin_stage="$(mktemp -d)"
-                    cp "$__unpin_meta" "$__unpin_stage/.unpin_meta"
-                    touch -d "@''${SOURCE_DATE_EPOCH:-315532800}" "$__unpin_stage/.unpin_meta"
-                    ( cd "$__unpin_stage" && zip -0 -X -j "$__unpin_bin" .unpin_meta ) >/dev/null
-                    rm -rf "$__unpin_stage"
+                    # Plain PE/ELF/Mach-O — single objcopy pass.
+                    __unpin_objcopy "$__unpin_bin"
                   fi
-                else
-                  # Plain PE/ELF/Mach-O — single objcopy pass.
-                  llvm-objcopy \
-                    --add-section .unpin_meta="$__unpin_meta" \
-                    --set-section-flags .unpin_meta=readonly,noload \
-                    "$__unpin_bin"
-                fi
 
-                rm -f "$__unpin_meta"
+                  rm -f "$__unpin_meta"
+                fi
               '';
             });
           in
@@ -295,6 +345,10 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             throw "withAliases: requires `aliases` or `aliasesFromSymlinksIn`"
           else if hasExplicit && builtins.length aliases > 256 then
             throw "withAliases: ${toString (builtins.length aliases)} aliases exceeds limit 256"
+          # Explicit-empty short-circuit: nothing to validate, nothing to
+          # embed — return the input drv untouched (no nativeBuildInputs
+          # bloat, no postInstall/postFixup hooks).
+          else if hasExplicit && aliases == [ ] then drv
           # deepSeq forces each `validateAliasName` invocation now instead
           # of deferring it to when the postFixup string is constructed.
           # Without this, throws fire at build-graph realization, not eval.
