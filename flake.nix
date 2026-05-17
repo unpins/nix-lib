@@ -621,17 +621,22 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         #   packages.x86_64-linux."windows-x86_64"   = mingw-cross build
         #   apps.<system>.default                    = `nix run` entry
         #
-        # `name` is looked up in native/<name>.nix and mingw/<name>.nix; falls back to
-        # `pkgs.pkgsStatic.${name}` / `(mingwStaticCross pkgs).${name}`. Consumers wanting
-        # full control pass `build` / `windowsBuild` directly. `binName` overrides when
-        # bin name ≠ name. `nativeBuild = false` → windows-only (e.g. gvim: static GTK
-        # infeasible on linux, MacVim is its own .app bundle).
+        # `name` is the user-facing id (catalog/gh-repo/binary). `pkgsAttr`
+        # overrides the nixpkgs / nativeFixes / mkPkgsCosmo lookup when the
+        # nixpkgs attribute differs (e.g. nixpkgs ships `links2`, we ship as
+        # `links`). Falls back to `pkgs.pkgsStatic.${pkgsAttr}` /
+        # `(mingwStaticCross pkgs).${pkgsAttr}` / `(mkPkgsCosmo {}).${pkgsAttr}`.
+        # Consumers wanting full control pass `build` / `windowsBuild` directly.
+        # `binName` overrides when bin name ≠ name. `nativeBuild = false` →
+        # windows-only (e.g. gvim: static GTK infeasible on linux, MacVim is its
+        # own .app bundle).
         mkStandaloneFlake =
           { self
           , name
           , build ? null
           , windowsBuild ? null
           , binName ? name
+          , pkgsAttr ? name
           , nativeBuild ? true
           , windows ? false
           , windowsCosmo ? false
@@ -644,7 +649,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
 
             rawBuild =
               if build != null then build
-              else nativeFixes.${name} or (pkgs: pkgs.pkgsStatic.${name});
+              else nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
             stripped = pkgs:
               strippedOrJoined pkgs name
                 (dropSharedLibs (filterEnableStaticOnDarwin (rawBuild pkgs)));
@@ -668,8 +673,8 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             };
             windowsRawBuild =
               if windowsBuild != null then windowsBuild
-              else if windowsCosmo then (_pkgs: (mkPkgsCosmo { }).${name})
-              else mingwFixes.${name} or (pkgs: (mingwStaticCross pkgs).${name});
+              else if windowsCosmo then (_pkgs: (mkPkgsCosmo { }).${pkgsAttr})
+              else mingwFixes.${pkgsAttr} or (pkgs: (mingwStaticCross pkgs).${pkgsAttr});
             windowsPkg = strippedOrJoined windowsPkgs name
               (dropSharedLibs (windowsRawBuild windowsPkgs));
           in
