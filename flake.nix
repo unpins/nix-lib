@@ -282,6 +282,13 @@
                   pkgs.buildPackages.unzip
                   pkgs.buildPackages.zip
                   pkgs.buildPackages.python3Minimal
+                  # Ad-hoc Mach-O re-signing after `--add-section` invalidates
+                  # the existing code signature. macOS Sonoma+ on ARM64 kills
+                  # any unsigned binary with SIGKILL on exec — without this,
+                  # darwin smoke runs exit with code 137 the moment the kernel
+                  # validates the LC_CODE_SIGNATURE blob. Available on both
+                  # linux (cross) and darwin build hosts.
+                  pkgs.buildPackages.darwin.sigtool
                 ];
 
               postInstall = (old.postInstall or "")
@@ -385,6 +392,12 @@
                           --remove-section __TEXT,__unpin_meta \
                           --add-section __TEXT,__unpin_meta="$__unpin_meta" \
                           "$1"
+                        # Re-sign ad-hoc. The add-section invalidates the
+                        # existing LC_CODE_SIGNATURE; macOS Sonoma+ on ARM64
+                        # kills unsigned binaries with SIGKILL. `codesign -s -`
+                        # writes a no-identity signature blob that satisfies
+                        # the kernel exec gate without trusting any cert.
+                        codesign --force --sign - "$1"
                         ;;
                       *)
                         llvm-objcopy \
