@@ -381,29 +381,43 @@
                   __unpin_objcopy() {
                     case "$(file -b "$1")" in
                       *Mach-O*)
-                        llvm-objcopy \
-                          --remove-section __TEXT,__unpin_meta \
-                          --add-section __TEXT,__unpin_meta="$__unpin_meta" \
-                          "$1"
-                        ${nixpkgs.lib.optionalString
-                            (pkgs.stdenv.hostPlatform.isDarwin or false) ''
-                          # Re-sign ad-hoc. `--add-section` invalidates
-                          # the existing LC_CODE_SIGNATURE; macOS
-                          # Sonoma+ kills any unsigned binary with
-                          # SIGKILL on exec. pkgsBuildBuild escapes
-                          # cross-darwin splicing: we always reach the
-                          # *build* platform's own cctools (binaries
-                          # have no `<triple>-` prefix) and sigtool.
-                          echo "withAliases: signing $1 ad-hoc (darwin)" >&2
-                          __unpin_sign_tmp="$(mktemp -d)"
-                          cp "$1" "$__unpin_sign_tmp/$(basename "$1")"
-                          CODESIGN_ALLOCATE=${pkgs.pkgsBuildBuild.darwin.cctools}/bin/codesign_allocate \
-                            ${pkgs.pkgsBuildBuild.darwin.sigtool}/bin/codesign \
-                            -f -s - "$__unpin_sign_tmp/$(basename "$1")"
-                          mv "$__unpin_sign_tmp/$(basename "$1")" "$1"
-                          rmdir "$__unpin_sign_tmp"
-                          echo "withAliases: signed $1" >&2
-                        ''}
+                        # Mach-O path: append the meta payload after the
+                        # LC_CODE_SIGNATURE blob at end-of-file, rather
+                        # than `llvm-objcopy --add-section`'ing into
+                        # __TEXT. Two reasons:
+                        # (1) add-section invalidates the code signature
+                        #     and the re-sign dance (sigtool + cctools'
+                        #     codesign_allocate via pkgsBuildBuild) ended
+                        #     up producing signatures that the macOS-15
+                        #     kernel rejects with SIGKILL on exec —
+                        #     architecture-dependent enough that we don't
+                        #     want to chase it any further.
+                        # (2) The signature covers the file up to the end
+                        #     of the LINKEDIT segment, so bytes appended
+                        #     afterwards are outside the signed range and
+                        #     don't invalidate anything. The unpin
+                        #     installer scans for the 0xff-0xff sentinels
+                        #     against raw bytes, so section placement is
+                        #     irrelevant on the read side.
+                        # If a previous embed already sits at the tail,
+                        # truncate it back to the LC_CODE_SIGNATURE end
+                        # so this stays idempotent.
+                        __unpin_sig_end=$(python3 -c '
+import struct, sys
+with open(sys.argv[1], "rb") as f:
+    data = f.read()
+ncmds = struct.unpack("<I", data[16:20])[0]
+off = 32
+for _ in range(ncmds):
+    cmd, sz = struct.unpack("<II", data[off:off+8])
+    if cmd == 0x1d:
+        dataoff, datasize = struct.unpack("<II", data[off+8:off+16])
+        print(dataoff + datasize); sys.exit(0)
+    off += sz
+print(len(data))
+' "$1")
+                        truncate -s "$__unpin_sig_end" "$1"
+                        cat "$__unpin_meta" >> "$1"
                         ;;
                       *)
                         llvm-objcopy \
