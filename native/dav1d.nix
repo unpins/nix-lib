@@ -17,7 +17,11 @@
 pkgs:
 pkgs.dav1d.overrideAttrs (oa: {
   postPatch = (oa.postPatch or "") + ''
-    for f in meson.build src/meson.build; do
+    # Patch every meson.build that branches on cpu_family — checked
+    # locations include the top-level, src/, and tests/ (the latter
+    # builds checkasm with its own arch dispatch). find -name keeps it
+    # robust to upstream adding more.
+    find . -name 'meson.build' -print0 | while IFS= read -r -d "" f; do
       substituteInPlace "$f" \
         --replace-quiet \
           "host_machine.cpu_family() == 'aarch64'" \
