@@ -17,16 +17,30 @@
 # All platforms: bake the curated terminfo fallback list into
 # ncurses → tmux's outer-terminal rendering works on hosts without
 # `/usr/share/terminfo`. Host terminfo still wins when present.
+#
+# Inject pkg-config into libevent's nativeBuildInputs. nixpkgs' libevent
+# forgets it, which is invisible on x86_64/aarch64 because the configure
+# fallback probe `cc conftest.c -lssl -lcrypto` resolves on its own. On
+# armv7l (ARM 32-bit) OpenSSL 3.x's libcrypto.a needs `__atomic_*_8`
+# from libatomic — `libcrypto.pc` declares it in `Libs.private`, but only
+# `pkg-config --libs --static openssl` surfaces it; the bare probe fails
+# the link with undefined `__atomic_fetch_add_8`. Splicing-aware: pass
+# `scope.pkg-config` (not `scope.buildPackages.pkg-config`) so nixpkgs
+# picks the cross-correct `<triple>-pkg-config-wrapper`.
 { lib }:
 pkgs:
 let
   p = pkgs.pkgsStatic;
   ncursesFB = lib.embedFallbackTerminfo p.ncurses;
+  libeventFixed = scope: scope.libevent.overrideAttrs (oa: {
+    nativeBuildInputs = (oa.nativeBuildInputs or [ ]) ++ [ scope.pkg-config ];
+  });
 in
 if p.stdenv.hostPlatform.isDarwin
 then
   ((lib.withDepsSharedPruned pkgs pkgs.tmux).override {
     ncurses = ncursesFB;
+    libevent = libeventFixed pkgs;
   }).overrideAttrs (old: {
     postPatch = (old.postPatch or "") + ''
       substituteInPlace configure.ac \
@@ -36,4 +50,7 @@ then
     '';
   })
 else
-  p.tmux.override { ncurses = ncursesFB; }
+  p.tmux.override {
+    ncurses = ncursesFB;
+    libevent = libeventFixed p;
+  }
