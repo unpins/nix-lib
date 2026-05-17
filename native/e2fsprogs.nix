@@ -200,10 +200,14 @@ DISPATCHER_EOF
         $LD -r -o multicall/$tool.combined.o "$@"
         $OBJCOPY --redefine-sym main=''${tool}_main multicall/$tool.combined.o
         # Single-pass awk: keep globals (T/B/D/R) that aren't the redefined
-        # tool entry point. Plain `grep -v` would exit 1 (and trip set -e)
-        # for tools whose only global is <tool>_main, e.g. dumpe2fs.
+        # tool entry point. Mach-O nm prefixes user symbols with `_`
+        # (so `_dumpe2fs_main` instead of `dumpe2fs_main`); compare against
+        # both forms so the entry point isn't accidentally localized on
+        # Darwin. Plain `grep -v` would also exit 1 (and trip set -e) for
+        # tools whose only global is <tool>_main, e.g. dumpe2fs.
         $NM --defined-only -g multicall/$tool.combined.o \
-          | awk -v t="''${tool}_main" '$2 ~ /^[TBDR]$/ && $3 != t {print $3}' \
+          | awk -v t="''${tool}_main" -v tu="_''${tool}_main" \
+              '$2 ~ /^[TBDR]$/ && $3 != t && $3 != tu {print $3}' \
           > multicall/$tool.localize.txt
         # `objcopy --localize-symbols=<empty>` exits 1; only single-.o tools
         # like dumpe2fs hit this since their internal helpers are already
