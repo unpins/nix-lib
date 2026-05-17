@@ -164,6 +164,19 @@ let
   multicallGroupClose = if isTargetDarwin then "" else "-Wl,--end-group";
   multicallLibgcc = if isTargetDarwin then "" else "-lgcc";
 
+  # Mach-O stores C symbols with a leading `_` in the symbol table
+  # (`main` lives as `_main`, `foo` as `_foo`). llvm-objcopy's
+  # `--redefine-sym old=new` matches the LITERAL stored name — it does
+  # not auto-add the underscore. So on Darwin we must spell the rename
+  # `_main=_<tool>_main`; on ELF we keep the bare form. Symptom of
+  # getting this wrong: redefine-sym is a silent no-op, `_main` stays
+  # global, the awk filter (which excludes only `<tool>_main` and
+  # `_<tool>_main`) doesn't see `_main`, so localize-symbols demotes
+  # `_main` to file-local — and the final link reports `_<tool>_main`
+  # undefined because no symbol with that name ever existed.
+  mainSymName = if isTargetDarwin then "_main" else "main";
+  newMainPrefix = if isTargetDarwin then "_" else "";
+
   # Custom Makefile fragment that reuses upstream's misc/Makefile variables
   # ($(LIBBLKID), $(LIBUUID), $(LIBARCHIVE), $(LIBS), $(SYSLIBS), $(ALL_LDFLAGS)
   # …) to do the final link. Written via pkgs.writeText so neither Nix
@@ -226,7 +239,7 @@ DISPATCHER_EOF
       __e2fs_combine() {
         local tool=$1; shift
         $LD -r -o multicall/$tool.combined.o "$@"
-        $OBJCOPY --redefine-sym main=''${tool}_main multicall/$tool.combined.o
+        $OBJCOPY --redefine-sym ${mainSymName}=${newMainPrefix}''${tool}_main multicall/$tool.combined.o
         # Single-pass awk: keep globals (T/B/D/R) that aren't:
         #   - the redefined tool entry point (Mach-O nm prefixes user
         #     symbols with `_`, so exclude both `tool_main` and
