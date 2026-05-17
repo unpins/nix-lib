@@ -53,25 +53,27 @@ let
 
       # Parse the post-configure Makefile.
       #
-      # Pass 1: capture `am__EXEEXT_N = …` lines. These expand to the
-      #         conditional applet slots (e.g. am__EXEEXT_1 = "su" when
-      #         WITH_SU, am__EXEEXT_2 = "getsubids" when ENABLE_SUBIDS).
-      #         Commented-out helpers (`#am__EXEEXT_5 = lastlog$(EXEEXT)`)
-      #         stay unresolved — `$(am__EXEEXT_5)` then expands to empty,
-      #         matching make's actual behaviour.
+      # Pass 1 (line-by-line): capture `am__EXEEXT_N = …`, `am_<tool>_OBJECTS = …`,
+      #         `<tool>_OBJECTS = …` definitions, plus the raw text of each
+      #         `<dir>_PROGRAMS = …` line. We DEFER resolving `$(am__EXEEXT_N)`
+      #         and `$(am_<tool>_OBJECTS)` references because automake emits the
+      #         PROGRAMS lists BEFORE the am__EXEEXT_N helpers, and `<tool>_OBJECTS`
+      #         BEFORE `am_<tool>_OBJECTS` is sometimes the case too. A single
+      #         forward-pass would miss every conditional slot (su, getsubids,
+      #         newgidmap, newuidmap), so resolution happens in END {} after the
+      #         file is fully ingested.
       #
-      # Pass 2: capture `<dir>_PROGRAMS = …` lines (bin/sbin/ubin/usbin).
-      #         Resolve `$(am__EXEEXT_N)` references and strip `$(EXEEXT)`
-      #         (empty on Linux). `noinst_PROGRAMS` is dropped — sulogin
-      #         lives in util-linux and the libsubid test helpers
+      # Pass 2 (END): resolve `$(am__EXEEXT_N)` in each captured PROGRAMS line
+      #         and emit the installed-tool set. Drop `noinst_PROGRAMS` —
+      #         sulogin lives in util-linux and the libsubid test helpers
       #         (check_subid_range, free_subid_range, get_subid_owners,
       #         new_subid_range) aren't user-facing.
       #
-      # Pass 3: capture `<tool>_OBJECTS = …` and `am_<tool>_OBJECTS = …`.
-      #         Single-source tools have `<tool>_OBJECTS = <tool>.o` directly.
-      #         Multi-source tools have `<tool>_OBJECTS = $(am_<tool>_OBJECTS)`
-      #         where `am_<tool>_OBJECTS` lists the actual files. We resolve
-      #         the indirection forward.
+      # Pass 3 (END): for each installed tool, resolve `$(am_<tool>_OBJECTS)`
+      #         in its OBJECTS list. Single-source tools have
+      #         `<tool>_OBJECTS = <tool>.o` directly. Multi-source ones
+      #         (login, su) have `<tool>_OBJECTS = $(am_<tool>_OBJECTS)` where
+      #         `am_<tool>_OBJECTS` lists the actual files.
       #
       # Output: `tool<TAB>objs` per installed program with a non-empty
       # objects list and all .o files present on disk.
@@ -93,7 +95,7 @@ let
           }
           return block
         }
-        # 1. am__EXEEXT_N = expansion
+        # Pass 1: capture raw definitions; defer resolution to END.
         /^am__EXEEXT_[0-9]+[[:space:]]*=/ {
           name = $1
           block = clean(read_block($0))
@@ -101,29 +103,12 @@ let
           exeMap[name] = block
           next
         }
-        # 2. installed-PROGRAMS lists
         /^(bin|sbin|ubin|usbin)_PROGRAMS[[:space:]]*=/ {
           block = clean(read_block($0))
           sub(/^[^=]*=[[:space:]]*/, "", block)
-          n = split(block, parts, /[[:space:]]+/)
-          for (i = 1; i <= n; i++) {
-            p = parts[i]
-            if (p == "") continue
-            if (match(p, /^\$\(am__EXEEXT_[0-9]+\)$/)) {
-              key = p; sub(/^\$\(/, "", key); sub(/\)$/, "", key)
-              if (key in exeMap) {
-                m = split(exeMap[key], pp, /[[:space:]]+/)
-                for (j = 1; j <= m; j++) {
-                  if (pp[j] != "") installed[pp[j]] = 1
-                }
-              }
-            } else {
-              installed[p] = 1
-            }
-          }
+          progLines[++nProgLines] = block
           next
         }
-        # 3a. am_<tool>_OBJECTS — capture for indirection
         /^am_[A-Za-z0-9_]+_OBJECTS[[:space:]]*=/ {
           name = $1
           sub(/^am_/, "", name); sub(/_OBJECTS$/, "", name)
@@ -132,38 +117,60 @@ let
           amObj[name] = block
           next
         }
-        # 3b. <tool>_OBJECTS — may reference am_<tool>_OBJECTS
         /^[A-Za-z0-9_]+_OBJECTS[[:space:]]*=/ {
           name = $1
           sub(/_OBJECTS$/, "", name)
-          # skip _la_OBJECTS (libshadow / libsubid libtool objects)
-          if (name ~ /_la$/) next
+          if (name ~ /_la$/) next  # libshadow / libsubid libtool objects
           block = clean(read_block($0))
           sub(/^[^=]*=[[:space:]]*/, "", block)
-          # resolve $(am_<tool>_OBJECTS) reference
-          if (match(block, /\$\(am_[A-Za-z0-9_]+_OBJECTS\)/)) {
-            ref = substr(block, RSTART, RLENGTH)
-            key = ref; sub(/^\$\(am_/, "", key); sub(/_OBJECTS\)$/, "", key)
-            if (key in amObj) {
-              gsub(/\$\(am_[A-Za-z0-9_]+_OBJECTS\)/, amObj[key], block)
-            } else {
-              block = ""
-            }
-          }
-          # keep only .o tokens
-          n = split(block, parts, /[[:space:]]+/)
-          objs = ""
-          for (i = 1; i <= n; i++) {
-            if (parts[i] ~ /\.o$/) objs = objs " " parts[i]
-          }
-          gsub(/^[[:space:]]+|[[:space:]]+$/, "", objs)
-          if (objs != "") toolObj[name] = objs
+          rawObj[name] = block
           next
         }
         END {
+          # Resolve PROGRAMS lines into installed[]
+          for (i = 1; i <= nProgLines; i++) {
+            n = split(progLines[i], parts, /[[:space:]]+/)
+            for (j = 1; j <= n; j++) {
+              p = parts[j]
+              if (p == "") continue
+              if (match(p, /^\$\(am__EXEEXT_[0-9]+\)$/)) {
+                key = p; sub(/^\$\(/, "", key); sub(/\)$/, "", key)
+                if (key in exeMap) {
+                  m = split(exeMap[key], pp, /[[:space:]]+/)
+                  for (k = 1; k <= m; k++)
+                    if (pp[k] != "") installed[pp[k]] = 1
+                }
+              } else {
+                installed[p] = 1
+              }
+            }
+          }
+          # Resolve OBJECTS per installed tool, expanding am_<tool>_OBJECTS.
           for (t in installed) {
-            if (t in toolObj) print t "\t" toolObj[t]
-            else              print "SKIP " t " (no _OBJECTS line)" > "/dev/stderr"
+            if (!(t in rawObj)) {
+              print "SKIP " t " (no _OBJECTS line)" > "/dev/stderr"
+              continue
+            }
+            block = rawObj[t]
+            # Replace every $(am_<x>_OBJECTS) reference with its expansion.
+            while (match(block, /\$\(am_[A-Za-z0-9_]+_OBJECTS\)/)) {
+              ref = substr(block, RSTART, RLENGTH)
+              key = ref; sub(/^\$\(am_/, "", key); sub(/_OBJECTS\)$/, "", key)
+              repl = (key in amObj) ? amObj[key] : ""
+              # Use gsub for the specific ref string (not regex) to handle
+              # the parens safely.
+              q = ref
+              gsub(/[][()$\\.*+?^|]/, "\\\\&", q)
+              if (!sub(q, repl, block)) break
+            }
+            # Keep only .o tokens.
+            n = split(block, parts, /[[:space:]]+/)
+            objs = ""
+            for (j = 1; j <= n; j++)
+              if (parts[j] ~ /\.o$/) objs = objs " " parts[j]
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", objs)
+            if (objs != "") print t "\t" objs
+            else print "SKIP " t " (no .o tokens after resolution)" > "/dev/stderr"
           }
         }
       ' Makefile > multicall/tools.tsv
