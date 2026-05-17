@@ -646,6 +646,12 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           , package_data ? true
           , bootstrap_naming ? false
           , own_software ? false
+          # Opt-in smoke-test args, e.g. `[ "--version" ]`. action-build
+          # runs `<bin> ${smoke[*]}` after each build on runners with a
+          # matching ABI (and on a Windows runner for windows-x86_64);
+          # exit 0 = pass. Skip with null when the binary lacks a quick
+          # non-interactive probe.
+          , smoke ? null
           }:
           let
             nixpkgsFor = forAllNative (system: import nixpkgs { inherit system; });
@@ -734,6 +740,10 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             # Read by unpins/action-build to drive CI config.
             manifest = {
               inherit name package_data bootstrap_naming own_software nativeBuild;
+              # `smoke` is null when the caller didn't opt in; otherwise
+              # a list of CLI args. JSON-encoded into the matrix to let
+              # build.yml run `<bin> <args>` after each build.
+              smoke = if smoke == null then null else smoke;
             };
           };
 
