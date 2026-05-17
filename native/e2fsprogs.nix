@@ -13,21 +13,29 @@
 #
 #   1. Let `make` run upstream normally — all .o files land in misc/* and
 #      e2fsck/*, all archives in lib/{support,ext2fs,e2p,et}/.
-#   2. For each entry point (mke2fs, tune2fs, dumpe2fs, e2fsck):
+#   2. For each entry point (mke2fs, tune2fs, dumpe2fs, e2fsck) the
+#      mechanism branches by target ABI because llvm-objcopy and GNU ld
+#      cover different feature sets:
 #        a. `ld -r` collects its .o set into a single partial-link object.
-#        b. `objcopy --redefine-syms=…` runs ONE pass that renames every
-#           defined global: the tool's `main` → `<tool>_main` (the
-#           dispatcher target) and every other global `foo` →
-#           `<tool>__foo` (privately scoped to this combined object).
-#           Internal cross-refs are already resolved by step (a), so the
-#           rename propagates through relocations as well. The prefix
-#           dissolves the collision set wholesale — no per-collision
-#           rename, no per-version maintenance.
-#           (We avoid `--localize-symbols` because it is functionally a
-#           no-op for Mach-O in llvm-objcopy: localized symbols remain
-#           externally visible to ld64, which then errors out with
-#           `duplicate symbol` whenever two combined objects share an
-#           upstream helper such as `misc/util.o`.)
+#        b. ELF (Linux): `objcopy --redefine-sym` in a loop renames the
+#           tool's `main` → `<tool>_main` and every other defined global
+#           `foo` → `<tool>__foo` (privately scoped across the final
+#           link). Internal cross-refs are already resolved by step (a),
+#           so the rename propagates through relocations as well, and the
+#           prefix dissolves the collision set wholesale.
+#        c. Mach-O (Darwin): do the visibility surgery at the `ld -r`
+#           pass itself via `-exported_symbols_list <main_only>`. ld64
+#           demotes every non-listed global to N_PEXT (private extern) in
+#           one shot, which is the Mach-O equivalent of file-local. We
+#           still run `objcopy --redefine-sym _main=_<tool>_main`
+#           afterwards because `_main` is the symbol the dispatcher
+#           imports — and the TEXT-symbol rename path of llvm-objcopy
+#           does work on Mach-O. We DON'T use `--redefine-sym` to prefix
+#           data globals on Darwin: llvm-objcopy's rename on Mach-O
+#           updates TEXT symbols (functions) but is a no-op for DATA/BSS
+#           symbols, so we'd be left with the same `duplicate symbol
+#           _journal_flags` ld64 error. `--localize-symbols` and the
+#           `--redefine-syms=<file>` form are also no-ops on Mach-O.
 #   3. A small dispatcher.c (basename(argv[0]) → *_main) is compiled
 #      separately, then the final link is delegated to upstream's
 #      misc/Makefile via an injected `unpin-multicall.mk` fragment.
@@ -171,6 +179,56 @@ let
   multicallGroupClose = if isTargetDarwin then "" else "-Wl,--end-group";
   multicallLibgcc = if isTargetDarwin then "" else "-lgcc";
 
+  # Mach-O branch: one `ld -r` pass with `-exported_symbols_list` that
+  # contains only `_main` (Mach-O's `_`-prefixed C symbol). ld64 demotes
+  # every other defined global to N_PEXT (private extern), achieving in
+  # one step what `--localize-symbols` would do on ELF. Then a final
+  # `--redefine-sym _main=_<tool>_main` rewrites the dispatcher target;
+  # TEXT-symbol renames are the one llvm-objcopy operation that DOES
+  # work on Mach-O, so this is safe.
+  combineMacho = ''
+    __e2fs_combine() {
+      local tool=$1; shift
+      echo "_main" > multicall/$tool.export.txt
+      $LD -r -exported_symbols_list multicall/$tool.export.txt \
+        -o multicall/$tool.combined.o "$@"
+      $OBJCOPY --redefine-sym _main=_''${tool}_main multicall/$tool.combined.o
+    }
+  '';
+
+  # ELF branch: ld -r, then a single `objcopy` invocation that renames
+  # every defined global. `main` → `<tool>_main` is the dispatcher
+  # target; every other global `foo` → `<tool>__foo` is privately scoped
+  # across the final link (no collision when misc/util.o is pulled into
+  # both mke2fs.combined.o and tune2fs.combined.o). Compiler-emitted
+  # COMDAT thunks (`__x86.get_pc_thunk.*`, i686 PIC helpers) are left
+  # untouched so libgcc / COMDAT dedup still resolve them cleanly.
+  combineElf = ''
+    __e2fs_combine() {
+      local tool=$1; shift
+      $LD -r -o multicall/$tool.combined.o "$@"
+      local -a redefs=()
+      while read -r old new; do
+        [ -n "$old" ] || continue
+        redefs+=(--redefine-sym "$old=$new")
+      done < <(
+        $NM --defined-only -g multicall/$tool.combined.o \
+          | awk -v t="$tool" \
+              '$2 ~ /^[TBDR]$/ && $3 !~ /^__x86\.get_pc_thunk\./ {
+                  old = $3
+                  if (old == "main") new = t "_main"
+                  else                new = t "__" old
+                  print old, new
+              }'
+      )
+      if [ ''${#redefs[@]} -gt 0 ]; then
+        $OBJCOPY "''${redefs[@]}" multicall/$tool.combined.o
+      fi
+    }
+  '';
+
+  combineFunc = if isTargetDarwin then combineMacho else combineElf;
+
   # Custom Makefile fragment that reuses upstream's misc/Makefile variables
   # ($(LIBBLKID), $(LIBUUID), $(LIBARCHIVE), $(LIBS), $(SYSLIBS), $(ALL_LDFLAGS)
   # …) to do the final link. Written via pkgs.writeText so neither Nix
@@ -230,57 +288,7 @@ let
 ${dispatcherC}
 DISPATCHER_EOF
 
-      __e2fs_combine() {
-        local tool=$1; shift
-        $LD -r -o multicall/$tool.combined.o "$@"
-        # Build a rename plan and apply every entry in one objcopy call
-        # via repeated `--redefine-sym old=new` flags:
-        #   - `main` → `<tool>_main`  (the entry point routed by dispatcher.c)
-        #   - every other defined global `foo` → `<tool>__foo` (private to
-        #     this combined object across the final link).
-        # Skip compiler-emitted COMDAT thunks (`__x86.get_pc_thunk.*`,
-        # i686 PIC helpers) — leaving them global lets the FINAL link
-        # dedupe normally and libgcc resolve any leftover refs.
-        #
-        # Why prefix-rename instead of `--localize-symbols`: llvm-objcopy's
-        # `--localize-symbols` is functionally a no-op on Mach-O — the
-        # demoted symbols stay externally visible, so misc/util.o pulled
-        # into both mke2fs.combined.o and tune2fs.combined.o triggers
-        # `duplicate symbol _journal_flags` at the ld64 final link.
-        # Prefix-renaming is target-format agnostic and also keeps the
-        # final binary's symbol map self-explanatory (you can see which
-        # tool a leftover symbol came from).
-        #
-        # Why iterated `--redefine-sym` instead of `--redefine-syms=<file>`:
-        # the file form is silently no-op'd by llvm-objcopy on Mach-O
-        # (the single-flag form works, as proven by the `_main=_<tool>_main`
-        # rename landing in earlier runs). Building the flag list in shell
-        # avoids both quirks.
-        #
-        # awk handles both Mach-O (leading `_` on user symbols) and ELF
-        # (no prefix) in one pass: strip a leading `_` if present, then
-        # re-attach it on the new name.
-        local -a redefs=()
-        while read -r old new; do
-          [ -n "$old" ] || continue
-          redefs+=(--redefine-sym "$old=$new")
-        done < <(
-          $NM --defined-only -g multicall/$tool.combined.o \
-            | awk -v t="$tool" \
-                '$2 ~ /^[TBDR]$/ && $3 !~ /^__x86\.get_pc_thunk\./ {
-                    old = $3
-                    sym = old
-                    pfx = ""
-                    if (sub(/^_/, "", sym)) pfx = "_"
-                    if (sym == "main") new = pfx t "_main"
-                    else                new = pfx t "__" sym
-                    print old, new
-                }'
-        )
-        if [ ''${#redefs[@]} -gt 0 ]; then
-          $OBJCOPY "''${redefs[@]}" multicall/$tool.combined.o
-        fi
-      }
+      ${combineFunc}
 
       ${lib.concatStringsSep "\n      " (lib.mapAttrsToList
         (tool: objs:
