@@ -629,7 +629,9 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         # Consumers wanting full control pass `build` / `windowsBuild` directly.
         # `binName` overrides when bin name ≠ name. `nativeBuild = false` →
         # windows-only (e.g. gvim: static GTK infeasible on linux, MacVim is its
-        # own .app bundle).
+        # own .app bundle). `linuxOnly = true` → suppresses every darwin attr
+        # from packages.<sys>, used for Linux-kernel-only tools (kmod,
+        # util-linux, shadow, procps-ng, iproute2).
         mkStandaloneFlake =
           { self
           , name
@@ -640,6 +642,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           , nativeBuild ? true
           , windows ? false
           , windowsCosmo ? false
+          , linuxOnly ? false
           , package_data ? true
           , bootstrap_naming ? false
           , own_software ? false
@@ -677,12 +680,21 @@ with zipfile.ZipFile(sys.argv[1]) as z:
               else mingwFixes.${pkgsAttr} or (pkgs: (mingwStaticCross pkgs).${pkgsAttr});
             windowsPkg = strippedOrJoined windowsPkgs name
               (dropSharedLibs (windowsRawBuild windowsPkgs));
+
+            # `linuxOnly` drops every Darwin attr from `packages.<sys>` so
+            # action-build's auto-discovered matrix doesn't include darwin
+            # runners. Used for packages whose nixpkgs `meta.platforms`
+            # excludes darwin entirely (kmod, util-linux, shadow,
+            # procps-ng, iproute2 — anything that talks to Linux-only
+            # kernel APIs).
+            isDarwinSys = system: nixpkgs.lib.hasSuffix "-darwin" system;
+            wantsNative = system: nativeBuild && !(linuxOnly && isDarwinSys system);
           in
           {
             packages = forAllNative (system:
               let pkgs = nixpkgsFor.${system}; in
-              nixpkgs.lib.optionalAttrs nativeBuild { default = stripped pkgs; }
-              // nixpkgs.lib.optionalAttrs (nativeBuild && system == "aarch64-darwin") {
+              nixpkgs.lib.optionalAttrs (wantsNative system) { default = stripped pkgs; }
+              // nixpkgs.lib.optionalAttrs (wantsNative system && system == "aarch64-darwin") {
                 "darwin-x86_64" = stripped pkgs.pkgsCross.x86_64-darwin;
               }
               // nixpkgs.lib.optionalAttrs (nativeBuild && system == "x86_64-linux") {
@@ -711,12 +723,13 @@ with zipfile.ZipFile(sys.argv[1]) as z:
                 "windows-x86_64" = windowsPkg;
               });
 
-            apps = nixpkgs.lib.optionalAttrs nativeBuild (forAllNative (system: {
-              default = {
-                type = "app";
-                program = "${self.packages.${system}.default}/bin/${binName}";
-              };
-            }));
+            apps = forAllNative (system:
+              nixpkgs.lib.optionalAttrs (wantsNative system) {
+                default = {
+                  type = "app";
+                  program = "${self.packages.${system}.default}/bin/${binName}";
+                };
+              });
 
             # Read by unpins/action-build to drive CI config.
             manifest = {
