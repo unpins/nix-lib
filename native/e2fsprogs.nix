@@ -233,8 +233,8 @@ DISPATCHER_EOF
       __e2fs_combine() {
         local tool=$1; shift
         $LD -r -o multicall/$tool.combined.o "$@"
-        # Build one rename map per tool and apply it in a single
-        # `--redefine-syms` pass:
+        # Build a rename plan and apply every entry in one objcopy call
+        # via repeated `--redefine-sym old=new` flags:
         #   - `main` → `<tool>_main`  (the entry point routed by dispatcher.c)
         #   - every other defined global `foo` → `<tool>__foo` (private to
         #     this combined object across the final link).
@@ -251,26 +251,34 @@ DISPATCHER_EOF
         # final binary's symbol map self-explanatory (you can see which
         # tool a leftover symbol came from).
         #
+        # Why iterated `--redefine-sym` instead of `--redefine-syms=<file>`:
+        # the file form is silently no-op'd by llvm-objcopy on Mach-O
+        # (the single-flag form works, as proven by the `_main=_<tool>_main`
+        # rename landing in earlier runs). Building the flag list in shell
+        # avoids both quirks.
+        #
         # awk handles both Mach-O (leading `_` on user symbols) and ELF
         # (no prefix) in one pass: strip a leading `_` if present, then
-        # re-attach it on the new name. Plain `grep -v` would also
-        # `exit 1` (and trip set -e) on a tool whose only global is
-        # main (e.g. dumpe2fs).
-        $NM --defined-only -g multicall/$tool.combined.o \
-          | awk -v t="$tool" \
-              '$2 ~ /^[TBDR]$/ && $3 !~ /^__x86\.get_pc_thunk\./ {
-                  old = $3
-                  sym = old
-                  pfx = ""
-                  if (sub(/^_/, "", sym)) pfx = "_"
-                  if (sym == "main") new = pfx t "_main"
-                  else                new = pfx t "__" sym
-                  print old, new
-              }' \
-          > multicall/$tool.renames.txt
-        if [ -s multicall/$tool.renames.txt ]; then
-          $OBJCOPY --redefine-syms=multicall/$tool.renames.txt \
-            multicall/$tool.combined.o
+        # re-attach it on the new name.
+        local -a redefs=()
+        while read -r old new; do
+          [ -n "$old" ] || continue
+          redefs+=(--redefine-sym "$old=$new")
+        done < <(
+          $NM --defined-only -g multicall/$tool.combined.o \
+            | awk -v t="$tool" \
+                '$2 ~ /^[TBDR]$/ && $3 !~ /^__x86\.get_pc_thunk\./ {
+                    old = $3
+                    sym = old
+                    pfx = ""
+                    if (sub(/^_/, "", sym)) pfx = "_"
+                    if (sym == "main") new = pfx t "_main"
+                    else                new = pfx t "__" sym
+                    print old, new
+                }'
+        )
+        if [ ''${#redefs[@]} -gt 0 ]; then
+          $OBJCOPY "''${redefs[@]}" multicall/$tool.combined.o
         fi
       }
 
