@@ -387,21 +387,22 @@
                           "$1"
                         ${nixpkgs.lib.optionalString
                             (pkgs.stdenv.hostPlatform.isDarwin or false) ''
-                          # Re-sign ad-hoc. `--add-section` invalidates the
-                          # existing LC_CODE_SIGNATURE; macOS Sonoma+ kills
-                          # any unsigned binary with SIGKILL on exec. We
-                          # source `darwin.signingUtils` from the *build*
-                          # platform pkgset (`pkgsBuildBuild`) — its
-                          # absolute paths reference the unprefixed
-                          # `cctools-1010.6/bin/codesign_allocate` that
-                          # actually exists on the runner. Going via
-                          # `buildPackages.darwin.cctools` instead would
-                          # land on the cross-prefixed cctools whose
-                          # binaries are `x86_64-apple-darwin-…`, not
-                          # `codesign_allocate` — and sigtool's wrapper
-                          # spawns the bare name.
-                          source ${pkgs.pkgsBuildBuild.darwin.signingUtils}
-                          sign "$1"
+                          # Re-sign ad-hoc. `--add-section` invalidates
+                          # the existing LC_CODE_SIGNATURE; macOS
+                          # Sonoma+ kills any unsigned binary with
+                          # SIGKILL on exec. pkgsBuildBuild escapes
+                          # cross-darwin splicing: we always reach the
+                          # *build* platform's own cctools (binaries
+                          # have no `<triple>-` prefix) and sigtool.
+                          echo "withAliases: signing $1 ad-hoc (darwin)" >&2
+                          __unpin_sign_tmp="$(mktemp -d)"
+                          cp "$1" "$__unpin_sign_tmp/$(basename "$1")"
+                          CODESIGN_ALLOCATE=${pkgs.pkgsBuildBuild.darwin.cctools}/bin/codesign_allocate \
+                            ${pkgs.pkgsBuildBuild.darwin.sigtool}/bin/codesign \
+                            -f -s - "$__unpin_sign_tmp/$(basename "$1")"
+                          mv "$__unpin_sign_tmp/$(basename "$1")" "$1"
+                          rmdir "$__unpin_sign_tmp"
+                          echo "withAliases: signed $1" >&2
                         ''}
                         ;;
                       *)
