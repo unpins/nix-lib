@@ -152,6 +152,16 @@ let
     }
   '';
 
+  # Linux toolchains ship GNU `libgcc.a` with the PIC `__x86.get_pc_thunk.*`
+  # helpers; Darwin's clang ships compiler-rt instead and rejects `-lgcc`
+  # (library not found). The thunk problem is i686-specific anyway — RIP-
+  # relative on x86_64, different (and resolvable) thunks on the other
+  # ISAs — so dropping `-lgcc` from the Darwin recipe also drops the
+  # i686-only rescue and leaves the Darwin link clean.
+  multicallLibgcc =
+    if pkgs.pkgsStatic.stdenv.hostPlatform.isDarwin then ""
+    else "-lgcc";
+
   # Custom Makefile fragment that reuses upstream's misc/Makefile variables
   # ($(LIBBLKID), $(LIBUUID), $(LIBARCHIVE), $(LIBS), $(SYSLIBS), $(ALL_LDFLAGS)
   # …) to do the final link. Written via pkgs.writeText so neither Nix
@@ -170,19 +180,35 @@ let
     .PHONY: multicall-link
     multicall-link: $(MULTI_OUT)
 
-    # `--start-group ... --end-group` is the key difference vs upstream's
-    # mke2fs/e2fsck per-tool recipes: a bigger combined link drags in
-    # additional libc.a members after libgcc has been scanned (notably
-    # musl's __secs_to_tm.lo and __stdio_exit.lo reference __x86.get_pc_thunk.*,
-    # which only live in libgcc). Without the group, the linker has already
-    # moved past libgcc by the time those late libc members surface their
-    # PIC thunks; with the group, ld rescans until all undefs resolve.
+    # `--start-group ... $(MULTI_LIBGCC) --end-group` is the key difference
+    # vs upstream's mke2fs/e2fsck per-tool recipes. Two reasons (GNU/Linux):
+    #
+    # (1) The bigger combined link drags in additional libc.a members
+    #     (musl's __secs_to_tm.lo, __stdio_exit.lo, ...) whose PIC-mode
+    #     references to `__x86.get_pc_thunk.*` are only resolvable from
+    #     libgcc — and the cc-driver's implicit `-lgcc -lc -lgcc` tail is
+    #     scanned ONCE by the linker. Without the explicit `-lgcc` inside
+    #     the group, libc gets pulled in (introducing fresh
+    #     `__x86.get_pc_thunk.*` undefs) after the implicit libgcc has
+    #     already been scanned, leaving those undefs unresolved.
+    #
+    # (2) `ld -r`-combined objects (lib/support/profile.o etc.) carry
+    #     leftover `__x86.get_pc_thunk.*` references too — putting libgcc
+    #     inside the group picks those up during the rescan pass.
+    #
+    # Darwin (ld64): MULTI_LIBGCC is empty (clang/compiler-rt has no
+    # `libgcc.a`; `-lgcc` would error with "library not found"). The
+    # thunk problem is i686-specific (RIP-relative on x86_64, different
+    # ISAs use different/no thunks), so skipping `-lgcc` on Darwin also
+    # skips the problem class. `--start-group`/`--end-group` themselves
+    # are no-ops on ld64.
     $(MULTI_OUT): $(MULTI_OBJS) $(DEPLIBS) $(LIBE2P) $(DEPLIBBLKID) $(DEPLIBUUID) $(LIBEXT2FS) $(LIBSUPPORT)
     	$(CC) $(ALL_LDFLAGS) -o $@ $(MULTI_OBJS) \
     		-Wl,--start-group \
     		$(LIBSUPPORT) $(LIBS) $(LIBBLKID) $(LIBUUID) \
     		$(LIBEXT2FS) $(LIBE2P) $(LIBINTL) \
     		$(SYSLIBS) $(LIBMAGIC) $(LIBARCHIVE) \
+    		$(MULTI_LIBGCC) \
     		-Wl,--end-group
   '';
 
@@ -241,7 +267,9 @@ DISPATCHER_EOF
       # link against in their per-target recipes.
       install -m644 ${multicallMk} misc/unpin-multicall.mk
 
-      make -C misc -f Makefile -f unpin-multicall.mk multicall-link
+      make -C misc -f Makefile -f unpin-multicall.mk \
+        MULTI_LIBGCC="${multicallLibgcc}" \
+        multicall-link
     '';
 
     # Wipe upstream's installed binaries and replace with our single
