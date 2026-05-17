@@ -285,18 +285,19 @@
                 ]
                 # Mach-O signing — only on darwin builds. `--add-section`
                 # invalidates the LC_CODE_SIGNATURE blob; macOS Sonoma+
-                # kills unsigned binaries with SIGKILL on exec. We pull in
-                # nixpkgs's auto-sign hook for its `signIfRequired`
-                # helper (sourced from signing-utils, propagated by the
-                # hook) — it wraps sigtool + codesign_allocate with the
-                # right CODESIGN_ALLOCATE env var and copy-out-then-back
-                # trick. Using the hook avoids putting `cctools` on PATH
-                # wholesale (the bare `ar`/`ranlib` clash breaks
-                # autoconf interface detection in some packages, gawk
-                # being one).
+                # kills unsigned binaries with SIGKILL on exec.
+                #
+                # `signingUtils` is a single shell file that stdenv `source`s
+                # at setup time (per findInputs in setup.sh) — it defines
+                # `sign`/`signIfRequired`/`checkRequiresSignature` and
+                # internally invokes `codesign_allocate` + sigtool via
+                # absolute /nix/store paths, so we don't need to put cctools
+                # on PATH (which would clobber `ar`/`ranlib` and break
+                # autoconf interface detection — observed with gawk's
+                # configure rejecting cctools' ar).
                 ++ nixpkgs.lib.optionals
                      (pkgs.stdenv.hostPlatform.isDarwin or false)
-                     [ pkgs.buildPackages.darwin.autoSignDarwinBinariesHook ];
+                     [ pkgs.buildPackages.darwin.signingUtils ];
 
               postInstall = (old.postInstall or "")
                 + nixpkgs.lib.optionalString hasAuto ''
