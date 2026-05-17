@@ -394,10 +394,14 @@
                           "$1"
                         # Re-sign ad-hoc. The add-section invalidates the
                         # existing LC_CODE_SIGNATURE; macOS Sonoma+ on ARM64
-                        # kills unsigned binaries with SIGKILL. `codesign -s -`
-                        # writes a no-identity signature blob that satisfies
-                        # the kernel exec gate without trusting any cert.
-                        codesign --force --sign - "$1"
+                        # kills unsigned binaries with SIGKILL. `sigtool inject`
+                        # writes a no-identity signature blob in-place. We use
+                        # the native `sigtool` CLI rather than the `codesign`
+                        # compatibility wrapper because the wrapper spawns
+                        # Apple's `codesign_allocate` helper at runtime — which
+                        # isn't bundled with the sigtool nixpkgs derivation
+                        # and isn't on PATH inside the nix-darwin build sandbox.
+                        sigtool -f "$1" inject
                         ;;
                       *)
                         llvm-objcopy \
