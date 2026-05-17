@@ -21,15 +21,20 @@
 #           refs are already resolved by step (a), so localizing them is
 #           safe — and it disposes of the collision set wholesale: no per-
 #           collision rename, no per-version maintenance.
-#   3. A small dispatcher.c (basename(argv[0]) → *_main) is compiled and
-#      linked alongside the four combined.o objects against e2fsprogs's
-#      in-tree libsupport/libext2fs/libe2p/libcom_err plus -lblkid/-luuid
-#      from util-linux-minimal AND `$(LIBARCHIVE)` (pre-resolved from
-#      pkg-config --libs --static, written by configure into MCONFIG —
-#      `-larchive -lcrypto -lacl -lzstd -lbz2 -lz -llzma -lxml2 -lm -ldl
-#      ...`). pkg-config isn't on PATH at postBuild time so we read the
-#      string out of MCONFIG via awk. Keeping libarchive preserves
-#      mke2fs's `-d <tarball>` source-from-archive mode.
+#   3. A small dispatcher.c (basename(argv[0]) → *_main) is compiled
+#      separately, then the final link is delegated to upstream's
+#      misc/Makefile via an injected `unpin-multicall.mk` fragment.
+#      Reason: the lib paths needed for the link ($(LIBBLKID), $(LIBUUID),
+#      $(LIBARCHIVE), $(SYSLIBS), $(ALL_LDFLAGS) …) resolve differently per
+#      target — Linux passes `--disable-libblkid` so LIBBLKID becomes
+#      `-L<util-linux>/lib -lblkid ...`; Darwin keeps libblkid in-tree so
+#      LIBBLKID becomes `$(LIB)/libblkid.a $(LIBUUID)`; cc-wrapper's
+#      implicit libgcc cascade (needed on linux-i686 for the libgcc
+#      __x86.get_pc_thunk.* helpers PIC code uses) only kicks in when the
+#      compiler is invoked via the wrapper with the right flag set, which
+#      `$(CC) $(ALL_LDFLAGS)` reproduces. Letting make do the variable
+#      substitution against mke2fs's own recipe (with e2fsck's
+#      `$(LIBSUPPORT)` added) keeps every per-target detail intact.
 #   4. We strip all upstream-installed binaries and replace them with one
 #      multicall binary at $bin/bin/e2fsprogs plus applet symlinks for the
 #      argv[0]-dispatch names. `lib.withAliases` then harvests those
@@ -165,11 +170,20 @@ let
     .PHONY: multicall-link
     multicall-link: $(MULTI_OUT)
 
+    # `--start-group ... --end-group` is the key difference vs upstream's
+    # mke2fs/e2fsck per-tool recipes: a bigger combined link drags in
+    # additional libc.a members after libgcc has been scanned (notably
+    # musl's __secs_to_tm.lo and __stdio_exit.lo reference __x86.get_pc_thunk.*,
+    # which only live in libgcc). Without the group, the linker has already
+    # moved past libgcc by the time those late libc members surface their
+    # PIC thunks; with the group, ld rescans until all undefs resolve.
     $(MULTI_OUT): $(MULTI_OBJS) $(DEPLIBS) $(LIBE2P) $(DEPLIBBLKID) $(DEPLIBUUID) $(LIBEXT2FS) $(LIBSUPPORT)
     	$(CC) $(ALL_LDFLAGS) -o $@ $(MULTI_OBJS) \
+    		-Wl,--start-group \
     		$(LIBSUPPORT) $(LIBS) $(LIBBLKID) $(LIBUUID) \
     		$(LIBEXT2FS) $(LIBE2P) $(LIBINTL) \
-    		$(SYSLIBS) $(LIBMAGIC) $(LIBARCHIVE)
+    		$(SYSLIBS) $(LIBMAGIC) $(LIBARCHIVE) \
+    		-Wl,--end-group
   '';
 
   multicall = pkgs.pkgsStatic.e2fsprogs.overrideAttrs (old: {
