@@ -152,15 +152,17 @@ let
     }
   '';
 
-  # Linux toolchains ship GNU `libgcc.a` with the PIC `__x86.get_pc_thunk.*`
-  # helpers; Darwin's clang ships compiler-rt instead and rejects `-lgcc`
-  # (library not found). The thunk problem is i686-specific anyway — RIP-
-  # relative on x86_64, different (and resolvable) thunks on the other
-  # ISAs — so dropping `-lgcc` from the Darwin recipe also drops the
-  # i686-only rescue and leaves the Darwin link clean.
-  multicallLibgcc =
-    if pkgs.pkgsStatic.stdenv.hostPlatform.isDarwin then ""
-    else "-lgcc";
+  # Darwin's ld64 doesn't accept --start-group/--end-group (errors with
+  # "unknown option: --start-group"), and its clang+compiler-rt has no
+  # `libgcc.a` for `-lgcc` to resolve. Pick the right link-line prefix/
+  # suffix per target. The thunk + late-libc-symbol problem that --start-
+  # group + libgcc solves is i686-specific (RIP-relative on x86_64,
+  # different/no thunks on the other ISAs) — Mach-O linkers also rescan
+  # symbol tables naturally, so neither directive is needed on Darwin.
+  isTargetDarwin = pkgs.pkgsStatic.stdenv.hostPlatform.isDarwin;
+  multicallGroupOpen = if isTargetDarwin then "" else "-Wl,--start-group";
+  multicallGroupClose = if isTargetDarwin then "" else "-Wl,--end-group";
+  multicallLibgcc = if isTargetDarwin then "" else "-lgcc";
 
   # Custom Makefile fragment that reuses upstream's misc/Makefile variables
   # ($(LIBBLKID), $(LIBUUID), $(LIBARCHIVE), $(LIBS), $(SYSLIBS), $(ALL_LDFLAGS)
@@ -204,12 +206,12 @@ let
     # are no-ops on ld64.
     $(MULTI_OUT): $(MULTI_OBJS) $(DEPLIBS) $(LIBE2P) $(DEPLIBBLKID) $(DEPLIBUUID) $(LIBEXT2FS) $(LIBSUPPORT)
     	$(CC) $(ALL_LDFLAGS) -o $@ $(MULTI_OBJS) \
-    		-Wl,--start-group \
+    		$(MULTI_GROUP_OPEN) \
     		$(LIBSUPPORT) $(LIBS) $(LIBBLKID) $(LIBUUID) \
     		$(LIBEXT2FS) $(LIBE2P) $(LIBINTL) \
     		$(SYSLIBS) $(LIBMAGIC) $(LIBARCHIVE) \
     		$(MULTI_LIBGCC) \
-    		-Wl,--end-group
+    		$(MULTI_GROUP_CLOSE)
   '';
 
   multicall = pkgs.pkgsStatic.e2fsprogs.overrideAttrs (old: {
@@ -225,15 +227,22 @@ DISPATCHER_EOF
         local tool=$1; shift
         $LD -r -o multicall/$tool.combined.o "$@"
         $OBJCOPY --redefine-sym main=''${tool}_main multicall/$tool.combined.o
-        # Single-pass awk: keep globals (T/B/D/R) that aren't the redefined
-        # tool entry point. Mach-O nm prefixes user symbols with `_`
-        # (so `_dumpe2fs_main` instead of `dumpe2fs_main`); compare against
-        # both forms so the entry point isn't accidentally localized on
-        # Darwin. Plain `grep -v` would also exit 1 (and trip set -e) for
-        # tools whose only global is <tool>_main, e.g. dumpe2fs.
+        # Single-pass awk: keep globals (T/B/D/R) that aren't:
+        #   - the redefined tool entry point (Mach-O nm prefixes user
+        #     symbols with `_`, so exclude both `tool_main` and
+        #     `_tool_main` forms)
+        #   - compiler-emitted COMDAT thunks (`__x86.get_pc_thunk.*` —
+        #     i686 PIC helpers). These live in their own COMDAT section
+        #     groups; localizing them after `ld -r` breaks the COMDAT
+        #     resolution (relocations stay bound to the discarded copy's
+        #     section instead of the surviving one). Leaving them global
+        #     lets the FINAL link dedupe normally and libgcc resolve any
+        #     leftover refs.
+        # Plain `grep -v` would also exit 1 (and trip set -e) for tools
+        # whose only global is <tool>_main, e.g. dumpe2fs.
         $NM --defined-only -g multicall/$tool.combined.o \
           | awk -v t="''${tool}_main" -v tu="_''${tool}_main" \
-              '$2 ~ /^[TBDR]$/ && $3 != t && $3 != tu {print $3}' \
+              '$2 ~ /^[TBDR]$/ && $3 != t && $3 != tu && $3 !~ /^__x86\.get_pc_thunk\./ {print $3}' \
           > multicall/$tool.localize.txt
         # `objcopy --localize-symbols=<empty>` exits 1; only single-.o tools
         # like dumpe2fs hit this since their internal helpers are already
@@ -268,6 +277,8 @@ DISPATCHER_EOF
       install -m644 ${multicallMk} misc/unpin-multicall.mk
 
       make -C misc -f Makefile -f unpin-multicall.mk \
+        MULTI_GROUP_OPEN="${multicallGroupOpen}" \
+        MULTI_GROUP_CLOSE="${multicallGroupClose}" \
         MULTI_LIBGCC="${multicallLibgcc}" \
         multicall-link
     '';
