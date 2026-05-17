@@ -282,22 +282,7 @@
                   pkgs.buildPackages.unzip
                   pkgs.buildPackages.zip
                   pkgs.buildPackages.python3Minimal
-                ]
-                # Mach-O signing — only on darwin builds. `--add-section`
-                # invalidates the LC_CODE_SIGNATURE blob; macOS Sonoma+
-                # kills unsigned binaries with SIGKILL on exec.
-                #
-                # `signingUtils` is a single shell file that stdenv `source`s
-                # at setup time (per findInputs in setup.sh) — it defines
-                # `sign`/`signIfRequired`/`checkRequiresSignature` and
-                # internally invokes `codesign_allocate` + sigtool via
-                # absolute /nix/store paths, so we don't need to put cctools
-                # on PATH (which would clobber `ar`/`ranlib` and break
-                # autoconf interface detection — observed with gawk's
-                # configure rejecting cctools' ar).
-                ++ nixpkgs.lib.optionals
-                     (pkgs.stdenv.hostPlatform.isDarwin or false)
-                     [ pkgs.buildPackages.darwin.signingUtils ];
+                ];
 
               postInstall = (old.postInstall or "")
                 + nixpkgs.lib.optionalString hasAuto ''
@@ -400,13 +385,25 @@
                           --remove-section __TEXT,__unpin_meta \
                           --add-section __TEXT,__unpin_meta="$__unpin_meta" \
                           "$1"
-                        # Re-sign ad-hoc. The add-section invalidates the
-                        # existing LC_CODE_SIGNATURE; macOS Sonoma+ kills
-                        # any unsigned binary with SIGKILL on exec. The
-                        # `signIfRequired` helper (sourced from signing-utils
-                        # via autoSignDarwinBinariesHook) wraps sigtool +
-                        # codesign_allocate with the correct env wiring.
-                        signIfRequired "$1"
+                        ${nixpkgs.lib.optionalString
+                            (pkgs.stdenv.hostPlatform.isDarwin or false) ''
+                          # Re-sign ad-hoc. `--add-section` invalidates the
+                          # existing LC_CODE_SIGNATURE; macOS Sonoma+ kills
+                          # any unsigned binary with SIGKILL on exec. We
+                          # call sigtool's `codesign` (with the
+                          # CODESIGN_ALLOCATE env var pointing at cctools'
+                          # helper) via absolute /nix/store paths so we
+                          # don't have to put either tool on PATH —
+                          # `cctools/bin/ar` would otherwise clash with
+                          # the stdenv-darwin `ar` wrapper.
+                          __unpin_sign_tmp="$(mktemp -d)"
+                          cp "$1" "$__unpin_sign_tmp/$(basename "$1")"
+                          CODESIGN_ALLOCATE=${pkgs.buildPackages.darwin.cctools}/bin/codesign_allocate \
+                            ${pkgs.buildPackages.darwin.sigtool}/bin/codesign \
+                            -f -s - "$__unpin_sign_tmp/$(basename "$1")"
+                          mv "$__unpin_sign_tmp/$(basename "$1")" "$1"
+                          rmdir "$__unpin_sign_tmp"
+                        ''}
                         ;;
                       *)
                         llvm-objcopy \
