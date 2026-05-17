@@ -390,19 +390,18 @@
                           # Re-sign ad-hoc. `--add-section` invalidates the
                           # existing LC_CODE_SIGNATURE; macOS Sonoma+ kills
                           # any unsigned binary with SIGKILL on exec. We
-                          # call sigtool's `codesign` (with the
-                          # CODESIGN_ALLOCATE env var pointing at cctools'
-                          # helper) via absolute /nix/store paths so we
-                          # don't have to put either tool on PATH —
-                          # `cctools/bin/ar` would otherwise clash with
-                          # the stdenv-darwin `ar` wrapper.
-                          __unpin_sign_tmp="$(mktemp -d)"
-                          cp "$1" "$__unpin_sign_tmp/$(basename "$1")"
-                          CODESIGN_ALLOCATE=${pkgs.buildPackages.darwin.cctools}/bin/codesign_allocate \
-                            ${pkgs.buildPackages.darwin.sigtool}/bin/codesign \
-                            -f -s - "$__unpin_sign_tmp/$(basename "$1")"
-                          mv "$__unpin_sign_tmp/$(basename "$1")" "$1"
-                          rmdir "$__unpin_sign_tmp"
+                          # source `darwin.signingUtils` from the *build*
+                          # platform pkgset (`pkgsBuildBuild`) — its
+                          # absolute paths reference the unprefixed
+                          # `cctools-1010.6/bin/codesign_allocate` that
+                          # actually exists on the runner. Going via
+                          # `buildPackages.darwin.cctools` instead would
+                          # land on the cross-prefixed cctools whose
+                          # binaries are `x86_64-apple-darwin-…`, not
+                          # `codesign_allocate` — and sigtool's wrapper
+                          # spawns the bare name.
+                          source ${pkgs.pkgsBuildBuild.darwin.signingUtils}
+                          sign "$1"
                         ''}
                         ;;
                       *)
