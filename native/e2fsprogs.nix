@@ -147,6 +147,31 @@ let
     }
   '';
 
+  # Custom Makefile fragment that reuses upstream's misc/Makefile variables
+  # ($(LIBBLKID), $(LIBUUID), $(LIBARCHIVE), $(LIBS), $(SYSLIBS), $(ALL_LDFLAGS)
+  # …) to do the final link. Written via pkgs.writeText so neither Nix
+  # interpolation nor bash heredoc indentation/escaping mangles the recipe
+  # tabs. `top_builddir` is one level up from misc/, matching upstream's
+  # misc/Makefile.in.
+  multicallMk = pkgs.writeText "unpin-multicall.mk" ''
+    MULTI_OUT ?= $(top_builddir)/multicall/e2fsprogs
+    MULTI_OBJS = \
+        $(top_builddir)/multicall/dispatcher.o \
+        $(top_builddir)/multicall/mke2fs.combined.o \
+        $(top_builddir)/multicall/tune2fs.combined.o \
+        $(top_builddir)/multicall/dumpe2fs.combined.o \
+        $(top_builddir)/multicall/e2fsck.combined.o
+
+    .PHONY: multicall-link
+    multicall-link: $(MULTI_OUT)
+
+    $(MULTI_OUT): $(MULTI_OBJS) $(DEPLIBS) $(LIBE2P) $(DEPLIBBLKID) $(DEPLIBUUID) $(LIBEXT2FS) $(LIBSUPPORT)
+    	$(CC) $(ALL_LDFLAGS) -o $@ $(MULTI_OBJS) \
+    		$(LIBSUPPORT) $(LIBS) $(LIBBLKID) $(LIBUUID) \
+    		$(LIBEXT2FS) $(LIBE2P) $(LIBINTL) \
+    		$(SYSLIBS) $(LIBMAGIC) $(LIBARCHIVE)
+  '';
+
   multicall = pkgs.pkgsStatic.e2fsprogs.overrideAttrs (old: {
     pname = "e2fsprogs-multi";
 
@@ -183,28 +208,22 @@ DISPATCHER_EOF
 
       $CC -O2 -c -o multicall/dispatcher.o multicall/dispatcher.c
 
-      # Pull LIBARCHIVE (the resolved `-L<libarchive>/lib -larchive -lcrypto
-      # -lacl -lzstd -lbz2 -lz -llzma -lxml2 -lm -lcrypto -ldl ...` line from
-      # `pkg-config --libs --static libarchive` that the upstream configure
-      # baked into MCONFIG) so create_inode_libarchive.o's archive_* refs
-      # resolve. pkg-config itself isn't on PATH post-configure (it was a
-      # nativeBuildInput), so we read the pre-computed string out of MCONFIG.
-      __e2fs_libarchive=$(awk -F= '/^LIBARCHIVE =/ {sub(/^[^=]*= */, ""); print; exit}' MCONFIG)
+      # Delegate the final link to upstream's misc/Makefile by adding a
+      # custom target that reuses the same variables mke2fs uses
+      # ($(LIBBLKID), $(LIBUUID), $(LIBARCHIVE), $(LIBS), $(SYSLIBS),
+      # $(ALL_LDFLAGS), ...). Why: those vars resolve differently per
+      # target — Linux passes `--disable-libblkid` so LIBBLKID becomes
+      # `-L<util-linux>/lib -lblkid ...`; Darwin keeps libblkid in-tree
+      # so LIBBLKID becomes `$(LIB)/libblkid.a $(LIBUUID)`. Hard-coding
+      # `-lblkid -luuid` breaks Darwin; hard-coding the .a paths breaks
+      # Linux. Make's variable expansion is the source of truth.
+      #
+      # Listed libraries are the union of what mke2fs (+LIBARCHIVE, +LIBMAGIC),
+      # tune2fs/dumpe2fs (subset), and e2fsck (+LIBSUPPORT, +LIBSS) each
+      # link against in their per-target recipes.
+      install -m644 ${multicallMk} misc/unpin-multicall.mk
 
-      # Link: dispatcher + 4 combined.o + e2fsprogs in-tree archives + libs
-      # from util-linux-minimal (-lblkid -luuid) + libarchive cascade.
-      $CC -o multicall/e2fsprogs \
-        multicall/dispatcher.o \
-        multicall/mke2fs.combined.o \
-        multicall/tune2fs.combined.o \
-        multicall/dumpe2fs.combined.o \
-        multicall/e2fsck.combined.o \
-        lib/support/libsupport.a \
-        lib/ext2fs/libext2fs.a \
-        lib/e2p/libe2p.a \
-        lib/et/libcom_err.a \
-        -lblkid -luuid \
-        $__e2fs_libarchive
+      make -C misc -f Makefile -f unpin-multicall.mk multicall-link
     '';
 
     # Wipe upstream's installed binaries and replace with our single
