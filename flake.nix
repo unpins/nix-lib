@@ -331,9 +331,9 @@
                   __unpin_aliases="''${__unpin_aliases:+$__unpin_aliases,}$n"
                   __unpin_count=$((__unpin_count + 1))
                 done
-                # Mirrors MAX_ALIASES = 256 in unpin/src/aliases.rs.
-                if [ "$__unpin_count" -gt 256 ]; then
-                  echo "withAliases: collected $__unpin_count aliases, exceeds limit of 256" >&2
+                # Mirrors MAX_ALIASES = 512 in unpin/src/aliases.rs.
+                if [ "$__unpin_count" -gt 512 ]; then
+                  echo "withAliases: collected $__unpin_count aliases, exceeds limit of 512" >&2
                   exit 1
                 fi
                 printf '%s' "$__unpin_aliases" > "$NIX_BUILD_TOP/.unpin-aliases"
@@ -450,8 +450,8 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             throw "withAliases: pass either `aliases` or `aliasesFromSymlinksIn`, not both"
           else if !hasExplicit && !hasAuto then
             throw "withAliases: requires `aliases` or `aliasesFromSymlinksIn`"
-          else if hasExplicit && builtins.length aliases > 256 then
-            throw "withAliases: ${toString (builtins.length aliases)} aliases exceeds limit 256"
+          else if hasExplicit && builtins.length aliases > 512 then
+            throw "withAliases: ${toString (builtins.length aliases)} aliases exceeds limit 512"
           # Explicit-empty short-circuit: nothing to validate, nothing to
           # embed — return the input drv untouched (no nativeBuildInputs
           # bloat, no postInstall/postFixup hooks).
