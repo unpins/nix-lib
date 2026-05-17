@@ -791,12 +791,18 @@ with zipfile.ZipFile(sys.argv[1]) as z:
       # Fix files use nixpkgs.lib for stdlib (hasSuffix, filterAttrs, …) AND our
       # helpers (withDepsSharedPruned, mingwStaticCross, …) — fuse both into one
       # `lib` for them so they can write `lib.X` uniformly.
-      fixLib = nixpkgs.lib // lib;
-      nativeFixes = import ./native { lib = fixLib; };
-      mingwFixes = import ./mingw { lib = fixLib; };
-      mingwOverlayFixes = import ./mingw-overlay { lib = fixLib; };
+      #
+      # `nativeFixes` is re-exposed inside the lib seen by fix files so one
+      # fix can reuse another (e.g. native/tmux.nix calling
+      # lib.nativeFixes.libevent). Safe under nix laziness because cross-fix
+      # references only resolve when the consumer calls the function with
+      # `pkgs`, not at top-level evaluation.
+      fixLibBase = nixpkgs.lib // lib;
+      nativeFixes = import ./native { lib = fixLibBase // { inherit nativeFixes; }; };
+      mingwFixes = import ./mingw { lib = fixLibBase; };
+      mingwOverlayFixes = import ./mingw-overlay { lib = fixLibBase; };
     in
     {
-      inherit lib;
+      lib = lib // { inherit nativeFixes; };
     };
 }
