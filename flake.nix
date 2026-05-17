@@ -648,10 +648,14 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           , own_software ? false
           # Opt-in smoke-test args, e.g. `[ "--version" ]`. action-build
           # runs `<bin> ${smoke[*]}` after each build on runners with a
-          # matching ABI (and on a Windows runner for windows-x86_64);
-          # exit 0 = pass. Skip with null when the binary lacks a quick
-          # non-interactive probe.
+          # matching ABI (and on a Windows runner for windows-x86_64).
+          # Exit 0 alone is too lax — some tools print "Unknown option"
+          # and still exit 0 (links does this on Windows). Pair with
+          # `smokePattern` to also require a stdout substring match.
+          # Skip both with null when the binary lacks a quick non-
+          # interactive probe.
           , smoke ? null
+          , smokePattern ? null
           }:
           let
             nixpkgsFor = forAllNative (system: import nixpkgs { inherit system; });
@@ -744,6 +748,9 @@ with zipfile.ZipFile(sys.argv[1]) as z:
               # a list of CLI args. JSON-encoded into the matrix to let
               # build.yml run `<bin> <args>` after each build.
               smoke = if smoke == null then null else smoke;
+              # Optional grep-E pattern that must match the smoke command's
+              # combined stdout+stderr. Catches "Unknown option" false-pass.
+              smoke_pattern = if smokePattern == null then null else smokePattern;
             };
           };
 
