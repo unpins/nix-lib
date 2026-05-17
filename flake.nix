@@ -283,20 +283,20 @@
                   pkgs.buildPackages.zip
                   pkgs.buildPackages.python3Minimal
                 ]
-                # Mach-O signing tools — only on darwin builds.
-                # `--add-section` invalidates the LC_CODE_SIGNATURE blob;
-                # macOS Sonoma+ kills any unsigned binary with SIGKILL on exec.
-                # `codesign_allocate` (cctools) reserves the load command +
-                # signature space; `codesign` (sigtool's compat wrapper) writes
-                # the ad-hoc signature. Both are needed because sigtool's
-                # native `inject` errors when the load command isn't present —
-                # which is the case after llvm-objcopy --add-section.
+                # Mach-O signing — only on darwin builds. `--add-section`
+                # invalidates the LC_CODE_SIGNATURE blob; macOS Sonoma+
+                # kills unsigned binaries with SIGKILL on exec. We pull in
+                # nixpkgs's auto-sign hook for its `signIfRequired`
+                # helper (sourced from signing-utils, propagated by the
+                # hook) — it wraps sigtool + codesign_allocate with the
+                # right CODESIGN_ALLOCATE env var and copy-out-then-back
+                # trick. Using the hook avoids putting `cctools` on PATH
+                # wholesale (the bare `ar`/`ranlib` clash breaks
+                # autoconf interface detection in some packages, gawk
+                # being one).
                 ++ nixpkgs.lib.optionals
                      (pkgs.stdenv.hostPlatform.isDarwin or false)
-                     [
-                       pkgs.buildPackages.darwin.sigtool
-                       pkgs.buildPackages.darwin.cctools
-                     ];
+                     [ pkgs.buildPackages.darwin.autoSignDarwinBinariesHook ];
 
               postInstall = (old.postInstall or "")
                 + nixpkgs.lib.optionalString hasAuto ''
@@ -401,12 +401,11 @@
                           "$1"
                         # Re-sign ad-hoc. The add-section invalidates the
                         # existing LC_CODE_SIGNATURE; macOS Sonoma+ kills
-                        # any unsigned binary with SIGKILL on exec. sigtool's
-                        # `codesign` wrapper calls `codesign_allocate` (cctools)
-                        # to reserve the load command + signature space, then
-                        # writes the ad-hoc blob. Both tools are wired into
-                        # nativeBuildInputs only for darwin builds.
-                        codesign --force --sign - "$1"
+                        # any unsigned binary with SIGKILL on exec. The
+                        # `signIfRequired` helper (sourced from signing-utils
+                        # via autoSignDarwinBinariesHook) wraps sigtool +
+                        # codesign_allocate with the correct env wiring.
+                        signIfRequired "$1"
                         ;;
                       *)
                         llvm-objcopy \
