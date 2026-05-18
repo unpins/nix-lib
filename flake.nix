@@ -536,7 +536,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         # its `pkgsStatic` counterpart (.a-only, no shared libs at all), falling back
         # to `dropSharedLibs` on the regular version when no pkgsStatic variant exists.
         #
-        # Used by `native/tmux.nix` on darwin: pkgsStatic.tmux itself fails to link
+        # Used by `tmux/flake.nix`'s darwin build closure: pkgsStatic.tmux itself fails to link
         # (configure.ac passes `-static` globally → libSystem probe fails), so we keep
         # regular tmux but swap its deps for the static variants. Preferring pkgsStatic
         # over postFixup-delete dodges the dyld-at-build-time pitfall (ncurses ships
@@ -925,11 +925,12 @@ with zipfile.ZipFile(sys.argv[1]) as z:
       # helpers (withDepsSharedPruned, mingwStaticCross, …) — fuse both into one
       # `lib` for them so they can write `lib.X` uniformly.
       #
-      # `nativeFixes` is re-exposed inside the lib seen by fix files so one
-      # fix can reuse another (e.g. native/tmux.nix calling
-      # lib.nativeFixes.libevent). Safe under nix laziness because cross-fix
-      # references only resolve when the consumer calls the function with
-      # `pkgs`, not at top-level evaluation.
+      # `nativeFixes` is re-exposed inside the lib seen by fix files (and by
+      # consumer `build` closures via `unpins-lib.lib.nativeFixes.<dep>`) so a
+      # downstream consumer can reuse a library override (e.g. tmux's `build`
+      # closure calls `lib.nativeFixes.libevent`). Safe under nix laziness
+      # because cross-fix references only resolve when the consumer calls
+      # the function with `pkgs`, not at top-level evaluation.
       fixLibBase = nixpkgs.lib // lib;
       nativeFixes = import ./native-overlay { lib = fixLibBase // { inherit nativeFixes; }; };
       mingwOverlayFixes = import ./mingw-overlay { lib = fixLibBase; };
