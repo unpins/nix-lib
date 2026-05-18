@@ -50,13 +50,7 @@ let
         }
         if (strncmp(name, "lt-", 3) == 0) name += 3;
 
-        if (strcmp(name, "findutils") == 0) {
-            if (argc < 2) {
-                fprintf(stderr, "findutils: usage: %s <applet> [args...]\n",
-                        argv[0]);
-                fprintf(stderr, "applets: find xargs\n");
-                return 1;
-            }
+        if (strcmp(name, "findutils") == 0 && argc >= 2 && argv[1][0] != '-') {
             name = argv[1];
             argv++;
             argc--;
@@ -65,8 +59,10 @@ let
         if (strcmp(name, "find") == 0)  return find_main(argc, argv);
         if (strcmp(name, "xargs") == 0) return xargs_main(argc, argv);
 
-        fprintf(stderr, "findutils: unknown applet '%s'\n", name);
-        return 1;
+        /* Default route: --version, --help, and binaries renamed by
+           the CI smoke step (smoke.exe) land in find. find's getopt
+           handles --version regardless of argv[0]. */
+        return find_main(argc, argv);
     }
   '';
 
