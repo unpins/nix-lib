@@ -768,10 +768,14 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             #                    .overrideAttrs …`. Per-binary cosmo recipes live
             #                    in `<consumer>/cosmo.nix` sidecars, mingw recipes
             #                    inline in the consumer's `windowsBuild`.
-            #   windowsCosmo   → shortcut: `(cosmoStaticCross pkgs).${pkgsAttr}`
-            #                    with no consumer customization. Legacy alias —
-            #                    the catalog now uses the sidecar pattern via
-            #                    `windowsBuild` for symmetry with mingw.
+            #   windowsCosmo   → `(cosmoStaticCross pkgs).${pkgsAttr}` + auto
+            #                    `cosmoApelink` (ELF→PE32+, rename to `.exe`).
+            #                    Use for cosmo builds where vanilla nixpkgs
+            #                    cross builds cleanly and no further consumer
+            #                    customization is needed. Most catalog cosmo
+            #                    packages have extra quirks (drop symlinks,
+            #                    withAliases, configureFlags) and use
+            #                    `windowsBuild = import ./cosmo.nix` instead.
             #   windows        → plain `(mingwStaticCross pkgs).${pkgsAttr}`,
             #                    no consumer customization.
             windowsEnabled = windows || windowsBuild != null || windowsCosmo;
@@ -781,7 +785,9 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             };
             windowsRawBuild =
               if windowsBuild != null then windowsBuild
-              else if windowsCosmo then (pkgs: (cosmoStaticCross pkgs).${pkgsAttr})
+              else if windowsCosmo then (pkgs:
+                cosmoApelink pkgs { inherit binName; }
+                  ((cosmoStaticCross pkgs).${pkgsAttr}))
               else (pkgs: (mingwStaticCross pkgs).${pkgsAttr});
             windowsPkg = strippedOrJoined windowsPkgs name
               (dropSharedLibs (applyOptSsp (windowsRawBuild windowsPkgs)));
@@ -934,6 +940,31 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           system = pkgs.stdenv.buildPlatform.system;
           targetArch = pkgs.stdenv.buildPlatform.parsed.cpu.name;
         };
+
+        # cosmocc emits APE polyglot binaries by default (Linux+macOS+Windows+
+        # BSD in one file; `file -L` reports "DOS/MBR boot sector"). action-build
+        # requires `file -L *.exe` to report PE32+, so every cosmo build needs
+        # `apelink -V 4` in postFixup to strip the polyglot down to its Windows
+        # half. This helper centralises that boilerplate so consumer sidecars
+        # don't have to re-state it.
+        #
+        # Composition order matters when the consumer also calls `withAliases`:
+        # `cosmoApelink` MUST wrap the drv BEFORE `withAliases` so postFixup
+        # chains as `<consumer cleanup>` → `<apelink to .exe>` → `<embed
+        # UNPIN_META into .exe>`. withAliases's postInstall (symlink harvest +
+        # delete) runs before postFixup either way — the .exe rename happens
+        # after the harvest so aliasesFromSymlinksIn still sees the symlinks.
+        cosmoApelink = pkgs: { binName }: drv:
+          let cs = import ./cosmocc.nix { pkgs = pkgs.buildPackages; };
+          in drv.overrideAttrs (old: {
+            postFixup = (old.postFixup or "") + ''
+              ${cs.cosmocc}/bin/apelink \
+                -V ${toString cs.platformBits.windows} \
+                -o $out/bin/${binName}.exe \
+                $out/bin/${binName}
+              rm -f $out/bin/${binName}
+            '';
+          });
       };
 
       # Per-target fixes, auto-loaded from sibling directories.
