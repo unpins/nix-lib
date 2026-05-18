@@ -21,6 +21,22 @@
           builtins.listToAttrs
             (map (sys: { name = sys; value = f sys; }) nativeSystems);
 
+        isLinuxSys = system: nixpkgs.lib.hasSuffix "-linux" system;
+        isDarwinSys = system: nixpkgs.lib.hasSuffix "-darwin" system;
+
+        # Append `flags` (string or list) to NIX_CFLAGS_COMPILE without losing
+        # prior values. Reads from both `old.NIX_CFLAGS_COMPILE` (top-level —
+        # what __structuredAttrs = true packages like htop need) and the legacy
+        # `old.env.NIX_CFLAGS_COMPILE` (what stock nixpkgs builders often set).
+        # Writes back at top-level: cc-wrapper reads both, but top-level is the
+        # one that survives a `__structuredAttrs` override layer.
+        appendCFlags = drv: flags: drv.overrideAttrs (old: {
+          NIX_CFLAGS_COMPILE = builtins.concatStringsSep " " (
+            nixpkgs.lib.optional (old ? NIX_CFLAGS_COMPILE) old.NIX_CFLAGS_COMPILE
+            ++ nixpkgs.lib.optional (old ? env && old.env ? NIX_CFLAGS_COMPILE) old.env.NIX_CFLAGS_COMPILE
+            ++ (if builtins.isList flags then flags else [ flags ]));
+        });
+
         # Remove .so/.dylib/.la/.dll/.dll.a from a drv's outputs; leave .a + headers + bins.
         # Build-system agnostic (postFixup, not configure flags).
         #
@@ -599,31 +615,23 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           }:
           let
             overridden = if staticDeps == { } then pkg else pkg.override staticDeps;
+            withMingwOverrides = overridden.overrideAttrs (old: {
+              stripAllList = [ "bin" ];
+              buildInputs = (old.buildInputs or [ ]) ++ extraInputs;
+              configureFlags =
+                (builtins.filter filterConfigureFlag (old.configureFlags or [ ]))
+                ++ extraConfigureFlags;
+              # Make-time only. Passing via NIX_LDFLAGS at configure breaks autoconf's
+              # "C compiler works" probe.
+              makeFlags = (old.makeFlags or [ ]) ++ [ "LDFLAGS=-all-static" ];
+            } // extraOverrides old);
           in
-          overridden.overrideAttrs
-            (old:
-              {
-                stripAllList = [ "bin" ];
-                buildInputs = (old.buildInputs or [ ]) ++ extraInputs;
-                configureFlags =
-                  (builtins.filter filterConfigureFlag (old.configureFlags or [ ]))
-                  ++ extraConfigureFlags;
-                # Make-time only. Passing via NIX_LDFLAGS at configure breaks autoconf's
-                # "C compiler works" probe.
-                makeFlags = (old.makeFlags or [ ]) ++ [ "LDFLAGS=-all-static" ];
-              }
-              // (nixpkgs.lib.optionalAttrs (extraCFlags != [ ]) {
-                # mingw headers (nghttp2, libpsl, libcurl, ...) default to
-                # `__declspec(dllimport)`. Static consumers need *_STATICLIB defined or
-                # the link leaves `__imp_*` unresolved.
-                env = (old.env or { }) // {
-                  NIX_CFLAGS_COMPILE = builtins.concatStringsSep " " (
-                    (nixpkgs.lib.optional (old ? env && old.env ? NIX_CFLAGS_COMPILE)
-                      old.env.NIX_CFLAGS_COMPILE)
-                    ++ extraCFlags);
-                };
-              })
-              // extraOverrides old);
+          # mingw headers (nghttp2, libpsl, libcurl, ...) default to
+          # `__declspec(dllimport)`. Static consumers need *_STATICLIB defined or
+          # the link leaves `__imp_*` unresolved.
+          if extraCFlags == [ ]
+          then withMingwOverrides
+          else appendCFlags withMingwOverrides extraCFlags;
 
         packageWithMan = pkgs: name: drv:
           let
@@ -689,16 +697,54 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           # interactive probe.
           , smoke ? null
           , smokePattern ? null
+          # optimize: knobs for opt-level / stack protector / LTO. Defaults
+          # merged with `{ lto = true; opt = null; ssp = true; }`. Keys:
+          #
+          #   lto = false      → skip mkPkgsLTO overlay; stock toolchain.
+          #                       Defaults true; falls through to non-LTO
+          #                       automatically for mingw / cosmocc cross
+          #                       (Linux native only).
+          #   opt = "-Os"      → appended to NIX_CFLAGS_COMPILE (wins over
+          #                       upstream). null leaves it to upstream
+          #                       (~ -O2). When LTO is active, null is
+          #                       resolved to -O2 inside the overlay.
+          #   ssp = false      → drop stack protector + skip the LTO
+          #                       `-Wl,-u,__stack_chk_fail` retention flag.
+          , optimize ? { }
           }:
           let
-            nixpkgsFor = forAllNative (system: import nixpkgs { inherit system; });
+            optimize_ = { lto = true; opt = null; ssp = true; } // optimize;
+            inherit (optimize_) lto opt ssp;
+            ltoOpt = if opt == null then "-O2" else opt;
+            # LTO overlay applies on Linux only — musl is Linux-specific
+            # and the cross-darwin path doesn't have an analogous chain
+            # we want to rewire yet. Darwin/cross fall back to stock pkgs.
+            nixpkgsFor = forAllNative (system:
+              if lto && isLinuxSys system
+              then mkPkgsLTO { inherit system; opt = ltoOpt; inherit ssp; pkgName = pkgsAttr; }
+              else import nixpkgs { inherit system; });
+
+            # Apply opt/ssp knobs to a built drv. No-op when both at
+            # default (opt = null + ssp = true) so cache.nixos.org hits
+            # stay intact for packages that don't override.
+            applyOptSsp = drv:
+              if opt == null && ssp then drv
+              else
+                let
+                  flags = (nixpkgs.lib.optional (opt != null) opt)
+                       ++ (nixpkgs.lib.optional (!ssp) "-fno-stack-protector");
+                in
+                (appendCFlags drv flags).overrideAttrs (old: {
+                  hardeningDisable = (old.hardeningDisable or [ ])
+                    ++ (if ssp then [ ] else [ "stackprotector" ]);
+                });
 
             rawBuild =
               if build != null then build
               else nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
             stripped = pkgs:
               strippedOrJoined pkgs name
-                (dropSharedLibs (filterEnableStaticOnDarwin (rawBuild pkgs)));
+                (dropSharedLibs (filterEnableStaticOnDarwin (applyOptSsp (rawBuild pkgs))));
 
             # Windows runs on x86_64-linux runners. `allowUnsupportedSystem` because
             # most nixpkgs `meta.platforms` exclude mingw / cosmo → cross-built drv
@@ -722,7 +768,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
               else if windowsCosmo then (_pkgs: (mkPkgsCosmo { }).${pkgsAttr})
               else mingwFixes.${pkgsAttr} or (pkgs: (mingwStaticCross pkgs).${pkgsAttr});
             windowsPkg = strippedOrJoined windowsPkgs name
-              (dropSharedLibs (windowsRawBuild windowsPkgs));
+              (dropSharedLibs (applyOptSsp (windowsRawBuild windowsPkgs)));
 
             # `linuxOnly` drops every Darwin attr from `packages.<sys>` so
             # action-build's auto-discovered matrix doesn't include darwin
@@ -730,7 +776,6 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             # excludes darwin entirely (kmod, util-linux, shadow,
             # procps-ng, iproute2 — anything that talks to Linux-only
             # kernel APIs).
-            isDarwinSys = system: nixpkgs.lib.hasSuffix "-darwin" system;
             wantsNative = system: nativeBuild && !(linuxOnly && isDarwinSys system);
           in
           {
@@ -786,6 +831,12 @@ with zipfile.ZipFile(sys.argv[1]) as z:
               smoke_pattern = if smokePattern == null then null else smokePattern;
             };
           };
+
+        # mkPkgsLTO: pkgsStatic with a chain-wide LTO overlay. Every drv in
+        # the closure rebuilds with -flto + gcc-ar + --gc-sections. Stack
+        # protector kept via -Wl,-u,__stack_chk_fail. See ./lto.nix.
+        # Consumed by mkStandaloneFlake when `lto = true`.
+        mkPkgsLTO = import ./lto.nix { inherit nixpkgs appendCFlags; };
 
         # Native cosmoStdenv. Used by playground/{bash,coreutils,dash,links} for
         # in-tree builds against the `$COSMOS` shared prefix. The full result is
