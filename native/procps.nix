@@ -274,10 +274,12 @@ DISPATCHER_TAIL
   });
 
   # libtool emits `library/.libs/libproc2.a` for the convenience archive.
-  # The wildcard pulls it in plus any other static archives in `.libs/`
-  # subdirs. ncurses/tinfo aren't in pkgsStatic.procps's buildInputs
-  # (configure dropped them per `--disable-modern-top`), so no system
-  # curses libs to thread.
+  # slabtop/top/watch/tload/hugetop pull ncurses + tinfo for the live UI;
+  # those come via `propagatedBuildInputs` (ncurses-static-dev) so
+  # configure detects them via pkg-config and sets $(NCURSES_LIBS) +
+  # $(TINFO_LIBS). $(MATH_LIBS) is wanted by top. The rest of the
+  # configure-detected lib slots stay empty under pkgsStatic (no
+  # systemd / selinux / namespace headers).
   multicallMk = pkgs.writeText "unpin-procps-multicall.mk" ''
     MULTI_OUT ?= multicall/procps-ng
 
@@ -289,6 +291,8 @@ DISPATCHER_TAIL
     		multicall/dispatcher.o $(MULTI_COMBINED_OBJS) \
     		$(MULTI_GROUP_OPEN) \
     		library/.libs/libproc2.a \
+    		$(NCURSES_LIBS) $(TINFO_LIBS) $(MATH_LIBS) \
+    		$(SYSTEMD_LIBS) $(SELINUX_LIBS) $(NAMESPACE_LIBS) \
     		$(LIBS) \
     		$(MULTI_LIBGCC) \
     		$(MULTI_GROUP_CLOSE)
