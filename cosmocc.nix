@@ -18,6 +18,15 @@ let
 
   version = "4.0.2";
 
+  # Upstream mmap.c at the cosmocc tag we ship — fetched separately so we
+  # can patch it without bundling 38 KB of cosmopolitan source in our repo.
+  # The patch fixes the wine hang where cosmo's pickaddr loops forever on
+  # STATUS_CONFLICTING_ADDRESSES; see cosmocc-wine-fix/.
+  cosmoMmapSrc = pkgs.fetchurl {
+    url = "https://raw.githubusercontent.com/jart/cosmopolitan/${version}/libc/intrin/mmap.c";
+    hash = "sha256-xHsnD5UZCwpmPOtgWklpbXzDCFY2aVaY0YUkpTpb54k=";
+  };
+
   # See docs/platforms/cosmocc.md for why dontPatchELF / dontStrip / etc. are
   # required on APE polyglots.
   cosmocc = pkgs.stdenvNoCC.mkDerivation {
@@ -43,6 +52,28 @@ let
       # Upstream zip ships cosmoranlib as 444 (not executable). Other cosmo*
       # fat scripts are 555. Normalize.
       chmod +x $out/bin/cosmoranlib
+
+      # Patch libcosmo.a's mmap.o to fix the wine fixed-VA hang. The bug:
+      # cosmo's pickaddr-then-retry loop on STATUS_CONFLICTING_ADDRESSES is
+      # deterministic, so when wine puts ntdll inside cosmo's preferred VA
+      # range, the loop never escapes. Patch leaves the failed range as a
+      # ghost reservation; pickaddr then skips it. See the .patch file for
+      # the full root-cause writeup. We rebuild mmap.o with the bundled
+      # cosmocc itself (single command emits both x86_64 + .aarch64/),
+      # then `ar r` swaps it into both libcosmo.a archives.
+      mkdir -p $TMPDIR/cosmosrc/libc/intrin $TMPDIR/build/.aarch64
+      cp ${cosmoMmapSrc} $TMPDIR/cosmosrc/libc/intrin/mmap.c
+      chmod u+w $TMPDIR/cosmosrc/libc/intrin/mmap.c
+      patch -p1 -d $TMPDIR/cosmosrc < ${./cosmocc-wine-fix/wine-fixed-addr-leak.patch}
+      ( cd $TMPDIR/build && $out/bin/cosmocc -U__COSMOCC__ -D_COSMO_SOURCE \
+          -O2 -ffunction-sections -fdata-sections \
+          -c -o mmap.o $TMPDIR/cosmosrc/libc/intrin/mmap.c )
+      chmod -R u+w $out
+      $out/bin/x86_64-linux-cosmo-ar r \
+        $out/x86_64-linux-cosmo/lib/libcosmo.a $TMPDIR/build/mmap.o
+      $out/bin/aarch64-linux-cosmo-ar r \
+        $out/aarch64-linux-cosmo/lib/libcosmo.a $TMPDIR/build/.aarch64/mmap.o
+
       runHook postUnpack
     '';
 

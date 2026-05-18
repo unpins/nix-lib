@@ -1,0 +1,73 @@
+Fix wine hang on cosmo PE binaries.
+
+When mmap()'s fixed-VA request fails with STATUS_CONFLICTING_ADDRESSES
+(wine puts ntdll inside cosmo's preferred VA range; real Windows does
+not), the original code removed the failed range from __maps but left
+the loop's pickaddr deterministic — it would re-pick the same
+conflicting addr forever, hanging the process.
+
+Fix: leave the failed range in __maps as a ghost reservation so
+__maps_pickaddr skips it next iteration; allocate a fresh map struct
+for the retry (re-keying the original would corrupt the rbtree).
+
+Validated against wine-10.0 + cosmocc 4.0.2 hello.exe (was: timeout
+124; now: prints "Hello, cosmo!" exit 0). Upstream-able as-is.
+
+--- a/libc/intrin/mmap.c
++++ b/libc/intrin/mmap.c
+@@ -799,27 +799,47 @@
+ 
+     // handle failure
+     if (IsWindows()) {
+-      // untrack reservation
+-      __maps_lock();
+-      tree_remove(&__maps.maps, &map->tree);
+-      __maps.pages -= (map->size + __pagesize - 1) / __pagesize;
+-      __maps_unlock();
+       if (errno == EADDRNOTAVAIL) {
+         // we've encountered mystery memory
+         if (fixedmode) {
+           // TODO(jart): Use VirtualQuery() to destroy mystery memory.
++          __maps_lock();
++          tree_remove(&__maps.maps, &map->tree);
++          __maps.pages -= (map->size + __pagesize - 1) / __pagesize;
++          __maps_unlock();
+           errno = ENOMEM;
+         } else if (noreplace) {
+           // we can't try again with a different address in this case
++          __maps_lock();
++          tree_remove(&__maps.maps, &map->tree);
++          __maps.pages -= (map->size + __pagesize - 1) / __pagesize;
++          __maps_unlock();
+           errno = EEXIST;
+         } else {
+-          // we shall leak the tracking object since it should at least
+-          // partially cover the mystery mapping. so if we loop forever
+-          // the system should eventually recover and find fresh spaces
++          // Leave `map` in the tree as a ghost reservation covering
++          // the failed addr range, so __maps_pickaddr skips it next
++          // iteration. Allocate a fresh map struct for the retry —
++          // re-keying `map` to a new addr would corrupt the rbtree.
++          //
++          // Real Windows rarely hits this path because cosmo's
++          // preferred VAs are free; wine puts ntdll inside cosmo's
++          // preferred range and triggers a hang without this fix.
++          struct Map *newmap = __maps_alloc();
++          if (!newmap) {
++            errno = ENOMEM;
++            return MAP_FAILED;
++          }
++          map = newmap;
+           errno = olderr;
+           addr = 0;
+           continue;
+         }
++      } else {
++        // untrack reservation
++        __maps_lock();
++        tree_remove(&__maps.maps, &map->tree);
++        __maps.pages -= (map->size + __pagesize - 1) / __pagesize;
++        __maps_unlock();
+       }
+     }
+     __maps_free(map);
