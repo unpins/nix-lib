@@ -779,7 +779,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             };
             windowsRawBuild =
               if windowsBuild != null then windowsBuild
-              else if windowsCosmo then (_pkgs: (mkPkgsCosmo { }).${pkgsAttr})
+              else if windowsCosmo then (pkgs: (cosmoStaticCross pkgs).${pkgsAttr})
               else (pkgs: (mingwStaticCross pkgs).${pkgsAttr});
             windowsPkg = strippedOrJoined windowsPkgs name
               (dropSharedLibs (applyOptSsp (windowsRawBuild windowsPkgs)));
@@ -917,6 +917,21 @@ with zipfile.ZipFile(sys.argv[1]) as z:
                 wiring.stdenv;
             };
           };
+
+        # `cosmoStaticCross pkgs` — symmetric to `mingwStaticCross pkgs` and
+        # `pkgs.pkgsStatic`: takes a build-host pkgs set and returns the cosmo
+        # cross pkgs set. Per-binary quirks live in the consumer flake's
+        # `windowsBuild = pkgs: let cs = lib.cosmoStaticCross pkgs; in
+        # cs.${pkgsAttr}.overrideAttrs (…)` (mirrors mingw's inline pattern).
+        #
+        # Internally still delegates to `mkPkgsCosmo` (which carries the
+        # `applyPatches` + `replaceCrossStdenv` wiring). The day nixpkgs
+        # upstream learns about cosmo (or our patch covers `pkgsCross.cosmo`),
+        # this collapses to `pkgs.pkgsCross.cosmo.appendOverlays […]`.
+        cosmoStaticCross = pkgs: mkPkgsCosmo {
+          system = pkgs.stdenv.buildPlatform.system;
+          targetArch = pkgs.stdenv.buildPlatform.parsed.cpu.name;
+        };
       };
 
       # Per-target fixes, auto-loaded from sibling directories.
