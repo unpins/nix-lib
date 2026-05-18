@@ -527,8 +527,10 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         # 30-60 min of darwin CI to add one configureFlag. Fake-cross via differing
         # config strings was tried and broke autotools (cross mode disables AC_RUN_IFELSE,
         # which apple-sdk's atf needs). So `drv.override` / `.overrideAttrs` inside the
-        # native/ + mingw/ + mingw-overlay/ fix files is the only path keeping both the
-        # cached toolchain AND autotools-native-mode configure runs.
+        # consumer's `build`/`windowsBuild` closures (and the lib-only
+        # native-overlay/ + mingw-overlay/ overlay fragments) is the only path
+        # keeping both the cached toolchain AND autotools-native-mode configure
+        # runs.
 
         # Rebuild `drv` with every dep in `drv.override.__functionArgs` swapped for
         # its `pkgsStatic` counterpart (.a-only, no shared libs at all), falling back
@@ -767,8 +769,9 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             #                    an overlay fragment. Used when mingw isn't viable
             #                    (gnulib waitpid/fork POSIX assumptions: bash,
             #                    git, coreutils).
-            #   windows        → mingw registry: `mingw/<name>.nix` or
-            #                    `(mingwStaticCross pkgs).${name}` fallback.
+            #   windows        → plain `(mingwStaticCross pkgs).${pkgsAttr}`;
+            #                    per-binary mingw quirks live inline in the
+            #                    consumer flake's `windowsBuild = pkgs: …`.
             windowsEnabled = windows || windowsBuild != null || windowsCosmo;
             windowsPkgs = import nixpkgs {
               system = "x86_64-linux";
@@ -777,7 +780,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             windowsRawBuild =
               if windowsBuild != null then windowsBuild
               else if windowsCosmo then (_pkgs: (mkPkgsCosmo { }).${pkgsAttr})
-              else mingwFixes.${pkgsAttr} or (pkgs: (mingwStaticCross pkgs).${pkgsAttr});
+              else (pkgs: (mingwStaticCross pkgs).${pkgsAttr});
             windowsPkg = strippedOrJoined windowsPkgs name
               (dropSharedLibs (applyOptSsp (windowsRawBuild windowsPkgs)));
 
@@ -929,7 +932,6 @@ with zipfile.ZipFile(sys.argv[1]) as z:
       # `pkgs`, not at top-level evaluation.
       fixLibBase = nixpkgs.lib // lib;
       nativeFixes = import ./native-overlay { lib = fixLibBase // { inherit nativeFixes; }; };
-      mingwFixes = import ./mingw { lib = fixLibBase; };
       mingwOverlayFixes = import ./mingw-overlay { lib = fixLibBase; };
     in
     {
