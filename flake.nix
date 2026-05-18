@@ -24,18 +24,29 @@
         isLinuxSys = system: nixpkgs.lib.hasSuffix "-linux" system;
         isDarwinSys = system: nixpkgs.lib.hasSuffix "-darwin" system;
 
-        # Append `flags` (string or list) to NIX_CFLAGS_COMPILE without losing
-        # prior values. Reads from both `old.NIX_CFLAGS_COMPILE` (top-level —
-        # what __structuredAttrs = true packages like htop need) and the legacy
-        # `old.env.NIX_CFLAGS_COMPILE` (what stock nixpkgs builders often set).
-        # Writes back at top-level: cc-wrapper reads both, but top-level is the
-        # one that survives a `__structuredAttrs` override layer.
-        appendCFlags = drv: flags: drv.overrideAttrs (old: {
-          NIX_CFLAGS_COMPILE = builtins.concatStringsSep " " (
-            nixpkgs.lib.optional (old ? NIX_CFLAGS_COMPILE) old.NIX_CFLAGS_COMPILE
-            ++ nixpkgs.lib.optional (old ? env && old.env ? NIX_CFLAGS_COMPILE) old.env.NIX_CFLAGS_COMPILE
-            ++ (if builtins.isList flags then flags else [ flags ]));
-        });
+        # Append `flags` (string or list) to NIX_CFLAGS_COMPILE.
+        #
+        # `__structuredAttrs = true` drvs (bash, findutils, grep, dash, …)
+        # carry the flag inside `env.NIX_CFLAGS_COMPILE`. Writing a top-level
+        # `NIX_CFLAGS_COMPILE` on top of that collides — nix's mkDerivation
+        # refuses with "attribute set cannot contain any attributes passed to
+        # derivation". So we detect where the existing value lives and append
+        # in-place; never both.
+        appendCFlags = drv: flags:
+          let
+            flagStr = builtins.concatStringsSep " "
+              (if builtins.isList flags then flags else [ flags ]);
+          in
+          drv.overrideAttrs (old:
+            if old ? env && old.env ? NIX_CFLAGS_COMPILE then {
+              env = old.env // {
+                NIX_CFLAGS_COMPILE = old.env.NIX_CFLAGS_COMPILE + " " + flagStr;
+              };
+            } else if old ? NIX_CFLAGS_COMPILE then {
+              NIX_CFLAGS_COMPILE = old.NIX_CFLAGS_COMPILE + " " + flagStr;
+            } else {
+              NIX_CFLAGS_COMPILE = flagStr;
+            });
 
         # Remove .so/.dylib/.la/.dll/.dll.a from a drv's outputs; leave .a + headers + bins.
         # Build-system agnostic (postFixup, not configure flags).
@@ -917,7 +928,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
       # references only resolve when the consumer calls the function with
       # `pkgs`, not at top-level evaluation.
       fixLibBase = nixpkgs.lib // lib;
-      nativeFixes = import ./native { lib = fixLibBase // { inherit nativeFixes; }; };
+      nativeFixes = import ./native-overlay { lib = fixLibBase // { inherit nativeFixes; }; };
       mingwFixes = import ./mingw { lib = fixLibBase; };
       mingwOverlayFixes = import ./mingw-overlay { lib = fixLibBase; };
     in
