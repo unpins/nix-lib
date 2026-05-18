@@ -762,16 +762,18 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             # Windows runs on x86_64-linux runners. `allowUnsupportedSystem` because
             # most nixpkgs `meta.platforms` exclude mingw / cosmo → cross-built drv
             # would be filtered out. Dispatch order:
-            #   windowsBuild   → consumer-supplied closure (curl Schannel,
-            #                    vim/gvim Make_ming.mak)
-            #   windowsCosmo   → mkPkgsCosmo (cosmocc-as-cross-stdenv); the
-            #                    per-package fix lives in `cosmo/<name>.nix` as
-            #                    an overlay fragment. Used when mingw isn't viable
-            #                    (gnulib waitpid/fork POSIX assumptions: bash,
-            #                    git, coreutils).
-            #   windows        → plain `(mingwStaticCross pkgs).${pkgsAttr}`;
-            #                    per-binary mingw quirks live inline in the
-            #                    consumer flake's `windowsBuild = pkgs: …`.
+            #   windowsBuild   → consumer-supplied closure. For mingw, returns
+            #                    `(mingwStaticCross pkgs).${name}.overrideAttrs …`;
+            #                    for cosmocc, returns `(cosmoStaticCross pkgs).${name}
+            #                    .overrideAttrs …`. Per-binary cosmo recipes live
+            #                    in `<consumer>/cosmo.nix` sidecars, mingw recipes
+            #                    inline in the consumer's `windowsBuild`.
+            #   windowsCosmo   → shortcut: `(cosmoStaticCross pkgs).${pkgsAttr}`
+            #                    with no consumer customization. Legacy alias —
+            #                    the catalog now uses the sidecar pattern via
+            #                    `windowsBuild` for symmetry with mingw.
+            #   windows        → plain `(mingwStaticCross pkgs).${pkgsAttr}`,
+            #                    no consumer customization.
             windowsEnabled = windows || windowsBuild != null || windowsCosmo;
             windowsPkgs = import nixpkgs {
               system = "x86_64-linux";
