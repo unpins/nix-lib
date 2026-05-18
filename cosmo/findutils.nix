@@ -2,7 +2,7 @@
 # coreutils-x86_64-w64-mingw32 as a nativeBuildInputs dep and coreutils
 # on mingw dies in gnulib `lib/savewd.c` on `waitpid`).
 #
-# Same multicall recipe as nix-lib/native/findutils.nix: rename main →
+# Same multicall recipe as findutils/flake.nix's native build closure: rename main →
 # {find,xargs}_main on each tool's object, ship a dispatcher.o, link
 # them with libfindtools.a + lib/libfind.a + gl/lib/libgnulib.a. cosmocc
 # uses ELF binutils + apelink in postFixup to produce findutils.exe.

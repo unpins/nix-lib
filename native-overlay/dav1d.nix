@@ -1,4 +1,4 @@
-# Same Apple-Silicon / meson cross-file mismatch as native/libopus.nix:
+# Same Apple-Silicon / meson cross-file mismatch as libopus.nix in this dir:
 # nixpkgs writes `cpu_family = 'arm64'` (from uname.processor) into the
 # meson cross-file on darwin-aarch64, and meson doesn't canonicalize to
 # 'aarch64'. dav1d treats `cpu_family().startswith('arm')` as ARM-32 and
