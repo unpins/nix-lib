@@ -6,11 +6,12 @@
 #   - cosmoCCUnwrapped       : single-arch cc dir w/ shims (gcc/cc/g++/c++/cpp)
 #   - cosmoBintoolsUnwrapped : APE bintools shimmed for kernel exec
 #   - platformBits           : apelink -V <bits> per OS
-#   - mkCrossWiring          : helpers for mkPkgsCosmo (cross-stdenv injection)
+#   - mkCrossWiring          : helpers for pkgsCross.cosmo (cross-stdenv injection)
 #
 # `pkgs` is the build-side nixpkgs (linux-gnu). Consumers either use cosmoStdenv
 # directly (existing playground/{bash,coreutils,dash,links}) or feed mkCrossWiring
-# into config.replaceCrossStdenv (new mkPkgsCosmo path).
+# into config.replaceCrossStdenv (the path mkStandaloneFlake's `windowsPkgs` uses
+# to expose `pkgs.pkgsCross.cosmo`).
 { pkgs }:
 
 let
@@ -190,9 +191,9 @@ let
     }
     (pkgs.overrideCC pkgs.stdenv cosmoCC);
 
-  # Helpers used by mkPkgsCosmo to swap the cross-stdenv's compiler/bintools
-  # for the cosmocc ones, preserving the cross target prefix that the
-  # nixpkgs-generated wrappers already carry.
+  # Helpers used by config.replaceCrossStdenv (from windowsPkgs) to swap the
+  # cross-stdenv's compiler/bintools for the cosmocc ones, preserving the
+  # cross target prefix that the nixpkgs-generated wrappers already carry.
   #
   # The cosmocc bin/ ships unprefixed tools (gcc, ar, ld, …) plus the real
   # binaries (x86_64-unknown-cosmo-cc, x86_64-linux-cosmo-ar, …). nixpkgs's

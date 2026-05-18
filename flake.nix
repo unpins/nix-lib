@@ -676,10 +676,10 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         #   apps.<system>.default                    = `nix run` entry
         #
         # `name` is the user-facing id (catalog/gh-repo/binary). `pkgsAttr`
-        # overrides the nixpkgs / nativeFixes / mkPkgsCosmo lookup when the
+        # overrides the nixpkgs / nativeFixes / pkgsCross.cosmo lookup when the
         # nixpkgs attribute differs (e.g. nixpkgs ships `links2`, we ship as
         # `links`). Falls back to `pkgs.pkgsStatic.${pkgsAttr}` /
-        # `(mingwStaticCross pkgs).${pkgsAttr}` / `(mkPkgsCosmo {}).${pkgsAttr}`.
+        # `pkgs.pkgsCross.mingwW64.${pkgsAttr}` / `pkgs.pkgsCross.cosmo.${pkgsAttr}`.
         # Consumers wanting full control pass `build` / `windowsBuild` directly.
         # `binName` overrides when bin name ≠ name. `nativeBuild = false` →
         # windows-only (e.g. gvim: static GTK infeasible on linux, MacVim is its
@@ -779,10 +779,48 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             #   windows        → plain `(mingwStaticCross pkgs).${pkgsAttr}`,
             #                    no consumer customization.
             windowsEnabled = windows || windowsBuild != null || windowsCosmo;
-            windowsPkgs = import nixpkgs {
-              system = "x86_64-linux";
-              config.allowUnsupportedSystem = true;
-            };
+            # windowsPkgs is the single root from which BOTH cross targets live:
+            #   pkgsCross.mingwW64  →  vanilla nixpkgs cross
+            #   pkgsCross.cosmo     →  cosmocc-as-cross-stdenv (via
+            #                          replaceCrossStdenv + cosmoOverlay)
+            # The applyPatches step registers `cosmo` as a kernel + example
+            # crossSystem in nixpkgs (see ./cosmo-lib-systems.patch). The
+            # overlay self-guards on `isCosmo` so it's a no-op for
+            # pkgsCross.mingwW64; `replaceCrossStdenv` likewise guards
+            # before swapping in cosmocc. Net effect: vanilla mingw drvs
+            # are unchanged, cosmo drvs are routed through cosmocc.
+            windowsPkgs =
+              let
+                basePkgs = nixpkgs.legacyPackages.${"x86_64-linux"};
+                nixpkgsPatched = basePkgs.applyPatches {
+                  name = "nixpkgs-cosmo";
+                  src = nixpkgs.outPath;
+                  patches = [ ./cosmo-lib-systems.patch ];
+                };
+                # Pass fixLib so cosmo overlay fragments can call
+                # `lib.withAliases` (defined in nix-lib's lib).
+                cosmoOverlay = import ./cosmo { lib = nixpkgs.lib // lib; };
+              in
+              import nixpkgsPatched {
+                system = "x86_64-linux";
+                overlays = [ cosmoOverlay ];
+                config = {
+                  allowUnsupportedSystem = true;
+                  replaceCrossStdenv = { buildPackages, baseStdenv }:
+                    if baseStdenv.hostPlatform.isCosmo or false
+                    then
+                      let
+                        cs = import ./cosmocc.nix { pkgs = buildPackages; };
+                        wiring = cs.mkCrossWiring {
+                          inherit buildPackages baseStdenv;
+                          targetArch = baseStdenv.hostPlatform.parsed.cpu.name;
+                          targetPrefix = "${baseStdenv.hostPlatform.config}-";
+                        };
+                      in
+                      wiring.stdenv
+                    else baseStdenv;
+                };
+              };
             windowsRawBuild =
               if windowsBuild != null then windowsBuild
               else if windowsCosmo then (pkgs:
@@ -867,79 +905,19 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         # `cosmoStdenv.mkDerivation` and `cosmoStdenv.platformBits`.
         cosmoStdenv = pkgs: import ./cosmocc.nix { inherit pkgs; };
 
-        # pkgsCosmo: a full nixpkgs package set re-evaluated with cosmocc as the
-        # cross-toolchain. Splicing handled by nixpkgs (buildPackages stays glibc,
-        # host packages target cosmo). Per-package quirks live in cosmo/<name>.nix.
+        # `cosmoStaticCross pkgs` — fully symmetric with `pkgs.pkgsCross.mingwW64`
+        # and `pkgs.pkgsStatic`: takes a build-host pkgs set (where cosmo wiring
+        # was registered, e.g. mkStandaloneFlake's `windowsPkgs`) and returns
+        # the cosmo cross pkgs set. Per-binary quirks live in the consumer's
+        # `windowsBuild = import ./cosmo.nix { inherit unpins-lib; }`.
         #
-        # The applyPatches step adds cosmo to nixpkgs's lib/systems/{parse,inspect}
-        # (small, see ./cosmo-lib-systems.patch). replaceCrossStdenv injects our
-        # cosmocc cc-wrapper into the cross-stdenv that nixpkgs constructs.
-        #
-        # `targetArch` picks the cosmocc single-arch driver. cosmocc ships both
-        # x86_64 and aarch64; arch must match `cosmoStdenv`'s host (see cosmocc.nix
-        # `archPrefix`). Cross-arch (e.g. x86_64-linux host building aarch64-cosmo)
-        # isn't wired — needs a buildPackages.pkgsCross stanza, not exposed yet.
-        #
-        # Most packages need `NIXPKGS_ALLOW_UNSUPPORTED_SYSTEM=1` because their
-        # `meta.platforms` doesn't list cosmo.
-        mkPkgsCosmo =
-          { system ? "x86_64-linux"
-          , targetArch ? "x86_64"
-          }:
-          let
-            basePkgs = nixpkgs.legacyPackages.${system};
-            nixpkgsPatched = basePkgs.applyPatches {
-              name = "nixpkgs-cosmo";
-              src = nixpkgs.outPath;
-              patches = [ ./cosmo-lib-systems.patch ];
-            };
-            # Pass fixLib so overlay fragments can call `lib.withAliases`
-            # (defined here in nix-lib's `lib`), not just nixpkgs.lib.
-            cosmoOverlay = import ./cosmo { lib = nixpkgs.lib // lib; };
-            targetConfig = "${targetArch}-unknown-cosmo-gnu";
-          in
-          import nixpkgsPatched {
-            inherit system;
-            crossSystem = {
-              config = targetConfig;
-              libc = null;
-            };
-            overlays = [ cosmoOverlay ];
-            config = {
-              # Most upstream packages don't list `x86_64-cosmo` in
-              # `meta.platforms`, so the cross evaluation would refuse to
-              # build them — including the cosmo coreutils we ship. The
-              # flag mirrors what `windowsPkgs` (mkStandaloneFlake's
-              # mingw-routed pkgs) already does for the same reason.
-              # CI doesn't propagate `NIXPKGS_ALLOW_UNSUPPORTED_SYSTEM=1`
-              # so this has to live inside the import.
-              allowUnsupportedSystem = true;
-              replaceCrossStdenv = { buildPackages, baseStdenv }:
-                let
-                  cs = import ./cosmocc.nix { pkgs = buildPackages; };
-                  wiring = cs.mkCrossWiring {
-                    inherit buildPackages baseStdenv targetArch;
-                    targetPrefix = "${targetConfig}-";
-                  };
-                in
-                wiring.stdenv;
-            };
-          };
-
-        # `cosmoStaticCross pkgs` — symmetric to `mingwStaticCross pkgs` and
-        # `pkgs.pkgsStatic`: takes a build-host pkgs set and returns the cosmo
-        # cross pkgs set. Per-binary quirks live in the consumer flake's
-        # `windowsBuild = pkgs: let cs = lib.cosmoStaticCross pkgs; in
-        # cs.${pkgsAttr}.overrideAttrs (…)` (mirrors mingw's inline pattern).
-        #
-        # Internally still delegates to `mkPkgsCosmo` (which carries the
-        # `applyPatches` + `replaceCrossStdenv` wiring). The day nixpkgs
-        # upstream learns about cosmo (or our patch covers `pkgsCross.cosmo`),
-        # this collapses to `pkgs.pkgsCross.cosmo.appendOverlays […]`.
-        cosmoStaticCross = pkgs: mkPkgsCosmo {
-          system = pkgs.stdenv.buildPlatform.system;
-          targetArch = pkgs.stdenv.buildPlatform.parsed.cpu.name;
-        };
+        # Cosmo is now a first-class nixpkgs cross target: `cosmo-lib-systems.patch`
+        # registers the kernel + an `examples.cosmo` crossSystem, and
+        # `windowsPkgs` is built with the cosmoOverlay + `replaceCrossStdenv`
+        # guarded on `isCosmo`. The cross-arch story (aarch64-cosmo from
+        # x86_64-linux) still needs a buildPackages.pkgsCross stanza — not
+        # exposed yet because no catalog package needs it.
+        cosmoStaticCross = pkgs: pkgs.pkgsCross.cosmo;
 
         # cosmocc emits APE polyglot binaries by default (Linux+macOS+Windows+
         # BSD in one file; `file -L` reports "DOS/MBR boot sector"). action-build
