@@ -264,11 +264,28 @@ let
       { name = "cosmo-config-sub-hook"; }
       ./cosmo-config-sub-hook.sh;
 
+    # Setup hook that auto-apelinks every cosmocc-emitted ELF in
+    # $out/bin to PE32+ `<name>.exe`. Runs in preFixupHooks so consumer
+    # postFixup + lib.withAliases UNPIN_META embed operate on the
+    # final `.exe`. Fail-loud: stripped binaries break the build
+    # (apelink needs .symtab) with a fix recipe in the error. See
+    # ../cosmo-apelink-hook.sh for the full contract.
+    apelinkHook = buildPackages.makeSetupHook
+      {
+        name = "cosmo-apelink-hook";
+        substitutions = {
+          apelink = "${cosmocc}/bin/apelink";
+          vbits = toString cosmocc.passthru.apelinkPlatformBits.windows;
+        };
+      }
+      ./cosmo-apelink-hook.sh;
+
     stdenv =
       let
         ccOverridden = buildPackages.overrideCC baseStdenv crossCC;
         withHook = ccOverridden.override (old: {
-          extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ]) ++ [ configSubHook ];
+          extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ])
+            ++ [ configSubHook apelinkHook ];
         });
         # cosmocc is static-only (no .so). makeStaticLibraries injects
         # `--disable-shared`/`--enable-static` (+ cmake/meson equivalents)
