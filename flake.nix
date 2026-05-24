@@ -711,12 +711,21 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           , smoke ? null
           , smokePattern ? null
           # optimize: knobs for opt-level / stack protector / LTO. Defaults
-          # merged with `{ lto = true; opt = null; ssp = true; }`. Keys:
+          # merged with `{ lto = false; opt = null; ssp = true; }`. Keys:
           #
-          #   lto = false      → skip mkPkgsLTO overlay; stock toolchain.
-          #                       Defaults true; falls through to non-LTO
-          #                       automatically for mingw / cosmocc cross
-          #                       (Linux native only).
+          #   lto = true       → enable mkPkgsLTO overlay; chain-LTO consumer
+          #                       + its level-1 buildInputs (Linux native
+          #                       only — mingw/cosmocc fall through). OFF by
+          #                       default since the LTO chain has produced
+          #                       systemic recurring failures (autoconf
+          #                       conftest leakage, ltrans debug-info refs,
+          #                       muslLTO symbol internalization, buildInput
+          #                       test-suite miscompiles). For tiny static
+          #                       CLIs the size win is 5-15% and the latency
+          #                       win is invisible (ms-scale runs), so the
+          #                       maintenance cost was not justified. Opt
+          #                       in per-package when a hot path genuinely
+          #                       benefits.
           #   opt = "-Os"      → appended to NIX_CFLAGS_COMPILE (wins over
           #                       upstream). null leaves it to upstream
           #                       (~ -O2). When LTO is active, null is
@@ -726,7 +735,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           , optimize ? { }
           }:
           let
-            optimize_ = { lto = true; opt = null; ssp = true; } // optimize;
+            optimize_ = { lto = false; opt = null; ssp = true; } // optimize;
             inherit (optimize_) lto opt ssp;
             ltoOpt = if opt == null then "-O2" else opt;
             # LTO overlay applies on Linux only — musl is Linux-specific

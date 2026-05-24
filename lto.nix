@@ -6,6 +6,12 @@
 # passed at each link so lto-plugin keeps those libc members through
 # partition even though no bitcode caller references them at claim time.
 #
+# OPT-IN AS OF THE LTO-DROP COMMIT. Default in `mkStandaloneFlake` is now
+# `optimize.lto = false`. Reasons documented in the commit message and in
+# the optimize-knob docstring in flake.nix. Keep this file as the
+# implementation for consumers that opt in (`mkStandaloneFlake { ...;
+# optimize = { lto = true; }; }`).
+#
 # Reference precedent: LLVM/LLD's `llvm/IR/RuntimeLibcalls.def` handles
 # the same class of problem automatically; GCC delegates to the user, so
 # we maintain the list explicitly. Linux kernel does the same thing via
