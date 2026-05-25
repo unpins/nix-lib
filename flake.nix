@@ -868,13 +868,20 @@ with zipfile.ZipFile(sys.argv[1]) as z:
                 });
               }
               // nixpkgs.lib.optionalAttrs (nativeBuild && system == "aarch64-linux") {
-                # muslpi = armv6l-unknown-linux-musleabihf. Baseline armv6 ISA
-                # (no NEON), runs on every ARM v6+ device (Pi 1/Zero through
-                # Pi 4/5 in 32-bit mode, BeagleBone, Odroid, etc.). Labeled
-                # "armv7l" because that's what `uname -m` returns on the
-                # dominant target hardware and matches the Rust ecosystem
-                # convention (ripgrep/fd/bat all use armv7 in this slot).
-                "linux-armv7l" = stripped pkgs.pkgsCross.muslpi;
+                # armv7l-hf-multiplatform = armv7l-unknown-linux-musleabihf,
+                # hardware float (VFPv3) + hardware 64-bit atomics
+                # (LDREXD/STREXD). Covers Pi 2/3/4 in 32-bit mode,
+                # BeagleBoneBlack, Odroid, and the dominant ARM 32-bit
+                # hardware that runs Linux today. Matches the Rust
+                # ecosystem convention (ripgrep/fd/bat use armv7l in
+                # this slot) and the CI runner (ubuntu-24.04-arm).
+                #
+                # Trade-off: drops armv6 baseline (Pi 1 / Zero / Zero W).
+                # Worth it because anything pulling in 64-bit atomics
+                # (libssh2, glib ≥ 2.68, any modern threading wrapper)
+                # fails to link on armv6 with __atomic_*_8 undefined,
+                # since musl doesn't ship libatomic in pkgsStatic.
+                "linux-armv7l" = stripped pkgs.pkgsCross.armv7l-hf-multiplatform;
               }
               // nixpkgs.lib.optionalAttrs (windowsEnabled && system == "x86_64-linux") {
                 "windows-x86_64" = windowsPkg;
