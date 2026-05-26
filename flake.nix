@@ -91,16 +91,22 @@
         # functional with zero data files. See docs/runtime-data.md for
         # the "complete coverage" path (data archive) — not yet wired.
         #
-        # `ghostty` predates our pinned ncurses (6.5 in nixpkgs 25.11);
-        # the entry comes from `extra-terminfo.src` (appended pre-tic
-        # via `embedFallbackTerminfo*`'s postPatch).
+        # Modern entries that ncurses 6.5 (nixpkgs 25.11) doesn't ship
+        # — `xterm-ghostty`, `xterm-kitty`, `rxvt-unicode*` — come from
+        # `extra-terminfo.src` (appended pre-tic via
+        # `embedFallbackTerminfo*`'s postPatch). The `xterm-…` aliases
+        # are the names Ghostty/kitty actually set in $TERM by default;
+        # ncurses' own `kitty`/`ghostty` entries lack those aliases, so
+        # we ship the upstream-canonical entries separately.
         fallbackTerminals =
           "xterm,xterm-color,xterm-256color,ansi,vt100,vt102,vt220,dumb,"
           + "linux,mintty,cygwin,ms-terminal,vscode,"
           + "screen,screen-256color,tmux,tmux-256color,"
-          + "alacritty,alacritty-direct,foot,kitty,ghostty,"
+          + "alacritty,alacritty-direct,foot,"
+          + "kitty,xterm-kitty,xterm-ghostty,wezterm,"
           + "gnome,gnome-256color,konsole,konsole-256color,"
-          + "st,st-256color,rxvt,rxvt-256color,Eterm,"
+          + "st,st-256color,Eterm,"
+          + "rxvt,rxvt-256color,rxvt-unicode,rxvt-unicode-256color,"
           + "iterm2-direct,nsterm,putty,putty-256color";
 
         # Patch ncurses to (a) append `extra-terminfo.src` to the source
