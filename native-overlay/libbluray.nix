@@ -41,9 +41,9 @@ in
   else { }
 )).overrideAttrs (oa: {
   configureFlags = (oa.configureFlags or [ ])
-    ++ pkgs.lib.optional isDarwin "--without-fontconfig";
-  buildInputs = pkgs.lib.optionals (!isDarwin) (oa.buildInputs or [ ])
-    ++ pkgs.lib.optionals isDarwin (builtins.filter
+    ++ lib.optional isDarwin "--without-fontconfig";
+  buildInputs = lib.optionals (!isDarwin) (oa.buildInputs or [ ])
+    ++ lib.optionals isDarwin (builtins.filter
       (d: !(d.pname or null == "fontconfig"))
       (oa.buildInputs or [ ]));
   postInstall = (oa.postInstall or "") + ''

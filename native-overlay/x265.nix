@@ -1,34 +1,23 @@
-# nixpkgs x265 in pkgsStatic needs three surgical patches:
+# x265 in pkgsStatic needs three surgical patches:
 #
-#  1. Multi-bit-depth archives stay separate. With the default
-#     `multibitdepthSupport = true`, the build produces three archives
-#     — main (8-bit), `libx265-10.a` (Main10/HDR10), `libx265-12.a`
-#     (Main12) — and the main archive references `x265_10bit::` /
-#     `x265_12bit::` symbols from the siblings. The dynamic-lib build
-#     merges them into one `.so`; pkgsStatic suppresses the `.so` and
-#     leaves the static archives unmerged, so any consumer linking
-#     `-lx265` sees undefined references. Merge the three with `ar -M`
-#     into a self-contained `libx265.a` (postBuild). Cutting
-#     `multibitdepthSupport` instead would drop HDR10/Main12 — too
-#     much loss for a static-lib rebundle.
+# 1. With `multibitdepthSupport = true` (default), the build emits
+#    three separate archives — 8-bit main + `libx265-10.a`
+#    (Main10/HDR10) + `libx265-12.a` (Main12) — and the main
+#    references symbols from the siblings. Dynamic builds merge
+#    them into one `.so`; pkgsStatic doesn't, so any `-lx265`
+#    consumer sees undef refs. Merge via `ar -M` (postBuild) into
+#    a unified `libx265.a`. Dropping multibitdepthSupport would
+#    shed HDR10/Main12 — too much loss for a static rebundle.
 #
-#  2. `rm -f $out/lib/*.a` in upstream postInstall — correct for the
-#     dynamic default, fatal for pkgsStatic. Replace with empty.
+# 2. Upstream `postInstall` does `rm -f $out/lib/*.a` — correct
+#    for the dynamic default, fatal for pkgsStatic. Clear it.
 #
-#  3. mingw-only: x265's CMake probes the toolchain at configure time
-#     for "what runtime libs does C++ EH need" and embeds the captured
-#     flags in `x265.pc` as `Libs.private`. The probe runs WITHOUT
-#     `-static-libgcc`, so it captures the dynamic-libgcc spec:
-#       Libs.private: -lstdc++ -lgcc_s -lgcc -lmcfgthread -lntdll ...
-#     Any consumer running `pkg-config --static --libs x265` (ffmpeg's
-#     link does) then re-injects `-lgcc_s`, and the linker prefers
-#     `libgcc_s.dll.a` (an import lib for `libgcc_s_seh-1.dll`) over
-#     the static unwind in `libgcc_eh.a`. Result: the .exe imports
-#     `libgcc_s_seh-1.dll` (and transitively `libmcfgthread-2.dll`)
-#     even though we pass `-static -static-libgcc -static-libstdc++`.
-#     Rewrite `Libs.private` to the static-libgcc form via postFixup
-#     (postInstall is forced empty above, so this has to live in a
-#     later phase).
+# 3. mingw-only: x265's CMake probe captures the dynamic C++ EH
+#    link sequence (`-lgcc_s ...`) into `x265.pc Libs.private`,
+#    forcing the consumer `.exe` to import `libgcc_s_seh-1.dll`
+#    even with `-static-libgcc`. Rewrite `Libs.private` to the
+#    static-libgcc form. Lives in `postFixup` because (2) emptied
+#    `postInstall`. See [[mingw-pc-libgcc-s-probe-trap]].
 { lib }:
 pkgs:
 let

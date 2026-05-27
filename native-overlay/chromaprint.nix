@@ -1,37 +1,36 @@
-# nixpkgs `pkgsStatic.chromaprint` pulls `ffmpeg-headless` into
-# `buildInputs` because of the `fpcalc` CLI binary (decodes audio
-# via libav* before fingerprinting). The library itself
-# (`libchromaprint.a`) never references libavcodec — decoding is
-# the consumer's responsibility. In pkgsStatic this becomes a
-# circular dep (consumer ffmpeg → chromaprint → ffmpeg-headless),
-# and worse: `ffmpeg-headless` propagates `libpulseaudio`, which
-# has `meta.badPlatforms = lib.platforms.isStatic` on musl.
+# pkgsStatic.chromaprint, four fixes:
 #
-# Disable `withTools` + `withExamples` and clear `buildInputs` +
-# `propagatedBuildInputs` — the core lib needs no runtime deps.
-# (`zlib` is unused by `libchromaprint.a`; the upstream propagation
-# was for the CLI.)
+# 1. `withTools = false; withExamples = false`. Upstream pulls
+#    `ffmpeg-headless` into buildInputs only for the `fpcalc` CLI
+#    (decodes audio before fingerprinting). The lib itself never
+#    references libav*. In pkgsStatic the tool would force a
+#    circular dep (consumer ffmpeg → chromaprint → ffmpeg-headless)
+#    and pull `libpulseaudio` (badPlatforms.isStatic on musl).
 #
-# Two `.pc` fixups for static consumers calling
-# `pkg-config --static chromaprint`:
+# 2. `buildInputs = [ ]`; on mingw `propagatedBuildInputs +=
+#    windows.mcfgthreads`. After dropping the CLI the core lib has
+#    no runtime deps (upstream's `zlib` propagation was for
+#    `fpcalc`). MinGW needs mcfgthread propagated because libstdc++
+#    refs `_MCF_*` (nixpkgs' mingw gcc is `--enable-threads=mcf`).
+#    Propagate both `.dev` (has the `.pc`) and `.out` (has
+#    `libmcfgthread.a`) — bare reference only catches `.dev` via
+#    splicing.
 #
-# - `libchromaprint.a` is C++ (`src/*.cpp`). Upstream's
-#   `libchromaprint.pc` omits `Libs.private`, so the static link
-#   probe fails with `undefined reference to __cxa_*` / `cosf`.
-#   Append `-lstdc++ -lm` (libc++ on darwin: clang uses libc++
-#   not libstdc++).
+# 3. `.pc Libs.private` append. `libchromaprint.a` is C++
+#    (`src/*.cpp`), so static link probes fail with `__cxa_*`/
+#    `cosf` undef. Darwin selects `FFT_LIB=vdsp` → archive also
+#    references Apple's Accelerate framework.
 #
-# - chromaprint's CMake auto-selects `FFT_LIB=vdsp` on darwin →
-#   `libchromaprint.a` references vDSP_* symbols from Apple's
-#   Accelerate framework. Append `-framework Accelerate` on darwin
-#   so consumer link probes resolve those symbols.
+# 4. MinGW only: `.pc Cflags += -DCHROMAPRINT_NODLL`. Header
+#    decorates `CHROMAPRINT_API` with `__declspec(dllimport)` on
+#    `_WIN32` unless this macro is defined, so static consumers
+#    emit `__imp_chromaprint_*` refs the `.a`'s plain symbols
+#    can't satisfy. See [[mingw-dllimport-static-pattern]].
 #
-# - On cross-mingw, `-lstdc++` requires `-lmcfgthread` because
-#   nixpkgs' mingw gcc is built with `--enable-threads=mcf`
-#   (libstdc++ refs `_MCF_tls_key_new` etc). Without it, consumer
-#   link probes (ffmpeg's `check_pkg_config`) fail with "cannot
-#   find -lmcfgthread". Add `windows.mcfgthreads` as a propagated
-#   buildInput so the `-L<store>/lib` is in PKG_CONFIG/LD search.
+# Note: split into mingw-overlay/ doesn't work here — the
+# `withTools = false` override-arg path re-invokes chromaprint's
+# function, dropping any `super.chromaprint.overrideAttrs` set by
+# the mingw overlay. Keep mingw fixes inline.
 { lib }:
 pkgs:
 let
@@ -43,8 +42,6 @@ in
   withExamples = false;
 }).overrideAttrs (oa: {
   buildInputs = [ ];
-  # Propagate both `.dev` (has the .pc) and `.out` (has libmcfgthread.a);
-  # the bare reference only catches `.dev` via splicing.
   propagatedBuildInputs = lib.optionals isMinGW [
     pkgs.windows.mcfgthreads
     pkgs.windows.mcfgthreads.out
@@ -57,12 +54,6 @@ in
     }' \
       >> $out/lib/pkgconfig/libchromaprint.pc
   '' + lib.optionalString isMinGW ''
-    # chromaprint.h does `#define CHROMAPRINT_API __declspec(dllimport)`
-    # on `_WIN32` unless `CHROMAPRINT_NODLL` is defined. Static
-    # consumers must build with `-DCHROMAPRINT_NODLL`, else the
-    # compiler emits `__imp_chromaprint_*` refs that can't be
-    # satisfied by `libchromaprint.a` (which has plain
-    # `chromaprint_*` symbols).
     sed -i 's|^Cflags: |Cflags: -DCHROMAPRINT_NODLL |' \
       $out/lib/pkgconfig/libchromaprint.pc
   '';
