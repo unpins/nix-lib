@@ -15,11 +15,15 @@
 #    CLI binaries that ffmpeg doesn't consume.
 #
 # 4. `srt.pc Libs.private` sed: srt's CMake bakes absolute
-#    `/nix/store/.../libmbedtls.a` paths. With `pkg-config --static`
-#    they land *before* the test object, `-Wl,--as-needed` drops
-#    them, then `-lsrt` later introduces unresolvable mbedtls refs.
-#    Sed to `-l` form so cc-wrapper appends `-L<store>/lib -lmbed*`
-#    at the tail.
+#    `/nix/store/.../lib{mbedtls,stdc++}.a` paths. ffmpeg's
+#    `check_pkg_config` (and any `pkg-config --static` consumer)
+#    routes absolute-path args to ldflags — *before* the test
+#    object — where `-Wl,--as-needed` drops them (nothing references
+#    them yet); then `-lsrt` pulls unresolvable mbedtls / libstdc++
+#    (srt is C++) refs. Rewrite both to `-l` form so the cc-wrapper
+#    appends them at the tail, after the object. libstdc++ only
+#    surfaced on aarch64 — x86_64's libsrt.a happened to need fewer
+#    of these C++ symbols — but the `-l` form is correct everywhere.
 { lib }:
 pkgs:
 let
@@ -33,7 +37,12 @@ pkgs.srt.overrideAttrs (oa: {
     "-DENABLE_APPS=OFF"
   ];
   postInstall = (oa.postInstall or "") + ''
-    sed -i -E 's|[^ ]*/lib(mbed[a-z0-9]+)\.a|-l\1|g' \
-      $out/lib/pkgconfig/srt.pc
+    for pc in $out/lib/pkgconfig/srt.pc $out/lib/pkgconfig/haisrt.pc; do
+      [ -f "$pc" ] || continue
+      sed -i -E \
+        -e 's|[^ ]*/lib(mbed[a-z0-9]+)\.a|-l\1|g' \
+        -e 's|[^ ]*/libstdc\+\+\.a|-lstdc++|g' \
+        "$pc"
+    done
   '';
 })
