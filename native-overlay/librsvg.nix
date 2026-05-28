@@ -14,20 +14,28 @@
 #    "Package 'pangocairo' not found" without it. See
 #    [[requires-private-static-cross]].
 #
-# 3. aarch64-musl `__clear_cache` (aarch64-linux only). rustc links
-#    the `rsvg-convert` bin with `-nodefaultlibs`, pulling only
-#    `compiler_builtins` — which has no `__clear_cache` on aarch64.
-#    libffi's executable closures (`ffi_prep_closure_loc`) and pcre2's
-#    JIT (`sljit`), both C objects dragged in via glib, reference it,
-#    so the link fails. Append `-lgcc` to the cargo target rustflags;
-#    it lands after the rlib group, so the archive resolves the pending
-#    refs. x86_64 never trips this (`__clear_cache` is a no-op there).
+# 3. `__clear_cache` (non-x86 Linux). rustc links the `rsvg-convert` bin
+#    with `-nodefaultlibs`, pulling only `compiler_builtins` — which has no
+#    `__clear_cache` on the non-x86 ISAs. libffi's executable closures
+#    (`ffi_prep_closure_loc`) and pcre2's JIT (`sljit`), both C objects
+#    dragged in via glib, reference it, so the link fails. Append `-lgcc`
+#    to the cargo target rustflags; it lands after the rlib group, so the
+#    archive resolves the pending refs. x86 never trips this
+#    (`__clear_cache` is a no-op there).
+#
+# 4. doCheck restricted to x86_64-linux. nixpkgs gates librsvg's test suite
+#    on `!isDarwin && !isi686`, so it still runs on aarch64/riscv64/armv7l.
+#    There the doctest link hits the same `__clear_cache` gap (rustdoc reads
+#    RUSTDOCFLAGS, which the fix #3 rustflags sed doesn't reach) and the
+#    suite wants a fontconfig runtime the sandbox lacks. The tests exercise
+#    upstream librsvg, not our static repackage, so keep them only on the
+#    one arch where they pass clean.
 { lib }:
 pkgs:
 let
-  isMinGW = pkgs.stdenv.hostPlatform.isMinGW or false;
-  isAarch64Linux = pkgs.stdenv.hostPlatform.isAarch64
-    && pkgs.stdenv.hostPlatform.isLinux;
+  host = pkgs.stdenv.hostPlatform;
+  isMinGW = host.isMinGW or false;
+  needsClearCache = host.isLinux && !isMinGW && !host.isx86;
 in
 pkgs.librsvg.overrideAttrs (oa: {
   buildInputs = (oa.buildInputs or [ ])
@@ -35,8 +43,11 @@ pkgs.librsvg.overrideAttrs (oa: {
   propagatedBuildInputs = (oa.propagatedBuildInputs or [ ]) ++ [ pkgs.pango ];
 
   # See fix #3 above.
-  preBuild = (oa.preBuild or "") + lib.optionalString isAarch64Linux ''
+  preBuild = (oa.preBuild or "") + lib.optionalString needsClearCache ''
     cfg=$(grep -rl --include=config.toml '"rustflags"' "$NIX_BUILD_TOP" | head -1)
     sed -i 's|"rustflags" = \[|"rustflags" = [ "-Clink-arg=-lgcc",|g' "$cfg"
   '';
+
+  # See fix #4 above.
+  doCheck = host.isx86_64 && host.isLinux;
 })
