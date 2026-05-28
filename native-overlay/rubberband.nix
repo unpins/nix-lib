@@ -14,7 +14,7 @@
 # every dep we don't need and reduces the chain to `fftw +
 # libsamplerate`.
 #
-# Two extra fixes:
+# Three extra fixes:
 #
 # 1. `propagatedBuildInputs` REPLACED (not extended). pkgsStatic
 #    auto-promotes upstream `buildInputs` into it, so the unwanted
@@ -25,6 +25,16 @@
 #    fftw's own evaluation uses the fixed variant; `overrideAttrs`
 #    would be too late (the `.eval` of `pkgs.rubberband` already
 #    triggers fftw eval).
+#
+# 3. darwin-aarch64 `cpu_family = 'arm64'` (same meson cross-file
+#    mismatch as libopus.nix / dav1d.nix here). meson.build:21 sets
+#    `architecture = host_machine.cpu_family()`, which nixpkgs writes
+#    as 'arm64' (not 'aarch64'); the darwin arch dispatch only matches
+#    `architecture == 'aarch64'`, so it falls through to
+#    meson.build:472 `error('Build for architecture arm64 is not
+#    supported on this platform')`. Accept 'arm64' at both gates. The
+#    only literal 'arm64' use is the `-arch arm64` clang flag *inside*
+#    the aarch64 branch (correct for Apple), so this is complete.
 #
 # `openjdk-headless` is filtered from `nativeBuildInputs` because
 # `-Djni=disabled` doesn't remove it from the build environment;
@@ -53,6 +63,12 @@ in
   # out below anyway).
   jdk_headless = pkgs.emptyDirectory;
 }).overrideAttrs (oa: {
+  # See fix #3 above — both arch gates are `architecture == 'aarch64'`.
+  postPatch = (oa.postPatch or "") + ''
+    substituteInPlace meson.build \
+      --replace-fail "architecture == 'aarch64'" \
+                     "architecture in ['aarch64', 'arm64']"
+  '';
   nativeBuildInputs = builtins.filter
     (d:
       let p = d.pname or null; in
