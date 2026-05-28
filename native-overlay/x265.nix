@@ -1,4 +1,4 @@
-# x265 in pkgsStatic needs three surgical patches:
+# x265 in pkgsStatic needs four surgical patches:
 #
 # 1. With `multibitdepthSupport = true`, the build emits three
 #    separate archives — 8-bit main + `libx265-10.a` (Main10/HDR10)
@@ -20,12 +20,25 @@
 # 2. Upstream `postInstall` does `rm -f $out/lib/*.a` — correct
 #    for the dynamic default, fatal for pkgsStatic. Clear it.
 #
-# 3. mingw-only: x265's CMake probe captures the dynamic C++ EH
+# 3. `x265.pc Libs.private` bakes an absolute
+#    `/nix/store/.../libstdc++.a` (x265 is C++). A `pkg-config
+#    --static` consumer (ffmpeg's `check_pkg_config`) routes that
+#    absolute path to ldflags *before* the test object, where
+#    `-Wl,--as-needed` drops it (nothing references it yet); then
+#    `-lx265` pulls unresolvable libstdc++ refs (operator new,
+#    std::ios_base, vtables). Rewrite to `-lstdc++` so the cc-wrapper
+#    appends it at the tail, after the object. Same trap and fix as
+#    srt — surfaced on aarch64 (x86_64's x265 test referenced fewer
+#    C++ symbols), but the `-l` form is correct everywhere. Darwin's
+#    `.pc` carries libc++, not libstdc++.a, so the sed is a no-op.
+#
+# 4. mingw-only: x265's CMake probe captures the dynamic C++ EH
 #    link sequence (`-lgcc_s ...`) into `x265.pc Libs.private`,
 #    forcing the consumer `.exe` to import `libgcc_s_seh-1.dll`
 #    even with `-static-libgcc`. Rewrite `Libs.private` to the
-#    static-libgcc form. Lives in `postFixup` because (2) emptied
-#    `postInstall`. See [[mingw-pc-libgcc-s-probe-trap]].
+#    static-libgcc form (fully replaces the line, superseding #3 on
+#    mingw). Lives in `postFixup` because (2) emptied `postInstall`.
+#    See [[mingw-pc-libgcc-s-probe-trap]].
 { lib }:
 pkgs:
 let
@@ -49,7 +62,13 @@ pkgs.x265.overrideAttrs (oa: {
     fi
   '';
   postInstall = "";
-  postFixup = (oa.postFixup or "") + lib.optionalString isMinGW ''
+  postFixup = (oa.postFixup or "") + ''
+    # Fix #3: absolute libstdc++.a → -lstdc++ (no-op on darwin/mingw).
+    for pc in $out/lib/pkgconfig/x265.pc $dev/lib/pkgconfig/x265.pc; do
+      [ -f "$pc" ] || continue
+      sed -i -E 's|[^ ]*/libstdc\+\+\.a|-lstdc++|g' "$pc"
+    done
+  '' + lib.optionalString isMinGW ''
     for pc in $out/lib/pkgconfig/x265.pc $dev/lib/pkgconfig/x265.pc; do
       [ -f "$pc" ] || continue
       sed -i \
