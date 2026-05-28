@@ -30,12 +30,21 @@
 #    suite wants a fontconfig runtime the sandbox lacks. The tests exercise
 #    upstream librsvg, not our static repackage, so keep them only on the
 #    one arch where they pass clean.
+#
+# 5. `gcc_s` static shim (riscv64). Unlike other musl targets (which report
+#    `unwind`, satisfied by fix #1), rustc's `--print=native-static-libs`
+#    reports `gcc_s` on riscv64-musl, and meson.build:374 probes
+#    `cc.find_library('gcc_s', static)`. Static musl ships no `libgcc_s.a`
+#    (that's the shared unwinder); the static `_Unwind_*` live in
+#    `libgcc_eh.a`. Symlink `libgcc_s.a -> libgcc_eh.a` onto the link path so
+#    both the meson probe and the final rustc link resolve.
 { lib }:
 pkgs:
 let
   host = pkgs.stdenv.hostPlatform;
   isMinGW = host.isMinGW or false;
   needsClearCache = host.isLinux && !isMinGW && !host.isx86;
+  isRiscV = host.isRiscV or false;
 in
 pkgs.librsvg.overrideAttrs (oa: {
   buildInputs = (oa.buildInputs or [ ])
@@ -46,6 +55,16 @@ pkgs.librsvg.overrideAttrs (oa: {
   preBuild = (oa.preBuild or "") + lib.optionalString needsClearCache ''
     cfg=$(grep -rl --include=config.toml '"rustflags"' "$NIX_BUILD_TOP" | head -1)
     sed -i 's|"rustflags" = \[|"rustflags" = [ "-Clink-arg=-lgcc",|g' "$cfg"
+  '';
+
+  # See fix #5 above. Must be preConfigure: meson's find_library('gcc_s')
+  # probe runs during the configure phase, before preBuild.
+  preConfigure = (oa.preConfigure or "") + lib.optionalString isRiscV ''
+    mkdir -p "$TMPDIR/gcc_s-shim"
+    eh=$($CC -print-file-name=libgcc_eh.a)
+    [ -f "$eh" ] || eh=$($CC -print-file-name=libgcc.a)
+    ln -sf "$eh" "$TMPDIR/gcc_s-shim/libgcc_s.a"
+    export NIX_LDFLAGS="''${NIX_LDFLAGS:-} -L$TMPDIR/gcc_s-shim"
   '';
 
   # See fix #4 above.
