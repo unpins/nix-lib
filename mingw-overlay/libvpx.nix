@@ -1,10 +1,12 @@
 # libvpx cross-mingw, four fixes:
 #
-# 1. `examplesSupport = false` override. The examples (`vpxenc`,
-#    `vpxdec`) don't link under the mingwStaticCross adapter's
-#    `-all-static`; killing them keeps the lib build clean.
-#    Consequence: drop the `bin` output (otherwise fixupPhase
-#    errors on the empty `bin/`).
+# 1. `examplesSupport = false` override. ffmpeg consumes only
+#    libvpx.a, so the CLI examples (`vpxenc`, `vpxdec`) are dead
+#    weight here — disabling them keeps the lib build lean and lets
+#    us drop the `bin` output (otherwise fixupPhase errors on the
+#    empty `bin/`). (They DO link on mingw; `unpins/libvpx`
+#    re-enables them and folds the C++ webm/libyuv runtime static
+#    for a single .exe.)
 #
 # 2. Rewrite `--target=` configureFlag. nixpkgs derives the libvpx
 #    target as `<cpu>-${kernel.name}-gcc` = `x86_64-windows-gcc`,
