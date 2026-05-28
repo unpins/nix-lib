@@ -1,6 +1,5 @@
-# pkgsStatic.srt: swap OpenSSL → mbedtls (`-DUSE_ENCLIB=mbedtls`) so
-# consumers carrying `--enable-mbedtls` (ffmpeg) don't pay double
-# crypto closure. Four fixes:
+# pkgsStatic.srt: swap OpenSSL → mbedtls (`-DUSE_ENCLIB=mbedtls`).
+# Why mbedtls not OpenSSL: see docs/crypto-backend.md. Four fixes:
 #
 # 1. `buildInputs`: filter openssl, add mbedtls. Filter rather than
 #    replace so platform additions survive (mingw-overlay adds

@@ -1,5 +1,5 @@
-# pkgsStatic.libssh: swap OpenSSL → mbedtls (`-DWITH_MBEDTLS=ON`) —
-# same motivation as [[srt]]. Four fixes:
+# pkgsStatic.libssh: swap OpenSSL → mbedtls (`-DWITH_MBEDTLS=ON`).
+# Why mbedtls not OpenSSL: see docs/crypto-backend.md. Four fixes:
 #
 # 1. `buildInputs`: drop openssl, install [zlib, mbedtls, libsodium].
 #
