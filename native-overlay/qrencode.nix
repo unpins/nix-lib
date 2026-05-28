@@ -5,18 +5,17 @@
 #    is `meta.badPlatforms = lib.platforms.isStatic` on pkgsStatic
 #    (no GL on musl). The library + CLI don't need SDL2.
 #
-# 2. `postInstall` nukes `$out/lib/*.dylib` + relinks the `qrencode`
-#    CLI against the static archive. pkgsStatic on darwin sets
-#    `--disable-shared --enable-static` already, but libqrencode's
-#    autotools setup builds both `.a` and `.dylib` anyway (LT_INIT
-#    on darwin defaults to producing both), and libtool then picks
-#    `.libs/libqrencode.dylib` for the CLI link → CI verifier
-#    rejects the resulting binary for loading a non-system dylib.
-#    Re-running `cc` by hand against `libqrencode.a` plus the
-#    statically-linked libpng + zlib deps produces a clean binary.
-#    The branch is gated on `isDarwin` so Linux pkgsStatic (where
-#    only `.a` is produced) and mingw (where only `.a` ships as
-#    well) bypass it as a no-op.
+# 2. On darwin libtool *sometimes* emits a `libqrencode.dylib` and
+#    links the `qrencode` CLI against it → the CI verifier rejects the
+#    binary for loading a non-system dylib. That happens when the build
+#    leaves shared libs on (a top-level darwin pkgsStatic build whose
+#    `--disable-shared` doesn't take effect). When it *does* take effect
+#    (ffmpeg pulling qrencode as a pkgsStatic dep) libtool produces a
+#    clean static `.a` + statically-linked CLI and emits no dylib — and
+#    the PIC `.libs/*.o` the hand-rebuild needs don't exist. So gate the
+#    whole fixup on a dylib being present: strip it, rebuild the `.a`
+#    from libtool's `.libs/*.o`, relink the CLI static. No dylib =
+#    no-op. Gated on isDarwin; Linux/mingw emit only `.a` and bypass it.
 { lib }:
 pkgs:
 let
@@ -25,24 +24,23 @@ in
 pkgs.qrencode.overrideAttrs (oa: {
   doCheck = false;
   postInstall = (oa.postInstall or "") + lib.optionalString isDarwin ''
-    # Strip the dynamic library shipped alongside (libqrencode's
-    # libtool on darwin emits the `.dylib` regardless of
-    # `--disable-shared` and silently skips the `.a` despite
-    # `--enable-static`).
-    rm -f $out/lib/libqrencode*.dylib
+    if [ -n "$(find "$out/lib" -maxdepth 1 -name 'libqrencode*.dylib' -print -quit 2>/dev/null)" ]; then
+      # libtool emitted a dynamic lib and linked the CLI against it.
+      rm -f $out/lib/libqrencode*.dylib
 
-    # Build the static archive by hand from libtool's PIC `.lo`
-    # outputs (already produced during compilePhase, live in `.libs/`).
-    $AR rcs libqrencode.a \
-      .libs/qrencode.o .libs/qrinput.o .libs/bitstream.o \
-      .libs/qrspec.o  .libs/rsecc.o  .libs/split.o \
-      .libs/mask.o    .libs/mqrspec.o .libs/mmask.o
-    install -m644 libqrencode.a $dev/lib/libqrencode.a
+      # Build the static archive by hand from libtool's PIC `.lo`
+      # outputs (produced during compilePhase, live in `.libs/`).
+      $AR rcs libqrencode.a \
+        .libs/qrencode.o .libs/qrinput.o .libs/bitstream.o \
+        .libs/qrspec.o  .libs/rsecc.o  .libs/split.o \
+        .libs/mask.o    .libs/mqrspec.o .libs/mmask.o
+      install -m644 libqrencode.a $dev/lib/libqrencode.a
 
-    # Re-link `qrencode` CLI against the static archive. cc-wrapper's
-    # NIX_LDFLAGS already carries `-L<libpng>/lib -L<zlib>/lib` from
-    # buildInputs, so `-lpng16 -lz` resolves to the static archives.
-    $CC -o $bin/bin/qrencode qrencode-qrenc.o \
-      $dev/lib/libqrencode.a -lpng16 -lz
+      # Re-link `qrencode` CLI against the static archive. cc-wrapper's
+      # NIX_LDFLAGS already carries `-L<libpng>/lib -L<zlib>/lib` from
+      # buildInputs, so `-lpng16 -lz` resolves to the static archives.
+      $CC -o $bin/bin/qrencode qrencode-qrenc.o \
+        $dev/lib/libqrencode.a -lpng16 -lz
+    fi
   '';
 })
