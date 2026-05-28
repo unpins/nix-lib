@@ -1,13 +1,21 @@
 # x265 in pkgsStatic needs three surgical patches:
 #
-# 1. With `multibitdepthSupport = true` (default), the build emits
-#    three separate archives — 8-bit main + `libx265-10.a`
-#    (Main10/HDR10) + `libx265-12.a` (Main12) — and the main
-#    references symbols from the siblings. Dynamic builds merge
-#    them into one `.so`; pkgsStatic doesn't, so any `-lx265`
-#    consumer sees undef refs. Merge via `ar -M` (postBuild) into
-#    a unified `libx265.a`. Dropping multibitdepthSupport would
-#    shed HDR10/Main12 — too much loss for a static rebundle.
+# 1. With `multibitdepthSupport = true`, the build emits three
+#    separate archives — 8-bit main + `libx265-10.a` (Main10/HDR10)
+#    + `libx265-12.a` (Main12) — and the main references symbols
+#    from the siblings. Dynamic builds merge them into one `.so`;
+#    pkgsStatic doesn't, so any `-lx265` consumer sees undef refs.
+#    Merge via `ar -M` (postBuild) into a unified `libx265.a`.
+#    Dropping multibitdepthSupport would shed HDR10/Main12 — too
+#    much loss for a static rebundle.
+#
+#    nixpkgs gates multibitdepth off on aarch64-linux
+#    (`is64bit && !(isAarch64 && isLinux)`), so the siblings are
+#    absent there and the main archive is already a complete
+#    8-bit-only build (HIGH_BIT_DEPTH=OFF, no sibling refs). Guard
+#    the merge on the siblings existing rather than re-deriving the
+#    platform predicate — robust if upstream flips the gate, and it
+#    skips cleanly on aarch64 where there is nothing to merge.
 #
 # 2. Upstream `postInstall` does `rm -f $out/lib/*.a` — correct
 #    for the dynamic default, fatal for pkgsStatic. Clear it.
@@ -25,8 +33,9 @@ let
 in
 pkgs.x265.overrideAttrs (oa: {
   postBuild = (oa.postBuild or "") + ''
-    echo "merging libx265.a + libx265-10.a + libx265-12.a → unified libx265.a"
-    $AR -M <<'EOF'
+    if [ -e libx265-10.a ] && [ -e libx265-12.a ]; then
+      echo "merging libx265.a + libx265-10.a + libx265-12.a → unified libx265.a"
+      $AR -M <<'EOF'
     CREATE libx265-merged.a
     ADDLIB libx265.a
     ADDLIB libx265-10.a
@@ -34,7 +43,10 @@ pkgs.x265.overrideAttrs (oa: {
     SAVE
     END
     EOF
-    mv libx265-merged.a libx265.a
+      mv libx265-merged.a libx265.a
+    else
+      echo "multibitdepth siblings absent (aarch64-linux); skipping merge"
+    fi
   '';
   postInstall = "";
   postFixup = (oa.postFixup or "") + lib.optionalString isMinGW ''
