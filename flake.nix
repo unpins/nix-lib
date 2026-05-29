@@ -705,6 +705,43 @@ with zipfile.ZipFile(sys.argv[1]) as z:
             '';
           });
 
+        # Drop Cosmopolitan's `.symtab.amd64` from a cosmo APE's tail-ZIP.
+        # That entry is the symbol table cosmocc's apelink adds for crash
+        # backtraces (`--ftrace`/`--strace`), ~30-80 KB deflated and unused at
+        # runtime — stdenv `strip` can't reach it (it's a ZIP member, not an
+        # ELF section). `zip -d` removes just that member, preserving the PE
+        # prefix, `.cosmo`, any `usr/share/zoneinfo/*`, and our `.unpin_man`.
+        # Self-guarding: no-op on mingw PE (no tail-ZIP) and on already-pure
+        # binaries (withMan's truncate path). Apply AFTER withMan so it trims
+        # what's left once the man block is embedded.
+        withCosmoStrip = pkgs: { primary }: drv:
+          let
+            binOutputName =
+              let outs = drv.outputs or [ "out" ];
+              in
+              if builtins.elem "bin" outs then "bin"
+              else if builtins.elem "out" outs then "out"
+              else builtins.head outs;
+          in
+          drv.overrideAttrs (old: {
+            nativeBuildInputs = (old.nativeBuildInputs or [ ])
+              ++ [ pkgs.buildPackages.zip pkgs.buildPackages.unzip ];
+            postFixup = (old.postFixup or "") + ''
+              __unpin_cs="''${${binOutputName}}/bin/${primary}"
+              if [ ! -f "$__unpin_cs" ] && [ -f "$__unpin_cs.exe" ]; then
+                __unpin_cs="$__unpin_cs.exe"
+              fi
+              # `grep -xF` *without* -q on purpose: nixpkgs' build shell runs
+              # with `set -o pipefail`, and `grep -q` exits on the first match
+              # → SIGPIPE to `unzip` → the pipeline reports failure even when
+              # the entry IS present. Reading to EOF sidesteps that.
+              if [ -f "$__unpin_cs" ] \
+                 && unzip -Z1 "$__unpin_cs" 2>/dev/null | grep -xF '.symtab.amd64' >/dev/null; then
+                zip -d "$__unpin_cs" .symtab.amd64 >/dev/null
+              fi
+            '';
+          });
+
         # Why not overlays for per-package fixes? `appendOverlays` invalidates
         # `pkgsBuildHost.stdenv` → cascade rebuild of compiler-rt-libc-static, ninja,
         # python3 in pkgsStatic-darwin (none cached; Hydra only builds pkgsStatic-linux).
@@ -1052,7 +1089,10 @@ with zipfile.ZipFile(sys.argv[1]) as z:
               if embedMan && winManSrc != null
               then withMan windowsPkgs { primary = binName; manRoot = "${winManSrc}"; } windowsBase
               else windowsBase;
-            windowsPkg = strippedOrJoined windowsPkgs name windowsWithMan;
+            # Trim cosmo's unused `.symtab.amd64` (no-op on mingw). Runs after
+            # withMan so the man block is already embedded.
+            windowsTrimmed = withCosmoStrip windowsPkgs { primary = binName; } windowsWithMan;
+            windowsPkg = strippedOrJoined windowsPkgs name windowsTrimmed;
 
             # `linuxOnly` drops every Darwin attr from `packages.<sys>` so
             # action-build's auto-discovered matrix doesn't include darwin
