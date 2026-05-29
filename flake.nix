@@ -527,6 +527,184 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           # Without this, throws fire at build-graph realization, not eval.
           else builtins.deepSeq validatedAliases wrapped;
 
+        # Embed a `.unpin_man` block: the package's OWN man pages, packed by
+        # `./mkman.py` into the container described in the embedded-man-format
+        # spec (zstd-compressed index + roff bodies, framed by 0xff-0xff
+        # sentinels), so `unpin man <pkg>` reads docs straight out of the
+        # binary — no companion data tarball. The embed mechanics mirror
+        # `withAliases` (named section via llvm-objcopy; Mach-O append-past-
+        # signature; cosmo tail-ZIP), differing only in that the payload is the
+        # binary blob mkman.py emits rather than a printf'd text block.
+        #
+        # Composition with withAliases: apply withAliases FIRST, withMan LAST.
+        #   - ELF/PE/cosmo: `.unpin_meta` and `.unpin_man` are independent
+        #     sections / ZIP entries; no ordering constraint, both survive.
+        #   - Mach-O: both blocks live at the file tail (past the signed
+        #     range). withMan re-truncates only at its own BEGIN sentinel (not
+        #     at the signature end), so it removes a prior man block on re-run
+        #     while leaving any earlier alias block intact.
+        # The unpin reader finds each block by its distinct sentinel scan, so
+        # section placement is irrelevant on the read side.
+        # `manRoot`: when null, harvest man from the drv's own outputs
+        # (`$man`/`$out`) — the native path, where the static build produces
+        # man. When set to a store path, read `$manRoot/share/man` instead —
+        # used by the windows/cosmo path, where the cross build ships no man
+        # so we source the (platform-independent) pages from a man-bearing
+        # build of the same package + version.
+        withMan = pkgs: { primary, manRoot ? null }: drv:
+          let
+            binOutputName =
+              let outs = drv.outputs or [ "out" ];
+              in
+              if builtins.elem "bin" outs then "bin"
+              else if builtins.elem "out" outs then "out"
+              else builtins.head outs;
+          in
+          drv.overrideAttrs (old: {
+            nativeBuildInputs = (old.nativeBuildInputs or [ ])
+              ++ [
+                pkgs.buildPackages.llvm        # llvm-objcopy
+                pkgs.buildPackages.file         # per-format branch (Mach-O vs ELF/PE)
+                pkgs.buildPackages.zstd         # mkman.py compresses via the zstd CLI
+                pkgs.buildPackages.python3Minimal
+                pkgs.buildPackages.unzip        # cosmo tail-ZIP detect (only on APE)
+                pkgs.buildPackages.zip
+              ];
+
+            postFixup = (old.postFixup or "") + ''
+              # Locate the man tree to embed.
+              ${if manRoot != null then ''
+                # Externally supplied man source (windows/cosmo path).
+                __unpin_manroot="${manRoot}"
+                if [ ! -d "$__unpin_manroot/share/man" ]; then
+                  echo "withMan: manRoot ${manRoot} has no share/man" >&2
+                  __unpin_manroot=""
+                fi
+              '' else ''
+                # Harvest from the drv's own outputs (native path). nixpkgs puts
+                # man in the `man` output when present; pkgsStatic single-output
+                # drvs keep it in `out`/the bin output under share/man.
+                __unpin_manroot=""
+                for __unpin_d in "''${man:-}" "''${${binOutputName}}" "''${out:-}"; do
+                  if [ -n "$__unpin_d" ] && [ -d "$__unpin_d/share/man" ]; then
+                    __unpin_manroot="$__unpin_d"; break
+                  fi
+                done
+              ''}
+              if [ -z "$__unpin_manroot" ]; then
+                echo "withMan: no share/man found for ${primary}, skipping" >&2
+              else
+                __unpin_manblob="$(mktemp)"
+                # mkman.py exit codes: 0 = blob written, 3 = no man pages
+                # (legit skip), anything else = real failure → fail the build
+                # (don't silently ship a man-less binary). The `|| rc=$?` keeps
+                # errexit from aborting before we can branch.
+                __unpin_rc=0
+                python3 ${./mkman.py} "$__unpin_manroot" "$__unpin_manblob" || __unpin_rc=$?
+                if [ "$__unpin_rc" = 3 ]; then
+                  echo "withMan: no man pages for ${primary}, skipping" >&2
+                elif [ "$__unpin_rc" != 0 ]; then
+                  echo "withMan: mkman.py failed (exit $__unpin_rc) for ${primary}" >&2
+                  exit "$__unpin_rc"
+                else
+                  __unpin_bin="''${${binOutputName}}/bin/${primary}"
+                  # Windows artifacts are `<primary>.exe`.
+                  if [ ! -f "$__unpin_bin" ] && [ -f "$__unpin_bin.exe" ]; then
+                    __unpin_bin="$__unpin_bin.exe"
+                  fi
+                  if [ ! -f "$__unpin_bin" ]; then
+                    # Man exists but we can't find the primary binary (binName
+                    # mismatch / unusual layout). Since embedMan is default-on
+                    # across the catalog, warn and skip rather than fail the
+                    # build — worst case is no embedded man for this package.
+                    echo "withMan: man found but $__unpin_bin missing — skipping embed for ${primary}" >&2
+                    rm -f "$__unpin_manblob"; __unpin_manroot=""
+                  fi
+                  if [ -n "$__unpin_manroot" ]; then
+
+                  # Invariant guard. On Mach-O the alias block and the man
+                  # block both live at the file tail; withAliases anchors its
+                  # truncation at the code-signature end (clobbering anything
+                  # appended after), so withMan MUST run after it. Record
+                  # whether an UNPIN_META alias block is present now and assert
+                  # it survives the embed below — fail loudly instead of
+                  # silently shipping a binary that lost its aliases. (ELF/PE
+                  # keep both as independent sections, so this passes trivially
+                  # there; it is the Mach-O tail case this protects.)
+                  __unpin_has_meta() {
+                    python3 -c 'import sys
+sys.exit(0 if open(sys.argv[1],"rb").read().find(b"\xff\xffUNPIN_META_v1_7f3a4e\xff\xff")>=0 else 1)' "$1"
+                  }
+                  __unpin_had_alias=0
+                  if __unpin_has_meta "$__unpin_bin"; then __unpin_had_alias=1; fi
+
+                  __unpin_man_embed() {
+                    case "$(file -b "$1")" in
+                      *Mach-O*)
+                        # Append past the signed range. Idempotent + alias-safe:
+                        # truncate at our OWN man BEGIN sentinel (if a prior
+                        # embed left one) rather than at the signature end, so a
+                        # withAliases block appended earlier is preserved.
+                        __unpin_off=$(python3 -c '
+import sys
+d = open(sys.argv[1], "rb").read()
+m = d.find(b"\xff\xffUNPIN_MAN_v1_b2c9d1\xff\xff")
+print(m if m >= 0 else len(d))
+' "$1")
+                        truncate -s "$__unpin_off" "$1"
+                        cat "$__unpin_manblob" >> "$1"
+                        ;;
+                      *)
+                        llvm-objcopy \
+                          --remove-section .unpin_man \
+                          --add-section .unpin_man="$__unpin_manblob" \
+                          --set-section-flags .unpin_man=readonly,noload \
+                          "$1"
+                        ;;
+                    esac
+                  }
+
+                  if unzip -l "$__unpin_bin" >/dev/null 2>&1; then
+                    # Cosmocc tail-ZIP. Pure (debug/marker only) → truncate ZIP
+                    # then objcopy; functional ZIP → add as a stored entry.
+                    __unpin_pure=1
+                    while IFS= read -r __unpin_entry; do
+                      case "$__unpin_entry" in
+                        .symtab.*|.cosmo) ;;
+                        *) __unpin_pure=0; break ;;
+                      esac
+                    done < <(unzip -Z1 "$__unpin_bin")
+                    if [ "$__unpin_pure" = 1 ]; then
+                      __unpin_zoff=$(python3 -c '
+import zipfile, sys
+with zipfile.ZipFile(sys.argv[1]) as z:
+    print(min(i.header_offset for i in z.infolist()))
+' "$__unpin_bin")
+                      truncate -s "$__unpin_zoff" "$__unpin_bin"
+                      __unpin_man_embed "$__unpin_bin"
+                    else
+                      __unpin_stage="$(mktemp -d)"
+                      cp "$__unpin_manblob" "$__unpin_stage/.unpin_man"
+                      touch -d "@''${SOURCE_DATE_EPOCH:-315532800}" "$__unpin_stage/.unpin_man"
+                      ( cd "$__unpin_stage" && zip -0 -X -j "$__unpin_bin" .unpin_man ) >/dev/null
+                      rm -rf "$__unpin_stage"
+                    fi
+                  else
+                    __unpin_man_embed "$__unpin_bin"
+                  fi
+
+                  if [ "$__unpin_had_alias" = 1 ] && ! __unpin_has_meta "$__unpin_bin"; then
+                    echo "withMan: embedding man removed the UNPIN_META alias block from $__unpin_bin." >&2
+                    echo "  On Mach-O, withMan must run AFTER withAliases — apply-order invariant violated." >&2
+                    exit 1
+                  fi
+                  fi
+                fi
+                rm -f "$__unpin_manblob"
+              fi
+            '';
+          });
+
         # Why not overlays for per-package fixes? `appendOverlays` invalidates
         # `pkgsBuildHost.stdenv` → cascade rebuild of compiler-rt-libc-static, ninja,
         # python3 in pkgsStatic-darwin (none cached; Hydra only builds pkgsStatic-linux).
@@ -703,9 +881,19 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           , windows ? false
           , windowsCosmo ? false
           , linuxOnly ? false
-          , package_data ? true
+          # No companion data tarball by default. Runtime data is embedded in
+          # the binary (file's magic, vim/gvim's VFS runtime) and man pages go
+          # in the `.unpin_man` block (embedMan), so `share/` is redundant.
+          # Set true only for a package that genuinely needs a side asset.
+          , package_data ? false
           , bootstrap_naming ? false
           , own_software ? false
+          # Embed the package's own man pages into the binary via `withMan`
+          # (the `.unpin_man` block), so `unpin man <pkg>` works offline with
+          # no companion asset. Default-on across the catalog: packages with no
+          # man (codec libs, coreutils/busybox) skip gracefully. Set false to
+          # opt a package out.
+          , embedMan ? true
           # Opt-in smoke-test args, e.g. `[ "--version" ]`. action-build
           # runs `<bin> ${smoke[*]}` after each build on runners with a
           # matching ABI (and on a Windows runner for windows-x86_64).
@@ -771,8 +959,16 @@ with zipfile.ZipFile(sys.argv[1]) as z:
               if build != null then build
               else nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
             stripped = pkgs:
-              strippedOrJoined pkgs name
-                (dropSharedLibs (filterEnableStaticOnDarwin (applyOptSsp (rawBuild pkgs))));
+              let
+                base = dropSharedLibs (filterEnableStaticOnDarwin (applyOptSsp (rawBuild pkgs)));
+                # withMan must run on the underlying drv (it edits the bin
+                # output and reads the man output) BEFORE strippedOrJoined
+                # collapses multi-output drvs into a symlinkJoin.
+                withMaybeMan =
+                  if embedMan then withMan pkgs { primary = binName; } base
+                  else base;
+              in
+              strippedOrJoined pkgs name withMaybeMan;
 
             # Windows runs on x86_64-linux runners. `allowUnsupportedSystem` because
             # most nixpkgs `meta.platforms` exclude mingw / cosmo → cross-built drv
@@ -842,8 +1038,21 @@ with zipfile.ZipFile(sys.argv[1]) as z:
               if windowsBuild != null then windowsBuild
               else if windowsCosmo then (pkgs: (cosmoStaticCross pkgs).${pkgsAttr})
               else (pkgs: (mingwStaticCross pkgs).${pkgsAttr});
-            windowsPkg = strippedOrJoined windowsPkgs name
-              (dropSharedLibs (applyOptSsp (windowsRawBuild windowsPkgs)));
+            # Man source for the windows/cosmo binary. The mingw/cosmo cross
+            # build ships no man, so embed the (OS-independent, version-locked)
+            # pages from the regular x86_64-linux build of the same attr. Pick
+            # its `man` output when split, else `out` (man-in-out). null when
+            # the attr doesn't exist or has no man → withMan skips gracefully.
+            winManNixpkgs = nixpkgs.legacyPackages.${"x86_64-linux"};
+            winManSrc =
+              let p = winManNixpkgs.${pkgsAttr} or null;
+              in if p == null then null else (p.man or p.out or p);
+            windowsBase = dropSharedLibs (applyOptSsp (windowsRawBuild windowsPkgs));
+            windowsWithMan =
+              if embedMan && winManSrc != null
+              then withMan windowsPkgs { primary = binName; manRoot = "${winManSrc}"; } windowsBase
+              else windowsBase;
+            windowsPkg = strippedOrJoined windowsPkgs name windowsWithMan;
 
             # `linuxOnly` drops every Darwin attr from `packages.<sys>` so
             # action-build's auto-discovered matrix doesn't include darwin
