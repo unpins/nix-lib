@@ -11,10 +11,21 @@
 # Mirror the Linux guard onto the Darwin branch. `nolib_test` is a
 # build-time check, not a build product — guarding it changes nothing in
 # the installed library.
+#
+# Second, static-only (any platform): CMake's libtool-emulation writes a
+# `libgraphite2.la` with `old_library=''` and `library_names='libgraphite2.so
+# ...'` even though only the static archive was built. A libtool consumer
+# (chafa is autotools) reads it, can't find the `.so`, and has no static
+# fallback — `cannot find .../libgraphite2.so`. Rewrite the `.la` to name the
+# static archive and drop the phantom shared names. pkg-config consumers
+# (ffmpeg) never read the `.la`, so they don't trip this.
 { lib }:
 pkgs:
-if pkgs.stdenv.hostPlatform.isDarwin then
-  pkgs.graphite2.overrideAttrs (oa: {
+let
+  host = pkgs.stdenv.hostPlatform;
+in
+pkgs.graphite2.overrideAttrs (oa:
+  (lib.optionalAttrs host.isDarwin {
     postPatch = (oa.postPatch or "") + ''
       substituteInPlace src/CMakeLists.txt --replace-fail \
         '    include(Graphite)
@@ -25,5 +36,16 @@ if pkgs.stdenv.hostPlatform.isDarwin then
           endif ()'
     '';
   })
-else
-  pkgs.graphite2
+  // (lib.optionalAttrs host.isStatic {
+    postFixup = (oa.postFixup or "") + ''
+      la="$out/lib/libgraphite2.la"
+      if [ -f "$la" ]; then
+        sed -i \
+          -e "s|^old_library=.*|old_library='libgraphite2.a'|" \
+          -e "s|^dlname=.*|dlname=|" \
+          -e "s|^library_names=.*|library_names=|" \
+          "$la"
+      fi
+    '';
+  })
+)
