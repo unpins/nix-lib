@@ -742,6 +742,17 @@
           # man (codec libs, coreutils/busybox) skip gracefully. Set false to
           # opt a package out.
           , embedMan ? true
+          # Override the man source for the windows/cosmo binary. The cross
+          # build ships no man of its own, so by default we graft the
+          # version-locked pages from the x86_64-linux nixpkgs build of
+          # `pkgsAttr` (see `winManSrc` below). That harvests EVERY page the
+          # upstream ships — including tools/libs the unpins binary doesn't
+          # actually carry (e.g. ffmpeg's ffplay.1 / libav*.3). Set this to a
+          # store path with `share/man` to embed exactly that set instead, so
+          # the windows binary's man matches what native/darwin embed (parity).
+          # null = keep the nixpkgs graft (default; unchanged for every package
+          # that doesn't opt in).
+          , winManRoot ? null
           # Opt-in smoke-test args, e.g. `[ "--version" ]`. action-build
           # runs `<bin> ${smoke[*]}` after each build on runners with a
           # matching ABI (and on a Windows runner for windows-x86_64).
@@ -892,9 +903,12 @@
             # its `man` output when split, else `out` (man-in-out). null when
             # the attr doesn't exist or has no man → withMan skips gracefully.
             winManNixpkgs = nixpkgs.legacyPackages.${"x86_64-linux"};
+            # `winManRoot` (package opt-in) wins: embed exactly the curated set
+            # the package supplies. Otherwise fall back to the nixpkgs graft.
             winManSrc =
-              let p = winManNixpkgs.${pkgsAttr} or null;
-              in if p == null then null else (p.man or p.out or p);
+              if winManRoot != null then winManRoot
+              else let p = winManNixpkgs.${pkgsAttr} or null;
+                   in if p == null then null else (p.man or p.out or p);
             windowsBase = dropSharedLibs (applyOptSsp (windowsRawBuild windowsPkgs));
             windowsWithMan =
               if embedMan && winManSrc != null
