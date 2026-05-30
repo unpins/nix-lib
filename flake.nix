@@ -165,28 +165,13 @@
           })
           else drv;
 
-        # Embed an UNPIN_META alias block into `$out/bin/<primary>` so unpin's
+        # Embed a package's multi-call alias list into `$out/bin/<primary>` as a
+        # `unpin/aliases` entry of the binary's embedded ZIP, so unpin's
         # installer can spawn argv[0]-dispatch links (xz → xzcat/unxz/lzma…) at
-        # `unpin install` time. The block is a payload bracketed by 0xff-0xff
-        # sentinels (see unpin/src/aliases.rs) and the reader scans for the
-        # sentinels in the file bytes — section name is irrelevant to consumption.
-        #
-        # We write into a custom `.unpin_meta` section via
-        # `llvm-objcopy --add-section` (not append-after-EOF) for three reasons:
-        # (1) ELF/PE/Mach-O all accept a named SHT_PROGBITS section and
-        # llvm-objcopy adjusts the headers correctly across formats;
-        # (2) standard `strip` only removes debug/symbol sections by name, so
-        # `.unpin_meta` survives — a trailer would be lost by any tool that
-        # rewrites the file by declared image size; (3) future code-signing
-        # puts the section inside the signature envelope while a trailer
-        # would invalidate it. `noload` + no `SHF_ALLOC` means the section is
-        # a file-only artifact — zero runtime memory cost.
-        #
-        # NB: we deliberately AVOID the `.note.*` namespace. llvm-objcopy
-        # parses `.note.*` payloads as structured ELF note records (namesz +
-        # descsz + type + payload), enforces 4-byte alignment, and rejects raw
-        # bytes that don't fit the schema. SHT_PROGBITS with a non-`.note`
-        # name dodges that entirely.
+        # `unpin install` time. The container is a plain ZIP (one name per line
+        # in `unpin/aliases`), located/read by unpin via the ZIP's native EOCD —
+        # see docs/embedded-metadata.md and `unpin/src/meta.rs`. Embedding is the
+        # shared `__unpin_embed_subtree` (see `unpinEmbedSh`).
         #
         # Two input modes (exactly one required):
         #   aliases = [ "xzcat" "unxz" "lzma" ];   # explicit list, Nix-eval-time
@@ -198,27 +183,50 @@
         # (we ship one binary, the alias links are unpin's job at install time)
         # then embed the list in postFixup so the embed runs AFTER stdenv strip.
         #
-        # Cosmocc / APE binaries: cosmocc emits PE-at-head + ZIP-at-tail. Naïve
-        # `llvm-objcopy` would parse only the PE half and silently drop the
-        # tail ZIP (losing `.symtab.amd64` and any embedded runtime resources).
-        # The embed step auto-detects the tail-ZIP case via `unzip -l` and
-        # picks the safe path:
-        #
-        #   (a) ZIP contains only debug/marker entries (`.symtab.*`, `.cosmo`):
-        #       truncate the ZIP entirely so the artifact is a pure PE/ELF/
-        #       Mach-O, then `llvm-objcopy --add-section`. Saves ~80–230 KB
-        #       per artifact by dropping debug symtab — affects crash-time
-        #       stack symbolication only, runtime behavior unaffected.
-        #
-        #   (b) ZIP carries functional data (e.g. `usr/share/zoneinfo/*` for
-        #       bash/coreutils on Windows where no system zoneinfo exists):
-        #       append our meta as a *stored* (not deflated) ZIP entry. The
-        #       0xff-0xff sentinels appear verbatim in the entry payload, so
-        #       the unpin scanner finds them; cosmocc's `/zip/<name>` lookups
-        #       are by name and our new entry doesn't conflict.
-        #
-        # Non-ZIP binaries (every native build, mingw cross): single branch
-        # straight to `llvm-objcopy`. No new dependencies along the hot path.
+        # Alias security (no marker needed): aliases are honored at install time
+        # only for catalog-owner packages, and every name passes the blocklist —
+        # both upstream of the reader. See docs/embedded-metadata.md §4.
+        # Shared embed primitive for withAliases/withMan: add a staging `unpin/`
+        # subtree to the binary's embedded ZIP (docs/embedded-metadata.md). If
+        # the binary already carries a tail-ZIP (cosmo APE runtime, or a prior
+        # embed step), add entries to it; otherwise build a standalone ZIP and
+        # append it as an overlay at EOF. On Mach-O the current EOF is past
+        # LC_CODE_SIGNATURE, so the overlay is outside the signed range and
+        # signing stays valid. `zip -y` keeps `.so` symlinks; mtimes are pinned
+        # and `-X` drops uid/gid for reproducibility. Idempotent: re-adding an
+        # entry replaces it, so re-runs don't accrete duplicate ZIPs.
+        unpinEmbedSh = ''
+          __unpin_embed_subtree() {
+            __ues_bin="$1"; __ues_stage="$2"
+            if [ ! -f "$__ues_bin" ]; then
+              echo "unpin embed: $__ues_bin does not exist" >&2; exit 1
+            fi
+            find "$__ues_stage/unpin" -exec touch -h -d "@''${SOURCE_DATE_EPOCH:-315532800}" {} + 2>/dev/null || true
+            __ues_names="$(cd "$__ues_stage" && find unpin -mindepth 1 \( -type f -o -type l \) | LC_ALL=C sort)"
+            [ -n "$__ues_names" ] || return 0
+            if unzip -Z1 "$__ues_bin" 2>/dev/null | grep -qxF .cosmo; then
+              # cosmo APE: ADD our entries to the existing tail-ZIP. We must not
+              # append a second ZIP after it — cosmo's loader finds its `/zip/`
+              # runtime via the end-of-file EOCD, and a trailing ZIP would shadow
+              # it. cosmo's ZIP has file-adjusted offsets, so `zip` can edit it.
+              ( cd "$__ues_stage" && printf '%s\n' "$__ues_names" | zip -y -X -q "$__ues_bin" -@ )
+            else
+              # Fresh binary, or a binary that already carries one of OUR overlay
+              # ZIPs (from a prior embed step). Append our subtree as a NEW
+              # overlay ZIP at EOF. We don't try to edit a prior overlay: `zip`
+              # rejects an unadjusted-prefix overlay ("structure invalid"), and
+              # the reader unions `unpin/*` across every embedded ZIP anyway — so
+              # aliases-overlay + man-overlay read back as one set. zip must
+              # CREATE the archive (a bare `mktemp` file is empty and rejected),
+              # so point it at a fresh path.
+              __ues_d="$(mktemp -d)"
+              ( cd "$__ues_stage" && printf '%s\n' "$__ues_names" | zip -y -X -q "$__ues_d/m.zip" -@ )
+              cat "$__ues_d/m.zip" >> "$__ues_bin"
+              rm -rf "$__ues_d"
+            fi
+          }
+        '';
+
         withAliases = pkgs:
           { primary
           , aliases ? null
@@ -304,17 +312,10 @@
             wrapped = drv.overrideAttrs (old: {
               nativeBuildInputs = (old.nativeBuildInputs or [ ])
                 ++ [
-                  pkgs.buildPackages.llvm
-                  # `file` drives the per-format branch in __unpin_objcopy
-                  # (Mach-O sections need __SEG,__SECT form; ELF/PE use plain
-                  # names). Not in baseline stdenv on darwin.
-                  pkgs.buildPackages.file
-                  # unzip/zip + python3Minimal are only exercised on cosmocc
-                  # outputs (tail-ZIP detection, offset compute, stored append).
-                  # ~10 MB of build closure, never linked into shipped artifacts.
-                  pkgs.buildPackages.unzip
+                  # Build + add to the binary's embedded ZIP. Build-only (~few
+                  # MB closure), never linked into the shipped artifact.
                   pkgs.buildPackages.zip
-                  pkgs.buildPackages.python3Minimal
+                  pkgs.buildPackages.unzip
                 ];
 
               postInstall = (old.postInstall or "")
@@ -374,6 +375,7 @@
               '';
 
               postFixup = (old.postFixup or "") + ''
+                ${unpinEmbedSh}
                 ${if hasExplicit
                   then "__unpin_aliases='${explicitCsv}'"
                   else ''__unpin_aliases="$(cat "$NIX_BUILD_TOP/.unpin-aliases")"''}
@@ -381,133 +383,27 @@
                 # Short-circuit: nothing to embed when the collected/declared
                 # list ended up empty (auto-mode: no symlinks matched the
                 # validator; explicit-mode: caller passed `aliases = [ ]`).
-                # Avoids a 60-byte ALIASES= block that the reader would just
-                # treat as no-aliases anyway.
                 if [ -z "$__unpin_aliases" ]; then
                   echo "withAliases: no aliases to embed for ${primary}, skipping" >&2
                 else
-                  __unpin_meta="$(mktemp)"
-                  # Octal escapes (\NNN) for portability — \xHH isn't POSIX,
-                  # though every stdenv shell we use happens to support it.
-                  # Marker bytes mirror aliases.rs MARKER_BEGIN/MARKER_END verbatim.
-                  printf '\377\377UNPIN_META_v1_7f3a4e\377\377\nALIASES=%s\n\377\377UNPIN_META_END_7f3a4e\377\377\n' \
-                    "$__unpin_aliases" > "$__unpin_meta"
-
                   __unpin_bin="''${${binOutputName}}/bin/${primary}"
+                  if [ ! -f "$__unpin_bin" ] && [ -f "$__unpin_bin.exe" ]; then
+                    __unpin_bin="$__unpin_bin.exe"
+                  fi
                   if [ ! -f "$__unpin_bin" ]; then
                     echo "withAliases: $__unpin_bin does not exist" >&2
                     exit 1
                   fi
-
-                  # `--remove-section` before `--add-section` keeps the embed
-                  # idempotent — no-op when the section is missing, cleans up
-                  # a previous embed when chained or re-run.
-                  #
-                  # llvm-objcopy's `--set-section-flags` is ELF-only and its
-                  # section-name format differs per object format: ELF/PE
-                  # accept a plain name (`.unpin_meta`), Mach-O requires
-                  # `SEGNAME,SECTNAME` (`__TEXT,__unpin_meta`, both ≤ 16 chars).
-                  # Branching on `file -b` keeps a single code path while
-                  # respecting each format's contract. The unpin reader scans
-                  # the raw file bytes for the 0xff-0xff sentinels regardless
-                  # of section name, so the alias payload is found either way.
-                  __unpin_objcopy() {
-                    case "$(file -b "$1")" in
-                      *Mach-O*)
-                        # Mach-O path: append the meta payload after the
-                        # LC_CODE_SIGNATURE blob at end-of-file, rather
-                        # than `llvm-objcopy --add-section`'ing into
-                        # __TEXT. Two reasons:
-                        # (1) add-section invalidates the code signature
-                        #     and the re-sign dance (sigtool + cctools'
-                        #     codesign_allocate via pkgsBuildBuild) ended
-                        #     up producing signatures that the macOS-15
-                        #     kernel rejects with SIGKILL on exec —
-                        #     architecture-dependent enough that we don't
-                        #     want to chase it any further.
-                        # (2) The signature covers the file up to the end
-                        #     of the LINKEDIT segment, so bytes appended
-                        #     afterwards are outside the signed range and
-                        #     don't invalidate anything. The unpin
-                        #     installer scans for the 0xff-0xff sentinels
-                        #     against raw bytes, so section placement is
-                        #     irrelevant on the read side.
-                        # If a previous embed already sits at the tail,
-                        # truncate it back to the LC_CODE_SIGNATURE end
-                        # so this stays idempotent.
-                        __unpin_sig_end=$(python3 -c '
-import struct, sys
-with open(sys.argv[1], "rb") as f:
-    data = f.read()
-ncmds = struct.unpack("<I", data[16:20])[0]
-off = 32
-for _ in range(ncmds):
-    cmd, sz = struct.unpack("<II", data[off:off+8])
-    if cmd == 0x1d:
-        dataoff, datasize = struct.unpack("<II", data[off+8:off+16])
-        print(dataoff + datasize); sys.exit(0)
-    off += sz
-print(len(data))
-' "$1")
-                        truncate -s "$__unpin_sig_end" "$1"
-                        cat "$__unpin_meta" >> "$1"
-                        ;;
-                      *)
-                        llvm-objcopy \
-                          --remove-section .unpin_meta \
-                          --add-section .unpin_meta="$__unpin_meta" \
-                          --set-section-flags .unpin_meta=readonly,noload \
-                          "$1"
-                        ;;
-                    esac
-                  }
-
-                  if unzip -l "$__unpin_bin" >/dev/null 2>&1; then
-                    # Cosmocc tail-ZIP detected. Decide between purify-then-objcopy
-                    # vs zip-append based on entry list.
-                    __unpin_pure=1
-                    while IFS= read -r __unpin_entry; do
-                      case "$__unpin_entry" in
-                        .symtab.*|.cosmo) ;;
-                        *) __unpin_pure=0; break ;;
-                      esac
-                    done < <(unzip -Z1 "$__unpin_bin")
-
-                    if [ "$__unpin_pure" = 1 ]; then
-                      # ZIP only carries throwaway debug/marker. Truncate it
-                      # entirely so the artifact becomes a pure PE/ELF/Mach-O.
-                      # Use python's zipfile to locate the first local-file-
-                      # header offset rather than `grep PK\x03\x04`, which
-                      # would false-positive on coincidental matches in PE
-                      # code. Crash-time symbolication is the only thing lost.
-                      __unpin_offset=$(python3 -c '
-import zipfile, sys
-with zipfile.ZipFile(sys.argv[1]) as z:
-    print(min(i.header_offset for i in z.infolist()))
-' "$__unpin_bin")
-                      truncate -s "$__unpin_offset" "$__unpin_bin"
-                      __unpin_objcopy "$__unpin_bin"
-                    else
-                      # ZIP has functional content (zoneinfo etc.). Append our
-                      # block as a stored entry — bytes appear verbatim so the
-                      # scanner finds the sentinels; -X drops uid/gid for
-                      # reproducibility, and we pin the mtime via `touch`
-                      # because `zip` records DOS file-times from the source
-                      # mtime (build-clock-dependent without this). `zip` itself
-                      # is idempotent — re-adding an existing entry replaces it.
-                      # 315532800 = 1980-01-01, the ZIP DOS-date epoch floor.
-                      __unpin_stage="$(mktemp -d)"
-                      cp "$__unpin_meta" "$__unpin_stage/.unpin_meta"
-                      touch -d "@''${SOURCE_DATE_EPOCH:-315532800}" "$__unpin_stage/.unpin_meta"
-                      ( cd "$__unpin_stage" && zip -0 -X -j "$__unpin_bin" .unpin_meta ) >/dev/null
-                      rm -rf "$__unpin_stage"
-                    fi
-                  else
-                    # Plain PE/ELF/Mach-O — single objcopy pass.
-                    __unpin_objcopy "$__unpin_bin"
-                  fi
-
-                  rm -f "$__unpin_meta"
+                  # Write `unpin/aliases` (one name per line) into a staging tree
+                  # and add it to the binary's embedded ZIP. Aliases are a
+                  # security boundary, but that is enforced at install time
+                  # (catalog-owner gate + blocklist), not here — we just ship
+                  # the declared list.
+                  __unpin_stage="$(mktemp -d)"
+                  mkdir -p "$__unpin_stage/unpin"
+                  printf '%s' "$__unpin_aliases" | tr ',' '\n' > "$__unpin_stage/unpin/aliases"
+                  __unpin_embed_subtree "$__unpin_bin" "$__unpin_stage"
+                  rm -rf "$__unpin_stage"
                 fi
               '';
             });
@@ -527,24 +423,17 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           # Without this, throws fire at build-graph realization, not eval.
           else builtins.deepSeq validatedAliases wrapped;
 
-        # Embed a `.unpin_man` block: the package's OWN man pages, packed by
-        # `./mkman.py` into the container described in the embedded-man-format
-        # spec (zstd-compressed index + roff bodies, framed by 0xff-0xff
-        # sentinels), so `unpin man <pkg>` reads docs straight out of the
-        # binary — no companion data tarball. The embed mechanics mirror
-        # `withAliases` (named section via llvm-objcopy; Mach-O append-past-
-        # signature; cosmo tail-ZIP), differing only in that the payload is the
-        # binary blob mkman.py emits rather than a printf'd text block.
+        # Embed the package's OWN man pages as `unpin/man/<name>.<section>`
+        # entries of the binary's embedded ZIP (roff verbatim; `.so` stubs as
+        # ZIP symlink entries), so `unpin man <pkg>` reads docs straight out of
+        # the binary — no companion data tarball. `./mkmeta.py` populates a
+        # staging `unpin/man/` tree, then the shared `__unpin_embed_subtree`
+        # (see `unpinEmbedSh`) adds it to the binary's ZIP.
         #
-        # Composition with withAliases: apply withAliases FIRST, withMan LAST.
-        #   - ELF/PE/cosmo: `.unpin_meta` and `.unpin_man` are independent
-        #     sections / ZIP entries; no ordering constraint, both survive.
-        #   - Mach-O: both blocks live at the file tail (past the signed
-        #     range). withMan re-truncates only at its own BEGIN sentinel (not
-        #     at the signature end), so it removes a prior man block on re-run
-        #     while leaving any earlier alias block intact.
-        # The unpin reader finds each block by its distinct sentinel scan, so
-        # section placement is irrelevant on the read side.
+        # Composition with withAliases: order-free. Both just ADD entries to the
+        # one embedded ZIP (creating it if absent), so neither clobbers the
+        # other — the old Mach-O "withMan after withAliases" ordering invariant
+        # is gone. See docs/embedded-metadata.md.
         # `manRoot`: when null, harvest man from the drv's own outputs
         # (`$man`/`$out`) — the native path, where the static build produces
         # man. When set to a store path, read `$manRoot/share/man` instead —
@@ -563,15 +452,13 @@ with zipfile.ZipFile(sys.argv[1]) as z:
           drv.overrideAttrs (old: {
             nativeBuildInputs = (old.nativeBuildInputs or [ ])
               ++ [
-                pkgs.buildPackages.llvm        # llvm-objcopy
-                pkgs.buildPackages.file         # per-format branch (Mach-O vs ELF/PE)
-                pkgs.buildPackages.zstd         # mkman.py compresses via the zstd CLI
-                pkgs.buildPackages.python3Minimal
-                pkgs.buildPackages.unzip        # cosmo tail-ZIP detect (only on APE)
+                pkgs.buildPackages.python3Minimal  # mkmeta.py builds the man tree
                 pkgs.buildPackages.zip
+                pkgs.buildPackages.unzip
               ];
 
             postFixup = (old.postFixup or "") + ''
+              ${unpinEmbedSh}
               # Locate the man tree to embed.
               ${if manRoot != null then ''
                 # Externally supplied man source (windows/cosmo path).
@@ -594,17 +481,17 @@ with zipfile.ZipFile(sys.argv[1]) as z:
               if [ -z "$__unpin_manroot" ]; then
                 echo "withMan: no share/man found for ${primary}, skipping" >&2
               else
-                __unpin_manblob="$(mktemp)"
-                # mkman.py exit codes: 0 = blob written, 3 = no man pages
-                # (legit skip), anything else = real failure → fail the build
-                # (don't silently ship a man-less binary). The `|| rc=$?` keeps
-                # errexit from aborting before we can branch.
+                # mkmeta.py populates a staging `unpin/man/` tree (roff files +
+                # symlinks for `.so`). Exit 3 = no man pages (legit skip); any
+                # other nonzero = real failure → fail the build (don't silently
+                # ship man-less). `|| rc=$?` keeps errexit from aborting first.
+                __unpin_stage="$(mktemp -d)"
                 __unpin_rc=0
-                python3 ${./mkman.py} "$__unpin_manroot" "$__unpin_manblob" || __unpin_rc=$?
+                python3 ${./mkmeta.py} "$__unpin_manroot" "$__unpin_stage" || __unpin_rc=$?
                 if [ "$__unpin_rc" = 3 ]; then
                   echo "withMan: no man pages for ${primary}, skipping" >&2
                 elif [ "$__unpin_rc" != 0 ]; then
-                  echo "withMan: mkman.py failed (exit $__unpin_rc) for ${primary}" >&2
+                  echo "withMan: mkmeta.py failed (exit $__unpin_rc) for ${primary}" >&2
                   exit "$__unpin_rc"
                 else
                   __unpin_bin="''${${binOutputName}}/bin/${primary}"
@@ -618,80 +505,14 @@ with zipfile.ZipFile(sys.argv[1]) as z:
                     # across the catalog, warn and skip rather than fail the
                     # build — worst case is no embedded man for this package.
                     echo "withMan: man found but $__unpin_bin missing — skipping embed for ${primary}" >&2
-                    rm -f "$__unpin_manblob"; __unpin_manroot=""
-                  fi
-                  if [ -n "$__unpin_manroot" ]; then
-
-                  # Invariant guard. On Mach-O the alias block and the man
-                  # block both live at the file tail; withAliases anchors its
-                  # truncation at the code-signature end (clobbering anything
-                  # appended after), so withMan MUST run after it. Record
-                  # whether an UNPIN_META alias block is present now and assert
-                  # it survives the embed below — fail loudly instead of
-                  # silently shipping a binary that lost its aliases. (ELF/PE
-                  # keep both as independent sections, so this passes trivially
-                  # there; it is the Mach-O tail case this protects.)
-                  __unpin_has_meta() {
-                    python3 -c 'import sys
-sys.exit(0 if open(sys.argv[1],"rb").read().find(b"\xff\xffUNPIN_META_v1_7f3a4e\xff\xff")>=0 else 1)' "$1"
-                  }
-                  __unpin_had_alias=0
-                  if __unpin_has_meta "$__unpin_bin"; then __unpin_had_alias=1; fi
-
-                  __unpin_man_embed() {
-                    case "$(file -b "$1")" in
-                      *Mach-O*)
-                        # Append past the signed range. Idempotent + alias-safe:
-                        # truncate at our OWN man BEGIN sentinel (if a prior
-                        # embed left one) rather than at the signature end, so a
-                        # withAliases block appended earlier is preserved.
-                        __unpin_off=$(python3 -c '
-import sys
-d = open(sys.argv[1], "rb").read()
-m = d.find(b"\xff\xffUNPIN_MAN_v1_b2c9d1\xff\xff")
-print(m if m >= 0 else len(d))
-' "$1")
-                        truncate -s "$__unpin_off" "$1"
-                        cat "$__unpin_manblob" >> "$1"
-                        ;;
-                      *)
-                        llvm-objcopy \
-                          --remove-section .unpin_man \
-                          --add-section .unpin_man="$__unpin_manblob" \
-                          --set-section-flags .unpin_man=readonly,noload \
-                          "$1"
-                        ;;
-                    esac
-                  }
-
-                  if unzip -l "$__unpin_bin" >/dev/null 2>&1; then
-                    # Cosmocc tail-ZIP (APE). ALWAYS add `.unpin_man` as a stored
-                    # ZIP member — never truncate the overlay and objcopy. An APE
-                    # is a PE/ELF/shell polyglot whose appended ZIP carries the
-                    # `.cosmo` loader marker (and the cosmocc symbol table);
-                    # llvm-objcopy rewrites the PE and discards that overlay, so
-                    # the result hangs / exits 126 on Windows (verified on the
-                    # Win10 VM: zip-append runs clean, objcopy path does not).
-                    # Size trimming of `.symtab.amd64` is a separate concern,
-                    # handled by `withCosmoStrip` (`zip -d`), which keeps the APE
-                    # structure intact.
-                    __unpin_stage="$(mktemp -d)"
-                    cp "$__unpin_manblob" "$__unpin_stage/.unpin_man"
-                    touch -d "@''${SOURCE_DATE_EPOCH:-315532800}" "$__unpin_stage/.unpin_man"
-                    ( cd "$__unpin_stage" && zip -0 -X -j "$__unpin_bin" .unpin_man ) >/dev/null
-                    rm -rf "$__unpin_stage"
                   else
-                    __unpin_man_embed "$__unpin_bin"
-                  fi
-
-                  if [ "$__unpin_had_alias" = 1 ] && ! __unpin_has_meta "$__unpin_bin"; then
-                    echo "withMan: embedding man removed the UNPIN_META alias block from $__unpin_bin." >&2
-                    echo "  On Mach-O, withMan must run AFTER withAliases — apply-order invariant violated." >&2
-                    exit 1
-                  fi
+                    # No ordering guard needed: __unpin_embed_subtree ADDS man
+                    # entries to whatever ZIP withAliases left (or creates one),
+                    # so it can't clobber the alias entry.
+                    __unpin_embed_subtree "$__unpin_bin" "$__unpin_stage"
                   fi
                 fi
-                rm -f "$__unpin_manblob"
+                rm -rf "$__unpin_stage"
               fi
             '';
           });
@@ -701,7 +522,7 @@ print(m if m >= 0 else len(d))
         # backtraces (`--ftrace`/`--strace`), ~30-80 KB deflated and unused at
         # runtime — stdenv `strip` can't reach it (it's a ZIP member, not an
         # ELF section). `zip -d` removes just that member, preserving the PE
-        # prefix, `.cosmo`, any `usr/share/zoneinfo/*`, and our `.unpin_man`.
+        # prefix, `.cosmo`, any `usr/share/zoneinfo/*`, and our `unpin/*` entries.
         # Self-guarding: no-op on mingw PE (no tail-ZIP). Apply AFTER withMan
         # so it trims what's left once the man block is embedded.
         withCosmoStrip = pkgs: { primary }: drv:
@@ -910,13 +731,13 @@ print(m if m >= 0 else len(d))
           , linuxOnly ? false
           # No companion data tarball by default. Runtime data is embedded in
           # the binary (file's magic, vim/gvim's VFS runtime) and man pages go
-          # in the `.unpin_man` block (embedMan), so `share/` is redundant.
+          # in the embedded ZIP (embedMan), so `share/` is redundant.
           # Set true only for a package that genuinely needs a side asset.
           , package_data ? false
           , bootstrap_naming ? false
           , own_software ? false
           # Embed the package's own man pages into the binary via `withMan`
-          # (the `.unpin_man` block), so `unpin man <pkg>` works offline with
+          # (as `unpin/man/*` ZIP entries), so `unpin man <pkg>` works offline with
           # no companion asset. Default-on across the catalog: packages with no
           # man (codec libs, coreutils/busybox) skip gracefully. Set false to
           # opt a package out.
