@@ -665,30 +665,21 @@ print(m if m >= 0 else len(d))
                   }
 
                   if unzip -l "$__unpin_bin" >/dev/null 2>&1; then
-                    # Cosmocc tail-ZIP. Pure (debug/marker only) → truncate ZIP
-                    # then objcopy; functional ZIP → add as a stored entry.
-                    __unpin_pure=1
-                    while IFS= read -r __unpin_entry; do
-                      case "$__unpin_entry" in
-                        .symtab.*|.cosmo) ;;
-                        *) __unpin_pure=0; break ;;
-                      esac
-                    done < <(unzip -Z1 "$__unpin_bin")
-                    if [ "$__unpin_pure" = 1 ]; then
-                      __unpin_zoff=$(python3 -c '
-import zipfile, sys
-with zipfile.ZipFile(sys.argv[1]) as z:
-    print(min(i.header_offset for i in z.infolist()))
-' "$__unpin_bin")
-                      truncate -s "$__unpin_zoff" "$__unpin_bin"
-                      __unpin_man_embed "$__unpin_bin"
-                    else
-                      __unpin_stage="$(mktemp -d)"
-                      cp "$__unpin_manblob" "$__unpin_stage/.unpin_man"
-                      touch -d "@''${SOURCE_DATE_EPOCH:-315532800}" "$__unpin_stage/.unpin_man"
-                      ( cd "$__unpin_stage" && zip -0 -X -j "$__unpin_bin" .unpin_man ) >/dev/null
-                      rm -rf "$__unpin_stage"
-                    fi
+                    # Cosmocc tail-ZIP (APE). ALWAYS add `.unpin_man` as a stored
+                    # ZIP member — never truncate the overlay and objcopy. An APE
+                    # is a PE/ELF/shell polyglot whose appended ZIP carries the
+                    # `.cosmo` loader marker (and the cosmocc symbol table);
+                    # llvm-objcopy rewrites the PE and discards that overlay, so
+                    # the result hangs / exits 126 on Windows (verified on the
+                    # Win10 VM: zip-append runs clean, objcopy path does not).
+                    # Size trimming of `.symtab.amd64` is a separate concern,
+                    # handled by `withCosmoStrip` (`zip -d`), which keeps the APE
+                    # structure intact.
+                    __unpin_stage="$(mktemp -d)"
+                    cp "$__unpin_manblob" "$__unpin_stage/.unpin_man"
+                    touch -d "@''${SOURCE_DATE_EPOCH:-315532800}" "$__unpin_stage/.unpin_man"
+                    ( cd "$__unpin_stage" && zip -0 -X -j "$__unpin_bin" .unpin_man ) >/dev/null
+                    rm -rf "$__unpin_stage"
                   else
                     __unpin_man_embed "$__unpin_bin"
                   fi
@@ -711,9 +702,8 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         # runtime — stdenv `strip` can't reach it (it's a ZIP member, not an
         # ELF section). `zip -d` removes just that member, preserving the PE
         # prefix, `.cosmo`, any `usr/share/zoneinfo/*`, and our `.unpin_man`.
-        # Self-guarding: no-op on mingw PE (no tail-ZIP) and on already-pure
-        # binaries (withMan's truncate path). Apply AFTER withMan so it trims
-        # what's left once the man block is embedded.
+        # Self-guarding: no-op on mingw PE (no tail-ZIP). Apply AFTER withMan
+        # so it trims what's left once the man block is embedded.
         withCosmoStrip = pkgs: { primary }: drv:
           let
             binOutputName =
