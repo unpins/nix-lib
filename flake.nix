@@ -553,6 +553,197 @@
             '';
           });
 
+        # Shared multicall dispatcher generator. Returns the shell block that
+        # writes `multicall/dispatcher.c` — the tiny C front-end every multicall
+        # binary shares: a `copy_basename` (strips dir + the `.exe` suffix), an
+        # applet table built at build time from `multicall/apps.list` (one applet
+        # name per line — THE contract; the caller populates it before invoking),
+        # and an argv[0]-shim `main` with a `<pkg> <applet> [args]` fallback.
+        #
+        # Canonical behaviour, uniform across the catalog (replaces the old
+        # hand-copied per-package dispatchers that had drifted apart):
+        #   * Applet name -> C symbol via `tr -c 'A-Za-z0-9_' '_'`, so hyphenated
+        #     applets (srt-live-transmit) map to a legal identifier with no
+        #     per-package sanitiser.
+        #   * Permissive dispatch: a basename that isn't an applet (the canonical
+        #     name, a full path, or a renamed copy like CI's `smoke.exe`) falls
+        #     through to `argv[1]` as the applet — so renamed binaries AND the
+        #     smoke test keep dispatching, without each package keying on its own
+        #     name (the strict form some packages used had to drop smoke).
+        #   * Bare/unknown invocation prints `usage`, unless `defaultApplet` is
+        #     set (libwebp: a bare `libwebp` runs cwebp) — then it runs that.
+        #
+        # Params: `name` (banner + default argv0) and optional `defaultApplet`.
+        # The list source / sanitiser / fallback-style that used to vary per
+        # package are now fixed here; the only knob is `defaultApplet`.
+        #
+        # Invoke at COLUMN 0 in the consumer's postBuild so the `CBODY` heredoc
+        # terminators reach the emitted script at column 0 (a shell requirement)
+        # and the enclosing indented-string keeps a sane min-indent. The consumer
+        # must have written `multicall/apps.list` earlier in postBuild. Drv-hash
+        # changes vs the old inline dispatchers (intended — behaviour is unified
+        # to the permissive form). See docs/multicall.md.
+        multicallDispatcherC = { name, defaultApplet ? null }:
+          let
+            sanDefault = nixpkgs.lib.replaceStrings [ "-" "." "+" ] [ "_" "_" "_" ]
+              (if defaultApplet == null then "" else defaultApplet);
+            fallbackC =
+              if defaultApplet == null
+              then ''        fprintf(stderr, "${name}: unknown applet '%s'\n", base);
+        return usage(a0);''
+              else ''        (void)usage;  /* defaultApplet replaces the usage() fallback */
+        return ${sanDefault}_main(argc, argv);'';
+          in
+          ''
+      {
+        echo '#include <string.h>'
+        echo '#include <stdio.h>'
+        while IFS= read -r a; do
+          [ -n "$a" ] || continue
+          san=$(printf '%s' "$a" | tr -c 'A-Za-z0-9_' '_')
+          echo "int ''${san}_main(int, char **);"
+        done < multicall/apps.list
+        echo 'struct applet { const char *name; int (*fn)(int, char **); };'
+        echo 'static const struct applet applets[] = {'
+        while IFS= read -r a; do
+          [ -n "$a" ] || continue
+          san=$(printf '%s' "$a" | tr -c 'A-Za-z0-9_' '_')
+          echo "    {\"$a\", ''${san}_main},"
+        done < multicall/apps.list
+        cat <<'CBODY'
+    {0, 0}
+};
+static void copy_basename(char *dst, size_t cap, const char *src) {
+    const char *p = src, *s;
+    s = strrchr(p, '/'); if (s) p = s + 1;
+#ifdef _WIN32
+    s = strrchr(p, '\\'); if (s) p = s + 1;
+#endif
+    size_t n = strlen(p); if (n >= cap) n = cap - 1;
+    memcpy(dst, p, n); dst[n] = 0;
+    if (n > 4 && strcmp(dst + n - 4, ".exe") == 0) dst[n - 4] = 0;
+}
+CBODY
+        cat <<CBODY
+static int usage(const char *a0) {
+    fprintf(stderr, "${name}: multicall binary; usage: %s <applet> [args]\n", a0);
+    fprintf(stderr, "applets:");
+    for (const struct applet *a = applets; a->name; a++)
+        fprintf(stderr, " %s", a->name);
+    fprintf(stderr, "\n");
+    return 1;
+}
+int main(int argc, char **argv) {
+    char base[64];
+    const char *a0 = (argc > 0 && argv[0]) ? argv[0] : "${name}";
+    copy_basename(base, sizeof base, a0);
+    /* argv[0] shim: invoked under an applet name -> run it directly. */
+    for (const struct applet *a = applets; a->name; a++)
+        if (strcmp(base, a->name) == 0) return a->fn(argc, argv);
+    /* Any other name (canonical "${name}", a path, or a renamed copy like
+       CI's smoke.exe) -> take argv[1] as the applet, so renamed binaries and
+       the smoke test still dispatch. */
+    if (argc >= 2) {
+        copy_basename(base, sizeof base, argv[1]);
+        for (const struct applet *a = applets; a->name; a++)
+            if (strcmp(base, a->name) == 0) return a->fn(argc - 1, argv + 1);
+    }
+${fallbackC}
+}
+CBODY
+      } > multicall/dispatcher.c'';
+
+        # Recipe-A multicall dispatcher generator (the `ld -r` family:
+        # e2fsprogs/util-linux/shadow/findutils/procps-ng). Sibling to
+        # multicallDispatcherC; a SEPARATE helper because the input model differs
+        # fundamentally — these have a NAME→FUNCTION table that is many-to-one
+        # (e2fsprogs: mkfs.ext2/3/4 → mke2fs_main; e2label/findfs → tune2fs_main),
+        # so the symbol can't be derived from the applet name. The caller writes
+        # `multicall/applets.list` as a TSV, one row per dispatchable name:
+        #
+        #     <applet-name>\t<fn-base>      (the C symbol is <fn-base>_main)
+        #
+        # Aliases are just extra rows pointing at the same <fn-base> (the upstream
+        # tool re-checks argv[0] itself). util-linux/shadow/procps-ng already
+        # produce this TSV from their Makefile parse; e2fsprogs/findutils write it
+        # from a static list. The dispatcher this emits is uniform and permissive
+        # (was strict in util-linux/shadow/procps-ng — unified to recover the
+        # renamed-binary smoke, like the Recipe-B helper): strips a `/`/`\\` dir
+        # prefix (the `\\` is unconditional — cosmo APE argv[0] can carry it and
+        # `_WIN32` isn't defined for cosmo), a trailing `.exe`, and a libtool
+        # `lt-` prefix before matching. Invoke at COLUMN 0, after writing the TSV.
+        #
+        # Optional `defaultApplet` (a <fn-base>, NOT an applet name — its symbol
+        # `<defaultApplet>_main` must exist): a bare/unknown invocation runs it
+        # instead of printing usage. procps-ng uses `src_ps_pscommand` so that
+        # `procps-ng --version` and a renamed binary route to ps. See
+        # docs/multicall.md.
+        multicallTableDispatcherC = { name, defaultApplet ? null }:
+          let
+            fallbackC =
+              if defaultApplet == null
+              then ''    fprintf(stderr, "${name}: unknown applet '%s'\n", base);
+    return usage(a0);''
+              else ''    (void)usage;  /* defaultApplet replaces the usage() fallback */
+    return ${defaultApplet}_main(argc, argv);'';
+          in
+          ''
+      {
+        echo '#include <string.h>'
+        echo '#include <stdio.h>'
+        echo '#include <strings.h>'
+        while IFS="$(printf '\t')" read -r tool san; do
+          [ -n "$tool" ] || continue
+          echo "int ''${san}_main(int, char **);"
+        done < multicall/applets.list
+        echo 'struct applet { const char *name; int (*fn)(int, char **); };'
+        echo 'static const struct applet applets[] = {'
+        while IFS="$(printf '\t')" read -r tool san; do
+          [ -n "$tool" ] || continue
+          printf '    {"%s", %s_main},\n' "$tool" "$san"
+        done < multicall/applets.list
+        cat <<'CBODY'
+    {0, 0}
+};
+static void copy_basename(char *dst, size_t cap, const char *src) {
+    const char *p = src, *s;
+    s = strrchr(p, '/');  if (s) p = s + 1;
+    s = strrchr(p, '\\'); if (s) p = s + 1;   /* unconditional: cosmo APE argv[0] */
+    size_t n = strlen(p); if (n >= cap) n = cap - 1;
+    memcpy(dst, p, n); dst[n] = 0;
+    if (n > 4 && strcasecmp(dst + n - 4, ".exe") == 0) dst[n - 4] = 0;
+    if (strncmp(dst, "lt-", 3) == 0) memmove(dst, dst + 3, strlen(dst + 3) + 1);
+}
+CBODY
+        cat <<CBODY
+static int usage(const char *a0) {
+    fprintf(stderr, "${name}: multicall binary; usage: %s <applet> [args]\n", a0);
+    fprintf(stderr, "applets:");
+    for (const struct applet *a = applets; a->name; a++)
+        fprintf(stderr, " %s", a->name);
+    fprintf(stderr, "\n");
+    return 1;
+}
+int main(int argc, char **argv) {
+    char base[256];
+    const char *a0 = (argc > 0 && argv[0]) ? argv[0] : "${name}";
+    copy_basename(base, sizeof base, a0);
+    /* argv[0] shim: invoked under an applet name -> run it directly. */
+    for (const struct applet *a = applets; a->name; a++)
+        if (strcmp(base, a->name) == 0) return a->fn(argc, argv);
+    /* Any other name (canonical "${name}", a path, or a renamed copy like
+       CI's smoke.exe) -> take argv[1] as the applet, so renamed binaries and
+       the smoke test still dispatch. */
+    if (argc >= 2) {
+        copy_basename(base, sizeof base, argv[1]);
+        for (const struct applet *a = applets; a->name; a++)
+            if (strcmp(base, a->name) == 0) return a->fn(argc - 1, argv + 1);
+    }
+${fallbackC}
+}
+CBODY
+      } > multicall/dispatcher.c'';
+
         # Why not overlays for per-package fixes? `appendOverlays` invalidates
         # `pkgsBuildHost.stdenv` → cascade rebuild of compiler-rt-libc-static, ninja,
         # python3 in pkgsStatic-darwin (none cached; Hydra only builds pkgsStatic-linux).
