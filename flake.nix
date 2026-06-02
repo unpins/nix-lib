@@ -142,8 +142,17 @@
               else {
                 ${pkgName} = (appendLinkFlags super.${pkgName}
                   (lldStdOpts super)).overrideAttrs (old: {
+                  # Use the pre-`.extend` host lld (`basePkgs.buildPackages`),
+                  # NOT `super.buildPackages.lld`. In a cross scope `super` is
+                  # the *extended* pkgsStatic whose buildPackages carries this
+                  # very overlay; if pkgName is a build-foundational package
+                  # (e.g. bash, which lld's own llvm→python test closure pulls
+                  # in), `super.buildPackages.lld` → … → overridden bash → lld
+                  # is an infinite recursion. `basePkgs.buildPackages` is the
+                  # host set captured before the overlay, so its lld closure
+                  # uses the un-overridden bash — same lld binary, no cycle.
                   nativeBuildInputs = (old.nativeBuildInputs or [ ])
-                    ++ [ super.buildPackages.lld ];
+                    ++ [ basePkgs.buildPackages.lld ];
                 });
               });
           };
