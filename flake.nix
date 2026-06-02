@@ -48,19 +48,90 @@
               NIX_CFLAGS_COMPILE = flagStr;
             });
 
-        # Final-link `--gc-sections` flag for a downstream link that happens
-        # OUTSIDE the target pkg's own build (e.g. a multicall.nix post-link).
-        # Returns the flag only when `pkgs` carries the gc overlay marker
-        # (`optimize.gc = true` → mkPkgsGC tagged the scope with __unpinsGC);
-        # otherwise "" so non-gc packages' link commands stay byte-identical
-        # (hash-neutral). The function/data-sections that make this bite are
-        # applied chain-wide by the overlay; this is just the link-time prune.
-        # Darwin's ld uses `-dead_strip`, but the gc overlay is Linux-only, so
-        # in practice only the --gc-sections branch is ever reached today.
+        # Final-link flag set for a downstream link that happens OUTSIDE the
+        # target pkg's own build (e.g. a multicall.nix post-link). These are
+        # the unpins-standard linker options, applied uniformly:
+        #
+        #   * non-darwin  → lld is the linker (`-fuse-ld=lld`, GNU-compatible
+        #     LLVM linker; needs `lld` on PATH — see lldFinalLink), plus
+        #     `--gc-sections` (dead-section prune; benign without
+        #     function-sections, the real win comes from the gc overlay's
+        #     chain-wide -ffunction-sections on Linux-native) and
+        #     `--icf=safe` (fold identical address-not-taken functions; a
+        #     measured no-op on C, kept for catalog uniformity and the C++
+        #     template tools). `--icf=all`/`--ignore-data-address-equality`
+        #     deliberately NOT used: they break function/data-pointer identity
+        #     (~−1.3% on aom but risks silent miscompiles in codec tables).
+        #   * darwin      → "" (unchanged). The darwin compiler is clang + Apple
+        #     ld64 (not lld) and the unpins allowlist/codesign path is sensitive
+        #     to link changes, so we deliberately do NOT touch the mac link here.
+        #     (ld64 could atom-dead-strip via `-dead_strip`, but that's a
+        #     separate, mac-only change requiring its own rebuild + re-verify.)
+        #
+        # Only valid on a FULL link ($CC-driven), never on `ld -r` relocatable
+        # partial-links (--gc-sections/--icf error there) — hence this lives on
+        # the multicall post-link, not the global cc-wrapper.
+        #
+        # cosmo (Cosmopolitan APE; isWindows && !isMinGW) is excluded: cosmocc
+        # is its own toolchain and doesn't take `-fuse-ld=lld`. It keeps its
+        # native link (returns "").
+        isLLDTarget = pkgs:
+          let h = pkgs.stdenv.hostPlatform;
+          in !(h.isDarwin) && !(h.isWindows && !(h.isMinGW or false));
+        # `-B<lld>/bin` makes the compiler driver find `ld.lld` for
+        # `-fuse-ld=lld` WITHOUT needing lld on PATH — so this flag is fully
+        # self-sufficient and every multicall package gets the standard linker
+        # by just appending `${lib.gcSectionsFlag pkgs}` to its post-link, no
+        # per-package nativeBuildInputs edit. (lld/bin ships ld.lld/lld-link
+        # but no `ld`/`as`/`ar`, so -B can't shadow the binutils the build
+        # otherwise uses.)
         gcSectionsFlag = pkgs:
-          if !(pkgs.__unpinsGC or false) then ""
-          else if pkgs.stdenv.hostPlatform.isDarwin then "-Wl,-dead_strip"
-          else "-Wl,--gc-sections";
+          if isLLDTarget pkgs then
+            "-B${pkgs.buildPackages.lld}/bin -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe"
+          else "";
+
+        # `lld` build tool for the scope. gcSectionsFlag's `-B` already makes
+        # `ld.lld` findable, so this is only needed where a link uses
+        # `-fuse-ld=lld` WITHOUT going through gcSectionsFlag (e.g. the
+        # gc-overlay single-binary makeFlagsArray). Empty list off the lld
+        # targets (darwin keeps ld64, cosmo keeps cosmocc).
+        lldFinalLink = pkgs:
+          if isLLDTarget pkgs then [ pkgs.buildPackages.lld ]
+          else [ ];
+
+        # Append to NIX_CFLAGS_LINK (cc-wrapper LINK-time flags),
+        # structuredAttrs-aware like appendCFlags. Unlike NIX_LDFLAGS this
+        # reaches ONLY $CC-driven links, never a direct `ld -r`, so
+        # --gc-sections/--icf are safe to carry here.
+        appendLinkFlags = drv: flagStr:
+          drv.overrideAttrs (old:
+            if old ? env && old.env ? NIX_CFLAGS_LINK then {
+              env = old.env // { NIX_CFLAGS_LINK = old.env.NIX_CFLAGS_LINK + " " + flagStr; };
+            } else if old ? NIX_CFLAGS_LINK then {
+              NIX_CFLAGS_LINK = old.NIX_CFLAGS_LINK + " " + flagStr;
+            } else { NIX_CFLAGS_LINK = flagStr; });
+
+        # Make a build scope link `pkgName`'s final $CC link with lld + the
+        # standard options, via NIX_CFLAGS_LINK (build-system agnostic —
+        # cmake/meson/make all pass it to the cc-wrapper at link). Covers what
+        # the gc overlay (Linux-native only, makeFlagsArray) and gcSectionsFlag
+        # (multicall post-link) don't: SINGLE-BINARY packages on the cross
+        # targets. Also harmlessly covers multicall on those scopes (libXApps
+        # inherits pkgName's env; redundant with gcSectionsFlag). No-op on
+        # darwin/cosmo and when pkgName is absent. Returns a full pkgs scope
+        # (like mkPkgsGC) so `pkgs.pkgsStatic.<name>` reaches the overlay.
+        withLLDLink = pkgName: basePkgs:
+          basePkgs // {
+            pkgsStatic = basePkgs.pkgsStatic.extend (self: super:
+              if !(isLLDTarget super) || !(super ? ${pkgName}) then { }
+              else {
+                ${pkgName} = (appendLinkFlags super.${pkgName}
+                  "-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe").overrideAttrs (old: {
+                  nativeBuildInputs = (old.nativeBuildInputs or [ ])
+                    ++ [ super.buildPackages.lld ];
+                });
+              });
+          };
 
         # Remove .so/.dylib/.la/.dll/.dll.a from a drv's outputs; leave .a + headers + bins.
         # Build-system agnostic (postFixup, not configure flags).
@@ -1199,17 +1270,21 @@ CBODY
                 "darwin-x86_64" = stripped pkgs.pkgsCross.x86_64-darwin;
               }
               // nixpkgs.lib.optionalAttrs (nativeBuild && system == "x86_64-linux") {
-                "linux-i686" = stripped pkgs.pkgsCross.musl32;
+                # withLLDLink: the gc overlay (lld + --gc-sections/--icf) is
+                # Linux-native only, so the cross scopes get the unpins-standard
+                # lld link via NIX_CFLAGS_LINK here instead — keeps the linker
+                # uniform across every non-mac target (single-binary included).
+                "linux-i686" = stripped (withLLDLink pkgsAttr pkgs.pkgsCross.musl32);
                 # musl-power = powerpc64le-unknown-linux-musl. Debian calls it
                 # "ppc64el" but uname returns "ppc64le" and the Rust ecosystem
                 # (rustup, binstall) labels it the same way — we follow uname.
-                "linux-ppc64le" = stripped pkgs.pkgsCross.musl-power;
+                "linux-ppc64le" = stripped (withLLDLink pkgsAttr pkgs.pkgsCross.musl-power);
                 # riscv64 has no pre-cooked musl variant in nixpkgs.pkgsCross
                 # (only glibc). Spell the crossSystem out by triple.
-                "linux-riscv64" = stripped (import nixpkgs {
+                "linux-riscv64" = stripped (withLLDLink pkgsAttr (import nixpkgs {
                   inherit system;
                   crossSystem = { config = "riscv64-unknown-linux-musl"; };
-                });
+                }));
               }
               // nixpkgs.lib.optionalAttrs (nativeBuild && system == "aarch64-linux") {
                 # armv7l-hf-multiplatform = armv7l-unknown-linux-musleabihf,
@@ -1225,7 +1300,7 @@ CBODY
                 # (libssh2, glib ≥ 2.68, any modern threading wrapper)
                 # fails to link on armv6 with __atomic_*_8 undefined,
                 # since musl doesn't ship libatomic in pkgsStatic.
-                "linux-armv7l" = stripped pkgs.pkgsCross.armv7l-hf-multiplatform;
+                "linux-armv7l" = stripped (withLLDLink pkgsAttr pkgs.pkgsCross.armv7l-hf-multiplatform);
               }
               // nixpkgs.lib.optionalAttrs (windowsEnabled && system == "x86_64-linux") {
                 "windows-x86_64" = windowsPkg;

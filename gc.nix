@@ -69,8 +69,17 @@ let
       ${pkgName} = (withGC super.${pkgName}).overrideAttrs (old: {
         buildInputs = map withGC (old.buildInputs or [ ]);
         propagatedBuildInputs = map withGC (old.propagatedBuildInputs or [ ]);
+        # lld on PATH so the target's own final link resolves `-fuse-ld=lld`.
+        nativeBuildInputs = (old.nativeBuildInputs or [ ])
+          ++ [ super.buildPackages.lld ];
+        # Final-link flags via makeFlagsArray (make-time LDFLAGS), NOT
+        # NIX_LDFLAGS: the latter reaches `ld -r` partial-links where
+        # --gc-sections/--icf error. lld is the unpins linker for all
+        # non-darwin targets (the gc overlay is Linux-only, so the host here
+        # is always non-darwin); --icf=safe is a uniformity no-op, the size
+        # comes from --gc-sections biting the chain-wide function-sections.
         preBuild = (old.preBuild or "") + ''
-          makeFlagsArray+=("LDFLAGS=$LDFLAGS -Wl,--gc-sections")
+          makeFlagsArray+=("LDFLAGS=$LDFLAGS -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe")
         '';
       });
     };
