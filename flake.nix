@@ -48,6 +48,20 @@
               NIX_CFLAGS_COMPILE = flagStr;
             });
 
+        # Final-link `--gc-sections` flag for a downstream link that happens
+        # OUTSIDE the target pkg's own build (e.g. a multicall.nix post-link).
+        # Returns the flag only when `pkgs` carries the gc overlay marker
+        # (`optimize.gc = true` → mkPkgsGC tagged the scope with __unpinsGC);
+        # otherwise "" so non-gc packages' link commands stay byte-identical
+        # (hash-neutral). The function/data-sections that make this bite are
+        # applied chain-wide by the overlay; this is just the link-time prune.
+        # Darwin's ld uses `-dead_strip`, but the gc overlay is Linux-only, so
+        # in practice only the --gc-sections branch is ever reached today.
+        gcSectionsFlag = pkgs:
+          if !(pkgs.__unpinsGC or false) then ""
+          else if pkgs.stdenv.hostPlatform.isDarwin then "-Wl,-dead_strip"
+          else "-Wl,--gc-sections";
+
         # Remove .so/.dylib/.la/.dll/.dll.a from a drv's outputs; leave .a + headers + bins.
         # Build-system agnostic (postFixup, not configure flags).
         #
@@ -981,8 +995,9 @@ CBODY
           # interactive probe.
           , smoke ? null
           , smokePattern ? null
-          # optimize: knobs for opt-level / stack protector / LTO. Defaults
-          # merged with `{ lto = false; opt = null; ssp = true; }`. Keys:
+          # optimize: knobs for opt-level / stack protector / LTO / GC.
+          # Defaults merged with
+          # `{ lto = false; opt = null; ssp = true; gc = true; }`. Keys:
           #
           #   lto = true       → enable mkPkgsLTO overlay; chain-LTO consumer
           #                       + its level-1 buildInputs (Linux native
@@ -1003,18 +1018,38 @@ CBODY
           #                       resolved to -O2 inside the overlay.
           #   ssp = false      → drop stack protector + skip the LTO
           #                       `-Wl,-u,__stack_chk_fail` retention flag.
+          #   gc = false       → disable the function/data-sections +
+          #                       --gc-sections dead-code prune (mkPkgsGC,
+          #                       Linux native only). ON by default: it is a
+          #                       benign codegen knob (no LTO-class failures)
+          #                       that shrinks every binary 6-19% measured
+          #                       (jq 6%, aom 19% — the win scales with how
+          #                       much dead code the deps carry). LTO subsumes
+          #                       it (lto = true makes gc a no-op). NOTE for
+          #                       multicall packages whose `name` ≠ the nixpkgs
+          #                       attr: set `pkgsAttr` to the real lib (e.g.
+          #                       aom → "libaom") or the overlay finds nothing
+          #                       to rebuild and only the multicall final link
+          #                       gets --gc-sections (weak prune). The
+          #                       multicall.nix post-link must also append
+          #                       `${lib.gcSectionsFlag pkgs}` to reach that
+          #                       external link.
           , optimize ? { }
           }:
           let
-            optimize_ = { lto = false; opt = null; ssp = true; } // optimize;
-            inherit (optimize_) lto opt ssp;
+            optimize_ = { lto = false; opt = null; ssp = true; gc = true; } // optimize;
+            inherit (optimize_) lto opt ssp gc;
             ltoOpt = if opt == null then "-O2" else opt;
-            # LTO overlay applies on Linux only — musl is Linux-specific
-            # and the cross-darwin path doesn't have an analogous chain
-            # we want to rewire yet. Darwin/cross fall back to stock pkgs.
+            # LTO and GC overlays apply on Linux only — musl is Linux-specific
+            # and the cross-darwin path doesn't have an analogous chain we want
+            # to rewire yet. Darwin/cross fall back to stock pkgs. LTO already
+            # includes function/data-sections + --gc-sections, so it subsumes
+            # gc; when both are set, lto wins and gc is a no-op.
             nixpkgsFor = forAllNative (system:
               if lto && isLinuxSys system
               then mkPkgsLTO { inherit system; opt = ltoOpt; inherit ssp; pkgName = pkgsAttr; }
+              else if gc && isLinuxSys system
+              then mkPkgsGC { inherit system ssp opt; pkgName = pkgsAttr; }
               else import nixpkgs { inherit system; });
 
             # Apply opt/ssp knobs to a built drv. No-op when both at
@@ -1222,6 +1257,11 @@ CBODY
         # protector kept via -Wl,-u,__stack_chk_fail. See ./lto.nix.
         # Consumed by mkStandaloneFlake when `lto = true`.
         mkPkgsLTO = import ./lto.nix { inherit nixpkgs appendCFlags; };
+
+        # mkPkgsGC: pkgsStatic with a chain-wide function/data-sections overlay
+        # (cheap dead-code stripping; see gc.nix). Enabled via
+        # `optimize.gc = true`. Linux-native only.
+        mkPkgsGC = import ./gc.nix { inherit nixpkgs appendCFlags; };
 
         # Native cosmoStdenv. Used by playground/{bash,coreutils,dash,links} for
         # in-tree builds against the `$COSMOS` shared prefix. The full result is
