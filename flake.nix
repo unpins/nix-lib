@@ -585,8 +585,10 @@
         #     through to `argv[1]` as the applet — so renamed binaries AND the
         #     smoke test keep dispatching, without each package keying on its own
         #     name (the strict form some packages used had to drop smoke).
-        #   * Bare/unknown invocation prints `usage`, unless `defaultApplet` is
-        #     set (libwebp: a bare `libwebp` runs cwebp) — then it runs that.
+        #   * Bare invocation (and `--help`/`-h`/`help`) lists the programs on
+        #     stdout and exits 0; an unknown program name errors on stderr and
+        #     exits 1. Unless `defaultApplet` is set (libwebp: a bare `libwebp`
+        #     runs cwebp) — then bare/unknown runs that, listing is unreachable.
         #
         # Params: `name` (banner + default argv0) and optional `defaultApplet`.
         # The list source / sanitiser / fallback-style that used to vary per
@@ -604,9 +606,16 @@
               (if defaultApplet == null then "" else defaultApplet);
             fallbackC =
               if defaultApplet == null
-              then ''        fprintf(stderr, "${name}: unknown applet '%s'\n", base);
-        return usage(a0);''
-              else ''        (void)usage;  /* defaultApplet replaces the usage() fallback */
+              then ''        if (argc < 2) { list_programs(stdout); return 0; }
+        if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") || !strcmp(argv[1], "help")) {
+            list_programs(stdout); return 0;
+        }
+        fprintf(stderr, "${name}: no program '%s'. Available:", base);
+        for (const struct applet *a = applets; a->name; a++)
+            fprintf(stderr, "%s%s", a == applets ? " " : ", ", a->name);
+        fprintf(stderr, "\n");
+        return 1;''
+              else ''        (void)list_programs;  /* defaultApplet replaces the listing fallback */
         return ${sanDefault}_main(argc, argv);'';
           in
           ''
@@ -640,13 +649,11 @@ static void copy_basename(char *dst, size_t cap, const char *src) {
 }
 CBODY
         cat <<CBODY
-static int usage(const char *a0) {
-    fprintf(stderr, "${name}: multicall binary; usage: %s <applet> [args]\n", a0);
-    fprintf(stderr, "applets:");
+static void list_programs(FILE *out) {
+    fprintf(out, "${name} is one binary with several programs:");
     for (const struct applet *a = applets; a->name; a++)
-        fprintf(stderr, " %s", a->name);
-    fprintf(stderr, "\n");
-    return 1;
+        fprintf(out, "%s%s", a == applets ? " " : ", ", a->name);
+    fprintf(out, "\nRun one: ${name} <program> [args...]\n");
 }
 int main(int argc, char **argv) {
     char base[64];
@@ -697,9 +704,16 @@ CBODY
           let
             fallbackC =
               if defaultApplet == null
-              then ''    fprintf(stderr, "${name}: unknown applet '%s'\n", base);
-    return usage(a0);''
-              else ''    (void)usage;  /* defaultApplet replaces the usage() fallback */
+              then ''    if (argc < 2) { list_programs(stdout); return 0; }
+    if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") || !strcmp(argv[1], "help")) {
+        list_programs(stdout); return 0;
+    }
+    fprintf(stderr, "${name}: no program '%s'. Available:", base);
+    for (const struct applet *a = applets; a->name; a++)
+        fprintf(stderr, "%s%s", a == applets ? " " : ", ", a->name);
+    fprintf(stderr, "\n");
+    return 1;''
+              else ''    (void)list_programs;  /* defaultApplet replaces the listing fallback */
     return ${defaultApplet}_main(argc, argv);'';
           in
           ''
@@ -731,13 +745,11 @@ static void copy_basename(char *dst, size_t cap, const char *src) {
 }
 CBODY
         cat <<CBODY
-static int usage(const char *a0) {
-    fprintf(stderr, "${name}: multicall binary; usage: %s <applet> [args]\n", a0);
-    fprintf(stderr, "applets:");
+static void list_programs(FILE *out) {
+    fprintf(out, "${name} is one binary with several programs:");
     for (const struct applet *a = applets; a->name; a++)
-        fprintf(stderr, " %s", a->name);
-    fprintf(stderr, "\n");
-    return 1;
+        fprintf(out, "%s%s", a == applets ? " " : ", ", a->name);
+    fprintf(out, "\nRun one: ${name} <program> [args...]\n");
 }
 int main(int argc, char **argv) {
     char base[256];
