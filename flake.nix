@@ -75,9 +75,24 @@
         # cosmo (Cosmopolitan APE; isWindows && !isMinGW) is excluded: cosmocc
         # is its own toolchain and doesn't take `-fuse-ld=lld`. It keeps its
         # native link (returns "").
+        # Which targets use lld (the unpins standard linker). Excludes:
+        #   * darwin → clang + Apple ld64 (allowlist/codesign is link-sensitive)
+        #   * cosmo (isWindows && !isMinGW) → cosmocc, its own toolchain
+        #   * riscv64 → lld can't link our C++ codec chains here: it emits
+        #     "relocation refers to a symbol in a discarded section" (.L data
+        #     and .LEHE C++ landing-pad labels) even with NO --gc-sections/--icf
+        #     — a RISC-V linker-relaxation × section-discard bug in lld that
+        #     GNU ld doesn't have. avif fails to link; the C-only aom happened
+        #     to survive, but "lld for C but GNU for C++" is too fragile a
+        #     split, so riscv64 stays on GNU ld wholesale (size-neutral — lld's
+        #     options don't bite on the crosses anyway).
         isLLDTarget = pkgs:
           let h = pkgs.stdenv.hostPlatform;
-          in !(h.isDarwin) && !(h.isWindows && !(h.isMinGW or false));
+          in !(h.isDarwin)
+          && !(h.isWindows && !(h.isMinGW or false))
+          && !(h.isRiscV or false);
+        # The unpins-standard lld options for a non-darwin final link.
+        lldStdOpts = _: "-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe";
         # `-B<lld>/bin` makes the compiler driver find `ld.lld` for
         # `-fuse-ld=lld` WITHOUT needing lld on PATH — so this flag is fully
         # self-sufficient and every multicall package gets the standard linker
@@ -87,7 +102,7 @@
         # otherwise uses.)
         gcSectionsFlag = pkgs:
           if isLLDTarget pkgs then
-            "-B${pkgs.buildPackages.lld}/bin -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe"
+            "-B${pkgs.buildPackages.lld}/bin ${lldStdOpts pkgs}"
           else "";
 
         # `lld` build tool for the scope. gcSectionsFlag's `-B` already makes
@@ -126,7 +141,7 @@
               if !(isLLDTarget super) || !(super ? ${pkgName}) then { }
               else {
                 ${pkgName} = (appendLinkFlags super.${pkgName}
-                  "-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe").overrideAttrs (old: {
+                  (lldStdOpts super)).overrideAttrs (old: {
                   nativeBuildInputs = (old.nativeBuildInputs or [ ])
                     ++ [ super.buildPackages.lld ];
                 });
