@@ -3,7 +3,7 @@
 
   # Bundled so consumers don't redeclare; bump propagates to every unpins/*.
   # Override via `inputs.unpins-lib.inputs.nixpkgs.follows = "nixpkgs"`.
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
   outputs = { self, nixpkgs }:
     let
@@ -91,7 +91,7 @@
         # functional with zero data files. See docs/runtime-data.md for
         # the "complete coverage" path (data archive) — not yet wired.
         #
-        # Modern entries that ncurses 6.5 (nixpkgs 25.11) doesn't ship
+        # Modern entries that ncurses 6.6 (nixpkgs 26.05) doesn't ship
         # — `xterm-ghostty`, `xterm-kitty`, `rxvt-unicode*` — come from
         # `extra-terminfo.src` (appended pre-tic via
         # `embedFallbackTerminfo*`'s postPatch). The `xterm-…` aliases
