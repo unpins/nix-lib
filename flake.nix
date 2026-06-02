@@ -437,10 +437,15 @@
         # `manRoot`: when null, harvest man from the drv's own outputs
         # (`$man`/`$out`) — the native path, where the static build produces
         # man. When set to a store path, read `$manRoot/share/man` instead —
-        # used by the windows/cosmo path, where the cross build ships no man
-        # so we source the (platform-independent) pages from a man-bearing
-        # build of the same package + version.
-        withMan = pkgs: { primary, manRoot ? null }: drv:
+        # an explicit external override (consumer-supplied `winManRoot`).
+        # `manFallback`: optional store path consulted ONLY on the harvest-own
+        # path (manRoot == null) when the drv ships no man of its own — the
+        # windows/cosmo default, where most cross builds DO install their own
+        # man (pre-generated roff in the tarball), but the rare help2man-driven
+        # package produces none and borrows version-locked pages from a
+        # man-bearing nixpkgs build. Leaving manFallback null keeps the native
+        # path byte-identical (the fallback block emits nothing).
+        withMan = pkgs: { primary, manRoot ? null, manFallback ? null }: drv:
           let
             binOutputName =
               let outs = drv.outputs or [ "out" ];
@@ -476,7 +481,17 @@
                   if [ -n "$__unpin_d" ] && [ -d "$__unpin_d/share/man" ]; then
                     __unpin_manroot="$__unpin_d"; break
                   fi
-                done
+                done${nixpkgs.lib.optionalString (manFallback != null) ''
+
+                # Cross build shipped no man pages of its own — either no
+                # share/man at all, or a share/man with no actual pages (e.g. a
+                # prune emptied man1/ and left only an empty tree). Borrow the
+                # version-locked pages from a man-bearing build (windows graft).
+                if [ -d "${manFallback}/share/man" ] \
+                   && { [ -z "$__unpin_manroot" ] \
+                        || ! find "$__unpin_manroot/share/man" \( -type f -o -type l \) 2>/dev/null | grep -q .; }; then
+                  __unpin_manroot="${manFallback}"
+                fi''}
               ''}
               if [ -z "$__unpin_manroot" ]; then
                 echo "withMan: no share/man found for ${primary}, skipping" >&2
@@ -1096,15 +1111,26 @@ CBODY
             winManNixpkgs = nixpkgs.legacyPackages.${"x86_64-linux"};
             # `winManRoot` (package opt-in) wins: embed exactly the curated set
             # the package supplies. Otherwise fall back to the nixpkgs graft.
-            winManSrc =
-              if winManRoot != null then winManRoot
-              else let p = winManNixpkgs.${pkgsAttr} or null;
-                   in if p == null then null else (p.man or p.out or p);
+            # Windows man source. An explicit consumer `winManRoot` wins
+            # outright (curated tree, unchanged behavior). Otherwise the
+            # windows build harvests its OWN share/man — symmetric with every
+            # cross-linux target, which already does this — and borrows the
+            # version-locked nixpkgs graft ONLY when the cross build ships no
+            # man of its own (the rare help2man-driven package). `winManGraft`
+            # is null for custom-named multicall packages (no matching nixpkgs
+            # attr); those harvest-own-or-nothing, same as today.
+            winManGraft =
+              let p = winManNixpkgs.${pkgsAttr} or null;
+              in if p == null then null else (p.man or p.out or p);
             windowsBase = dropSharedLibs (applyOptSsp (windowsRawBuild windowsPkgs));
             windowsWithMan =
-              if embedMan && winManSrc != null
-              then withMan windowsPkgs { primary = binName; manRoot = "${winManSrc}"; } windowsBase
-              else windowsBase;
+              if !embedMan then windowsBase
+              else if winManRoot != null
+              then withMan windowsPkgs { primary = binName; manRoot = "${winManRoot}"; } windowsBase
+              else withMan windowsPkgs {
+                primary = binName;
+                manFallback = if winManGraft == null then null else "${winManGraft}";
+              } windowsBase;
             # Trim cosmo's unused `.symtab.amd64` (no-op on mingw). Runs after
             # withMan so the man block is already embedded.
             windowsTrimmed = withCosmoStrip windowsPkgs { primary = binName; } windowsWithMan;
