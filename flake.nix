@@ -1360,7 +1360,7 @@ CBODY
         # mkPkgsGC: pkgsStatic with a chain-wide function/data-sections overlay
         # (cheap dead-code stripping; see gc.nix). Enabled via
         # `optimize.gc = true`. Linux-native only.
-        mkPkgsGC = import ./gc.nix { inherit nixpkgs appendCFlags; };
+        mkPkgsGC = import ./gc.nix { inherit nixpkgs appendCFlags appendLinkFlags; };
 
         # Native cosmoStdenv. Used by playground/{bash,coreutils,dash,links} for
         # in-tree builds against the `$COSMOS` shared prefix. The full result is

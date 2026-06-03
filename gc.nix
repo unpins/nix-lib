@@ -26,7 +26,7 @@
 # `withCFlags` on stdenv re-runs the nixpkgs bootstrap fixed-point and blows up
 # in bootstrap-stage2-gcc-wrapper. The overlay touches only the target scope.
 
-{ nixpkgs, appendCFlags }:
+{ nixpkgs, appendCFlags, appendLinkFlags }:
 
 { system ? "x86_64-linux"
 , ssp ? true
@@ -66,22 +66,34 @@ let
     then { __unpinsGC = true; }
     else {
       __unpinsGC = true;
-      ${pkgName} = (withGC super.${pkgName}).overrideAttrs (old: {
-        buildInputs = map withGC (old.buildInputs or [ ]);
-        propagatedBuildInputs = map withGC (old.propagatedBuildInputs or [ ]);
-        # lld on PATH so the target's own final link resolves `-fuse-ld=lld`.
-        nativeBuildInputs = (old.nativeBuildInputs or [ ])
-          ++ [ super.buildPackages.lld ];
-        # Final-link flags via makeFlagsArray (make-time LDFLAGS), NOT
-        # NIX_LDFLAGS: the latter reaches `ld -r` partial-links where
-        # --gc-sections/--icf error. lld is the unpins linker for all
-        # non-darwin targets (the gc overlay is Linux-only, so the host here
-        # is always non-darwin); --icf=safe is a uniformity no-op, the size
-        # comes from --gc-sections biting the chain-wide function-sections.
-        preBuild = (old.preBuild or "") + ''
-          makeFlagsArray+=("LDFLAGS=$LDFLAGS -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe")
-        '';
-      });
+      # Two final-link channels, both safe (neither reaches a direct `ld -r`
+      # partial-link, where --gc-sections/--icf would error):
+      #   * makeFlagsArray LDFLAGS — make-time, reaches autotools/make final
+      #     links ($CC). CMake/meson IGNORE `make LDFLAGS=` (they bake link
+      #     flags at configure), so a CMake/meson single-binary would silently
+      #     fall back to GNU ld with no --gc-sections.
+      #   * NIX_CFLAGS_LINK (appendLinkFlags, env-aware) — the cc-wrapper
+      #     link channel that EVERY $CC-driven link honors (make, CMake,
+      #     meson), and which never touches a direct `ld -r`. This is what
+      #     makes CMake/meson single-binary targets actually use lld + gc.
+      # make/autotools packages get both (idempotent: doubled -fuse-ld=lld /
+      # --gc-sections / --icf=safe is harmless). lld is the unpins linker for
+      # all non-darwin targets (this overlay is Linux-only → host is always
+      # non-darwin); --icf=safe is a uniformity no-op, the size win comes from
+      # --gc-sections biting the chain-wide function-sections. `-B<lld>/bin`
+      # makes ld.lld findable for the NIX_CFLAGS_LINK path even though lld is
+      # also on PATH via nativeBuildInputs (belt-and-suspenders).
+      ${pkgName} = appendLinkFlags
+        ((withGC super.${pkgName}).overrideAttrs (old: {
+          buildInputs = map withGC (old.buildInputs or [ ]);
+          propagatedBuildInputs = map withGC (old.propagatedBuildInputs or [ ]);
+          nativeBuildInputs = (old.nativeBuildInputs or [ ])
+            ++ [ super.buildPackages.lld ];
+          preBuild = (old.preBuild or "") + ''
+            makeFlagsArray+=("LDFLAGS=$LDFLAGS -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe")
+          '';
+        }))
+        "-B${super.buildPackages.lld}/bin -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe";
     };
 in
 # Return a full pkgs scope (mirror of `import nixpkgs {...}`) so consumers
