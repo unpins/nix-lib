@@ -165,6 +165,54 @@
           if isLLDTarget pkgs then [ (lldRSafe pkgs.buildPackages) ]
           else [ ];
 
+        # nixos-26.05 meson (glib 2.88, pango 1.57, harfbuzz, gdk-pixbuf, …)
+        # evaluates `subsystem = host_machine.subsystem()` on darwin; in CROSS
+        # mode meson can't autodetect it and aborts
+        #   ERROR: Subsystem not defined or could not be autodetected
+        # and nixpkgs' generated cross-file (build-support/lib/meson.nix
+        # [host_machine]) omits `subsystem`. This hits EVERY meson package in a
+        # genuine darwin cross (CI's x86_64-darwin via Rosetta on macos-14;
+        # local aarch64-darwin via build-aarch64-darwin), so fix it once at the
+        # `meson` tool rather than per-package: ship an extra setup-hook that,
+        # WHEN a cross-file is already in play (i.e. a real cross — guard so we
+        # never force cross mode onto a native build), appends a supplemental
+        # cross-file re-emitting the COMPLETE [host_machine] + subsystem='macos'
+        # (meson REPLACES [host_machine] across files — a partial one drops
+        # system/cpu/endian → "Machine info is currently {'subsystem'…}").
+        # Native darwin builds (no cross-file) skip it; the per-package objc
+        # nativeFixes (glib/pango) carry their own complete section for the
+        # objc-forced-cross case. Applied only to the darwin scope's meson.
+        darwinMesonSubsystemScope = pkgs:
+          let
+            bp = pkgs.buildPackages;
+            hp = pkgs.stdenv.hostPlatform;
+            cpuFamily = if hp.isAarch64 then "aarch64" else "x86_64";
+            hook = bp.makeSetupHook { name = "meson-darwin-subsystem-hook"; }
+              (bp.writeText "meson-darwin-subsystem-hook.sh" ''
+                _unpinsMesonDarwinSubsystem() {
+                  case " ''${mesonFlags:-} ''${mesonFlagsArray[*]:-} " in
+                    *--cross-file*) ;;
+                    *) return 0 ;;
+                  esac
+                  cat > "$NIX_BUILD_TOP/unpins-darwin-subsystem.ini" <<EOF
+                [host_machine]
+                system = 'darwin'
+                cpu_family = '${cpuFamily}'
+                cpu = '${hp.parsed.cpu.name}'
+                endian = 'little'
+                subsystem = 'macos'
+                EOF
+                  mesonFlagsArray+=("--cross-file=$NIX_BUILD_TOP/unpins-darwin-subsystem.ini")
+                }
+                preConfigureHooks+=(_unpinsMesonDarwinSubsystem)
+              '');
+          in
+          pkgs.extend (_final: prev: {
+            meson = prev.meson.overrideAttrs (o: {
+              propagatedBuildInputs = (o.propagatedBuildInputs or [ ]) ++ [ hook ];
+            });
+          });
+
         # Append to NIX_CFLAGS_LINK (cc-wrapper LINK-time flags),
         # structuredAttrs-aware like appendCFlags. Unlike NIX_LDFLAGS this
         # reaches ONLY $CC-driven links, never a direct `ld -r`, so
@@ -189,7 +237,24 @@
         withLLDLink = pkgName: basePkgs:
           basePkgs // {
             pkgsStatic = basePkgs.pkgsStatic.extend (self: super:
-              if !(isLLDTarget super) || !(super ? ${pkgName}) then { }
+              # `super` here is the static cross scope, but the same overlay is
+              # re-evaluated for `pkgsStatic.buildPackages` (nixpkgs threads
+              # overlays through the build-platform set). There `super` is the
+              # NATIVE glibc host — and a cross build that references
+              # `buildPackages.${pkgName}` (e.g. coreutils' Makefile `INSTALL =
+              # ${buildPackages.coreutils}/bin/install`, or its man-copy from
+              # `buildPackages.coreutils-full`) would then build that native
+              # glibc tool WITH lld + --gc-sections. That breaks a glibc binary
+              # that dynamically links e.g. libacl: --gc-sections/lld drops the
+              # libacl.so.1 RUNPATH, so the tool fails to run at its own
+              # help2man man-gen (`error while loading shared libraries:
+              # libacl.so.1`). The flags only make sense for the static-musl
+              # TARGET (static libacl, nothing to load at runtime), so gate on
+              # isStatic — exactly as gc.nix does. Build-platform tools fall
+              # back to stock (cache.nixos.org hit), which is what we want.
+              if !(isLLDTarget super)
+                 || !(super.stdenv.hostPlatform.isStatic or false)
+                 || !(super ? ${pkgName}) then { }
               else {
                 ${pkgName} = (appendLinkFlags super.${pkgName}
                   (lldStdOpts super)).overrideAttrs (old: {
@@ -1198,6 +1263,8 @@ CBODY
               then mkPkgsLTO { inherit system; opt = ltoOpt; inherit ssp; pkgName = pkgsAttr; }
               else if gc && isLinuxSys system
               then mkPkgsGC { inherit system ssp opt; pkgName = pkgsAttr; }
+              else if isDarwinSys system
+              then darwinMesonSubsystemScope (import nixpkgs { inherit system; })
               else import nixpkgs { inherit system; });
 
             # Apply opt/ssp knobs to a built drv. No-op when both at

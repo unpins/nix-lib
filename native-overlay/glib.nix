@@ -21,15 +21,41 @@
 # `[binaries].objc{,pp}` entries is safe and leaves the primary cross-file
 # untouched. Reusable for any other glib/gobject-introspection/libsoup-
 # class meson package that pulls darwin objc.
+#
+# Second darwin fix (nixos-26.05, glib 2.88.1): meson.build:84 does
+# `subsystem = host_machine.subsystem()` under `host_system == 'darwin'`.
+# In cross mode meson can't autodetect the subsystem and aborts with
+#   ERROR: Subsystem not defined or could not be autodetected
+# (a native build on a Mac autodetects it; our linux→darwin cross-eval
+# can't). nixpkgs' generated cross-file's `[host_machine]` omits it, so we
+# merge `subsystem = 'macos'` into host_machine via the same extra
+# cross-file (meson merges sections per-key, so a partial [host_machine]
+# just adds the one key). Both unpins darwin targets are desktop macOS.
 { lib }:
 pkgs:
 if pkgs.stdenv.hostPlatform.isDarwin then
+  let
+    hp = pkgs.stdenv.hostPlatform;
+    # Mirror nixpkgs' generated [host_machine] (build-support/lib/meson.nix):
+    # meson REPLACES a section when a later --cross-file redefines it (it does
+    # not merge [host_machine] per-key), so a partial file with only
+    # `subsystem` drops system/cpu/endian and meson aborts "Machine info is
+    # currently {'subsystem': 'macos'}". Re-emit the full section + subsystem.
+    cpuFamily = if hp.isAarch64 then "aarch64" else "x86_64";
+  in
   pkgs.glib.overrideAttrs (oa: {
     preConfigure = (oa.preConfigure or "") + ''
       cat > "$NIX_BUILD_TOP/objc-cross.conf" <<EOF
       [binaries]
       objc = '$CC'
       objcpp = '$CXX'
+
+      [host_machine]
+      system = 'darwin'
+      cpu_family = '${cpuFamily}'
+      cpu = '${hp.parsed.cpu.name}'
+      endian = 'little'
+      subsystem = 'macos'
       EOF
       mesonFlagsArray+=("--cross-file=$NIX_BUILD_TOP/objc-cross.conf")
     '';

@@ -23,6 +23,17 @@
 #    archive resolves the pending refs. x86 never trips this
 #    (`__clear_cache` is a no-op there).
 #
+# 3b. `-lshell32` (mingw). nixos-26.05's glib 2.88.1 grew win32 shell
+#    integration in gio (gwin32appinfo.c / gwin32mount.c /
+#    gwin32notificationbackend.c / glocalfile.c), whose objects are archived
+#    into librsvg's rlib and reference shell32 APIs (`SHFileOperationW`,
+#    `CommandLineToArgvW`, `SHGetKnownFolderPath`, `Shell_NotifyIconW`,
+#    `SHGetDesktopFolder`, `SHBindToParent`, `SHParseDisplayName`,
+#    `SHCreateShellItemArrayFromIDLists`). gio-2.0.pc's Libs.private never
+#    listed `-lshell32`, so the rsvg-convert link dies with `undefined
+#    reference to __imp_SH*`. Same rustflags channel as #3 — append
+#    `-lshell32` to the cargo link. See [[feedback_mingw_libs_private_winapis]].
+#
 # 4. doCheck restricted to x86_64-linux. nixpkgs gates librsvg's test suite
 #    on `!isDarwin && !isi686`, so it still runs on aarch64/riscv64/armv7l.
 #    There the doctest link hits the same `__clear_cache` gap (rustdoc reads
@@ -69,11 +80,16 @@ pkgs.librsvg.overrideAttrs (oa: {
     ++ lib.optionals (!isMinGW) [ pkgs.libunwind ];
   propagatedBuildInputs = (oa.propagatedBuildInputs or [ ]) ++ [ pkgs.pango ];
 
-  # See fix #3 above.
-  preBuild = (oa.preBuild or "") + lib.optionalString needsClearCache ''
-    cfg=$(grep -rl --include=config.toml '"rustflags"' "$NIX_BUILD_TOP" | head -1)
-    sed -i 's|"rustflags" = \[|"rustflags" = [ "-Clink-arg=-lgcc",|g' "$cfg"
-  '';
+  # See fix #3 / #3b above.
+  preBuild = (oa.preBuild or "")
+    + lib.optionalString needsClearCache ''
+      cfg=$(grep -rl --include=config.toml '"rustflags"' "$NIX_BUILD_TOP" | head -1)
+      sed -i 's|"rustflags" = \[|"rustflags" = [ "-Clink-arg=-lgcc",|g' "$cfg"
+    ''
+    + lib.optionalString isMinGW ''
+      cfg=$(grep -rl --include=config.toml '"rustflags"' "$NIX_BUILD_TOP" | head -1)
+      sed -i 's|"rustflags" = \[|"rustflags" = [ "-Clink-arg=-lshell32",|g' "$cfg"
+    '';
 
   # See fix #5 above. Must be preConfigure: meson's find_library('gcc_s')
   # probe runs during the configure phase, before preBuild.
