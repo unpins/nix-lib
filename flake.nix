@@ -170,19 +170,24 @@
         # mode meson can't autodetect it and aborts
         #   ERROR: Subsystem not defined or could not be autodetected
         # and nixpkgs' generated cross-file (build-support/lib/meson.nix
-        # [host_machine]) omits `subsystem`. This hits EVERY meson package in a
-        # genuine darwin cross (CI's x86_64-darwin via Rosetta on macos-14;
-        # local aarch64-darwin via build-aarch64-darwin), so fix it once at the
-        # `meson` tool rather than per-package: ship an extra setup-hook that,
-        # WHEN a cross-file is already in play (i.e. a real cross — guard so we
-        # never force cross mode onto a native build), appends a supplemental
-        # cross-file re-emitting the COMPLETE [host_machine] + subsystem='macos'
-        # (meson REPLACES [host_machine] across files — a partial one drops
-        # system/cpu/endian → "Machine info is currently {'subsystem'…}").
-        # Native darwin builds (no cross-file) skip it; the per-package objc
-        # nativeFixes (glib/pango) carry their own complete section for the
-        # objc-forced-cross case. Applied only to the darwin scope's meson.
-        darwinMesonSubsystemScope = pkgs:
+        # [host_machine]) omits `subsystem`. When a cross-file is already in play
+        # (a real cross — guard so we never force cross mode onto a native build)
+        # this appends a supplemental cross-file re-emitting the COMPLETE
+        # [host_machine] + subsystem='macos' (meson REPLACES [host_machine]
+        # across files — a partial one drops system/cpu/endian → "Machine info
+        # is currently {'subsystem'…}").
+        #
+        # ATTACH PER-PACKAGE, never by overriding the global `meson`. gnutar's
+        # checkPhase closure transitively pulls `meson`, so ANY change to the
+        # `meson` derivation (even its propagatedBuildInputs) re-hashes the whole
+        # darwin stdenv closure — gnutar included — forcing a from-source rebuild
+        # on the GHA macos-14 runner where gnutar test 155 (time01 "tricky time
+        # stamps") fails, cascading to EVERY darwin build. So the setup-hook
+        # rides the CONSUMING package's own nativeBuildInputs; the cached
+        # stdenv/gnutar stay untouched. The per-package objc nativeFixes
+        # (glib/pango/cairo) already carry their own complete [host_machine]
+        # section; apply this to any other meson package that needs it.
+        withDarwinMesonSubsystem = pkgs: drv:
           let
             bp = pkgs.buildPackages;
             hp = pkgs.stdenv.hostPlatform;
@@ -207,10 +212,8 @@
                 preConfigureHooks+=(_unpinsMesonDarwinSubsystem)
               '');
           in
-          pkgs.extend (_final: prev: {
-            meson = prev.meson.overrideAttrs (o: {
-              propagatedBuildInputs = (o.propagatedBuildInputs or [ ]) ++ [ hook ];
-            });
+          drv.overrideAttrs (o: {
+            nativeBuildInputs = (o.nativeBuildInputs or [ ]) ++ [ hook ];
           });
 
         # Append to NIX_CFLAGS_LINK (cc-wrapper LINK-time flags),
@@ -1263,8 +1266,6 @@ CBODY
               then mkPkgsLTO { inherit system; opt = ltoOpt; inherit ssp; pkgName = pkgsAttr; }
               else if gc && isLinuxSys system
               then mkPkgsGC { inherit system ssp opt; pkgName = pkgsAttr; }
-              else if isDarwinSys system
-              then darwinMesonSubsystemScope (import nixpkgs { inherit system; })
               else import nixpkgs { inherit system; });
 
             # Apply opt/ssp knobs to a built drv. No-op when both at
