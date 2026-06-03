@@ -26,7 +26,7 @@
 # `withCFlags` on stdenv re-runs the nixpkgs bootstrap fixed-point and blows up
 # in bootstrap-stage2-gcc-wrapper. The overlay touches only the target scope.
 
-{ nixpkgs, appendCFlags, appendLinkFlags }:
+{ nixpkgs, appendCFlags, appendLinkFlags, lldRSafe }:
 
 { system ? "x86_64-linux"
 , ssp ? true
@@ -87,13 +87,16 @@ let
         ((withGC super.${pkgName}).overrideAttrs (old: {
           buildInputs = map withGC (old.buildInputs or [ ]);
           propagatedBuildInputs = map withGC (old.propagatedBuildInputs or [ ]);
+          # lldRSafe = the -r-safe ld.lld wrapper (strips --icf on relocatable
+          # links): both channels below carry --icf=safe, which would abort a
+          # `$CC -r` partial-link (e.g. busybox's kbuild built-in.o) otherwise.
           nativeBuildInputs = (old.nativeBuildInputs or [ ])
-            ++ [ super.buildPackages.lld ];
+            ++ [ (lldRSafe super.buildPackages) ];
           preBuild = (old.preBuild or "") + ''
             makeFlagsArray+=("LDFLAGS=$LDFLAGS -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe")
           '';
         }))
-        "-B${super.buildPackages.lld}/bin -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe";
+        "-B${lldRSafe super.buildPackages}/bin -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe";
     };
 in
 # Return a full pkgs scope (mirror of `import nixpkgs {...}`) so consumers

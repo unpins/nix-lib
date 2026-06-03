@@ -86,11 +86,62 @@
         #     to survive, but "lld for C but GNU for C++" is too fragile a
         #     split, so riscv64 stays on GNU ld wholesale (size-neutral — lld's
         #     options don't bite on the crosses anyway).
+        # Which targets use lld (the unpins standard linker). Excludes the
+        # two exotic cross arches whose lld backend has linker bugs GNU ld
+        # doesn't — both stay on GNU ld (size-neutral: lld gives no size win
+        # on the crosses, the gc gain is Linux-native only):
+        #   * riscv64 → lld emits "relocation refers to a symbol in a
+        #     discarded section" (RISC-V relaxation × section-discard) even
+        #     without --gc-sections/--icf.
+        #   * ppc64le → lld doesn't synthesize the PowerPC out-of-line FP
+        #     save/restore routines (_savefpr_*/_restfpr_*, libgcc crtsavres)
+        #     that GNU ld generates on demand, so any FP-heavy static link
+        #     (e.g. busybox's awk/decompress) fails with undefined _restfpr_N.
         isLLDTarget = pkgs:
           let h = pkgs.stdenv.hostPlatform;
           in !(h.isDarwin)
           && !(h.isWindows && !(h.isMinGW or false))
-          && !(h.isRiscV or false);
+          && !(h.isRiscV or false)
+          && !(h.isPower or false);
+
+        # `ld.lld` aborts on a relocatable link that also carries `--icf`
+        # ("-r and --icf may not be used together"). lldStdOpts carries
+        # `--icf=safe`, and it reaches EVERY $CC link via NIX_CFLAGS_LINK /
+        # makeFlagsArray — including the `$CC -r` relocatable partial-links
+        # some build systems emit (busybox's kbuild links applets/built-in.o
+        # that way). `--gc-sections` is -r-safe (lld ignores it on a
+        # relocatable link); only `--icf` is fatal. So wrap ld.lld: strip
+        # `--icf*` when the args contain -r/-i/--relocatable, pass everything
+        # else straight through. The wrapper dir symlinks the rest of lld/bin,
+        # so it's a drop-in target for `-B<dir>` and PATH — `-fuse-ld=lld`
+        # resolves to the wrapper. `buildPkgs` is the build-platform scope
+        # holding lld/bash/runCommand; callers pass the recursion-safe one
+        # (e.g. `basePkgs.buildPackages` in a cross scope, see withLLDLink).
+        lldRSafe = buildPkgs:
+          buildPkgs.runCommand "lld-rsafe-${buildPkgs.lld.version}" { } ''
+            mkdir -p $out/bin
+            for f in ${buildPkgs.lld}/bin/*; do
+              ln -s "$f" "$out/bin/$(basename "$f")"
+            done
+            rm -f $out/bin/ld.lld
+            cat > $out/bin/ld.lld <<'WRAP'
+            #!${buildPkgs.bash}/bin/bash
+            reloc=0
+            for a in "$@"; do
+              case "$a" in -r|--relocatable|-i) reloc=1 ;; esac
+            done
+            if [ "$reloc" = 1 ]; then
+              args=()
+              for a in "$@"; do
+                case "$a" in --icf|--icf=*) ;; *) args+=("$a") ;; esac
+              done
+              exec ${buildPkgs.lld}/bin/ld.lld "''${args[@]}"
+            fi
+            exec ${buildPkgs.lld}/bin/ld.lld "$@"
+            WRAP
+            chmod +x $out/bin/ld.lld
+          '';
+
         # The unpins-standard lld options for a non-darwin final link.
         lldStdOpts = _: "-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe";
         # `-B<lld>/bin` makes the compiler driver find `ld.lld` for
@@ -102,7 +153,7 @@
         # otherwise uses.)
         gcSectionsFlag = pkgs:
           if isLLDTarget pkgs then
-            "-B${pkgs.buildPackages.lld}/bin ${lldStdOpts pkgs}"
+            "-B${lldRSafe pkgs.buildPackages}/bin ${lldStdOpts pkgs}"
           else "";
 
         # `lld` build tool for the scope. gcSectionsFlag's `-B` already makes
@@ -111,7 +162,7 @@
         # gc-overlay single-binary makeFlagsArray). Empty list off the lld
         # targets (darwin keeps ld64, cosmo keeps cosmocc).
         lldFinalLink = pkgs:
-          if isLLDTarget pkgs then [ pkgs.buildPackages.lld ]
+          if isLLDTarget pkgs then [ (lldRSafe pkgs.buildPackages) ]
           else [ ];
 
         # Append to NIX_CFLAGS_LINK (cc-wrapper LINK-time flags),
@@ -151,8 +202,10 @@
                   # is an infinite recursion. `basePkgs.buildPackages` is the
                   # host set captured before the overlay, so its lld closure
                   # uses the un-overridden bash — same lld binary, no cycle.
+                  # lldRSafe (the -r-safe ld.lld wrapper) so a `$CC -r` in the
+                  # build doesn't choke on lldStdOpts' --icf.
                   nativeBuildInputs = (old.nativeBuildInputs or [ ])
-                    ++ [ basePkgs.buildPackages.lld ];
+                    ++ [ (lldRSafe basePkgs.buildPackages) ];
                 });
               });
           };
@@ -1360,7 +1413,7 @@ CBODY
         # mkPkgsGC: pkgsStatic with a chain-wide function/data-sections overlay
         # (cheap dead-code stripping; see gc.nix). Enabled via
         # `optimize.gc = true`. Linux-native only.
-        mkPkgsGC = import ./gc.nix { inherit nixpkgs appendCFlags appendLinkFlags; };
+        mkPkgsGC = import ./gc.nix { inherit nixpkgs appendCFlags appendLinkFlags lldRSafe; };
 
         # Native cosmoStdenv. Used by playground/{bash,coreutils,dash,links} for
         # in-tree builds against the `$COSMOS` shared prefix. The full result is
