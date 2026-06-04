@@ -17,35 +17,32 @@
 #    rewrite over the symbol table, so the underscore form must be
 #    spelled on darwin.
 #
-# 2. (Darwin only) `libbluray.configure`'s autoconf has
-#    `--without-fontconfig` but nixpkgs hard-wires fontconfig into
-#    `buildInputs`. On darwin pkgsStatic the fontconfig closure
-#    pulls `dejavu-fonts.minimal → fontforge → python3 → cross-bash`,
-#    which fails to evaluate on aarch64-darwin cross-from-darwin
-#    (the cross bash binary path is missing from the cross closure).
-#    libbluray uses fontconfig only at runtime for menu/OSD font
-#    discovery (BD-J UI rendering) — it's not a link-time
-#    requirement of the `bd_*` C API. Consumers exercising only the
-#    demuxer (e.g. ffmpeg's libbluray demuxer) never traverse the
-#    fontconfig path. Pass `--without-fontconfig` AND filter
-#    fontconfig out of `buildInputs` so the eval/build doesn't
-#    traverse the dejavu chain.
+# 2. (History — fix removed 2026-06-03) An earlier nixpkgs revision
+#    couldn't evaluate darwin pkgsStatic fontconfig (its
+#    `--with-default-fonts=${dejavu_fonts.minimal}` pulled
+#    `dejavu → fontforge → python3 → cross-bash`, and the cross bash
+#    binary path was missing from the cross closure). We worked around
+#    it by dropping fontconfig from libbluray on darwin
+#    (`--without-fontconfig` + buildInputs filter).
+#
+#    On nixos-26.05 that no longer reproduces: the vanilla cross
+#    `libbluray` (with fontconfig) evaluates cleanly, and the
+#    dejavu→fontforge build tools are correctly sourced from
+#    `buildPackages` (build host), not the cross target. Meanwhile
+#    libbluray 1.4.1 switched to **meson** with nixpkgs'
+#    `-Dauto_features=enabled`, which makes the (now optional)
+#    fontconfig dependency REQUIRED — so dropping it now fails with
+#    `ERROR: Dependency "fontconfig" not found`. So we simply keep
+#    fontconfig (same as Linux). The consuming scope must provide a
+#    buildable darwin fontconfig — ffmpeg's pkgsStaticScope already
+#    does via `nativeFixes.fontconfig` (disables 2 flaky sysroot-path
+#    tests that fail under pkgsStatic darwin).
 { lib }:
 pkgs:
 let
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
 in
-(pkgs.libbluray.override (
-  if isDarwin
-  then { fontconfig = pkgs.emptyDirectory; }
-  else { }
-)).overrideAttrs (oa: {
-  configureFlags = (oa.configureFlags or [ ])
-    ++ lib.optional isDarwin "--without-fontconfig";
-  buildInputs = lib.optionals (!isDarwin) (oa.buildInputs or [ ])
-    ++ lib.optionals isDarwin (builtins.filter
-      (d: !(d.pname or null == "fontconfig"))
-      (oa.buildInputs or [ ]));
+pkgs.libbluray.overrideAttrs (oa: {
   postInstall = (oa.postInstall or "") + ''
     echo "renaming dec_init -> bluray_internal_dec_init in libbluray.a"
     $OBJCOPY ${if isDarwin
