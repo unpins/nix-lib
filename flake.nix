@@ -1211,6 +1211,17 @@ CBODY
           # interactive probe.
           , smoke ? null
           , smokePattern ? null
+          # Per-package exception to the darwin portability allow-list. A list
+          # of Apple PrivateFramework names (e.g. [ "MediaRemote" ]) that
+          # action-build's "Verify binary is portable" step will accept for
+          # THIS package only, in addition to the always-allowed public
+          # /System/Library/Frameworks/*, libSystem and libobjc. Default []:
+          # the strict contract is unchanged for every package that doesn't
+          # opt in. Use only when an upstream macOS feature genuinely depends
+          # on a private framework with no public equivalent (the symbols
+          # should be weak-import + NULL-guarded so the feature degrades
+          # gracefully if a future macOS drops the framework).
+          , darwinAllowPrivateFrameworks ? [ ]
           # optimize: knobs for opt-level / stack protector / LTO / GC.
           # Defaults merged with
           # `{ lto = false; opt = null; ssp = true; gc = true; }`. Keys:
@@ -1469,6 +1480,10 @@ CBODY
               # Optional grep-E pattern that must match the smoke command's
               # combined stdout+stderr. Catches "Unknown option" false-pass.
               smoke_pattern = if smokePattern == null then null else smokePattern;
+              # Per-package darwin portability exception: list of Apple
+              # PrivateFramework names the verify step accepts for this package.
+              # Empty for all packages that don't opt in (strict contract).
+              darwin_allow_private_frameworks = darwinAllowPrivateFrameworks;
             };
           };
 
