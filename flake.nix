@@ -474,7 +474,11 @@
               "ssh-add" "ssh-agent" "ssh-keygen"
               "git" "gh" "hg" "svn"
               "gpg" "gpg2" "pinentry" "age" "rage"
-              "python" "python2" "python3" "node" "nodejs" "deno"
+              # `python`/`python3` intentionally absent: the catalog `python`
+              # package must be allowed to claim its interpreter names. The
+              # owner-gate (catalog-only) still blocks any other package.
+              # Kept lockstep with BLOCKED_ALIAS_NAMES in unpin/src/aliases.rs.
+              "node" "nodejs" "deno"
               "npm" "npx" "yarn" "pnpm"
               "cargo" "rustc" "rustup" "go" "java" "javac"
               "ruby" "gem" "bundle" "perl" "php" "lua"
