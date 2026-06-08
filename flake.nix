@@ -1149,9 +1149,22 @@ CBODY
         # action-build's verify step looks for at `result/bin/<pkg>` — multi-output drvs
         # would otherwise land at `result-bin`/`result-man` and verify fails.
         strippedOrJoined = pkgs: name: drv:
-          if (drv.outputs or [ "out" ]) == [ "out" ]
-          then drv.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
-          else packageWithMan pkgs name drv;
+          let
+            out =
+              if (drv.outputs or [ "out" ]) == [ "out" ]
+              then drv.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
+              else packageWithMan pkgs name drv;
+          in
+          # strip/symlinkJoin yield a synthetic meta that drops the upstream
+          # license/description/homepage. Carry them back onto the artifact so
+          # tooling (the website packages page, `unpin info`) can read them with
+          # no per-package table. `meta` is not part of the derivation hash, so
+          # this adds no rebuilds.
+          out // {
+            meta = (out.meta or { }) // builtins.intersectAttrs
+              { license = null; description = null; homepage = null; longDescription = null; }
+              (drv.meta or { });
+          };
 
         # Standalone-binary flake template. Returns:
         #   packages.<system>.default                = native build (pkgsStatic)
@@ -1265,6 +1278,13 @@ CBODY
           #                       multicall.nix post-link must also append
           #                       `${lib.gcSectionsFlag pkgs}` to reach that
           #                       external link.
+          # Pin the artifact's `meta.license` to an explicit SPDX id (or list of
+          # them), e.g. "GPL-3.0-or-later". The upstream license is carried
+          # automatically by `strippedOrJoined`; set this only when the build has
+          # none (a custom mkDerivation — ffmpeg, python) or inherits a noisy
+          # multi-component list you want pinned to the effective license. Read
+          # by the website packages page; reusable by `unpin info`.
+          , license ? null
           , optimize ? { }
           }:
           let
@@ -1298,6 +1318,13 @@ CBODY
                     ++ (if ssp then [ ] else [ "stackprotector" ]);
                 });
 
+            # Pin the artifact's meta.license to the caller-supplied SPDX id(s)
+            # when `license` is set; otherwise keep whatever strippedOrJoined
+            # carried from upstream. meta isn't hashed, so this never rebuilds.
+            withLicense = drv:
+              if license == null then drv
+              else drv // { meta = (drv.meta or { }) // { license = license; }; };
+
             rawBuild =
               if build != null then build
               else nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
@@ -1311,7 +1338,7 @@ CBODY
                   if embedMan then withMan pkgs { primary = binName; } base
                   else base;
               in
-              strippedOrJoined pkgs name withMaybeMan;
+              withLicense (strippedOrJoined pkgs name withMaybeMan);
 
             # Windows runs on x86_64-linux runners. `allowUnsupportedSystem` because
             # most nixpkgs `meta.platforms` exclude mingw / cosmo → cross-built drv
@@ -1412,7 +1439,7 @@ CBODY
             # Trim cosmo's unused `.symtab.amd64` (no-op on mingw). Runs after
             # withMan so the man block is already embedded.
             windowsTrimmed = withCosmoStrip windowsPkgs { primary = binName; } windowsWithMan;
-            windowsPkg = strippedOrJoined windowsPkgs name windowsTrimmed;
+            windowsPkg = withLicense (strippedOrJoined windowsPkgs name windowsTrimmed);
 
             # `linuxOnly` drops every Darwin attr from `packages.<sys>` so
             # action-build's auto-discovered matrix doesn't include darwin
