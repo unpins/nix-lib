@@ -1393,6 +1393,12 @@ CBODY
           # multi-component list you want pinned to the effective license. Read
           # by the website packages page; reusable by `unpin info`.
           , license ? null
+          # Pin the artifact's `meta.description` (one line; read by the
+          # website packages page and reusable by `unpin info`). The upstream
+          # description is carried automatically by `strippedOrJoined`; set
+          # this only when the build has none (a custom mkDerivation —
+          # ffmpeg, python).
+          , description ? null
           , optimize ? { }
           # Link the DNS fallback (__wrap_getaddrinfo) into the linux-static
           # artifact so it resolves names where /etc/resolv.conf is absent
@@ -1440,6 +1446,11 @@ CBODY
               if license == null then drv
               else drv // { meta = (drv.meta or { }) // { license = license; }; };
 
+            # Same pinning for meta.description; meta isn't hashed either.
+            withDescription = drv:
+              if description == null then drv
+              else drv // { meta = (drv.meta or { }) // { description = description; }; };
+
             rawBuild =
               if build != null then build
               else nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
@@ -1454,7 +1465,7 @@ CBODY
                   if embedMan then withMan pkgs { primary = binName; } base
                   else base;
               in
-              withLicense (strippedOrJoined pkgs name withMaybeMan);
+              withLicense (withDescription (strippedOrJoined pkgs name withMaybeMan));
 
             # Windows runs on x86_64-linux runners. `allowUnsupportedSystem` because
             # most nixpkgs `meta.platforms` exclude mingw / cosmo → cross-built drv
