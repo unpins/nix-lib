@@ -32,11 +32,12 @@
  *     but with no `nameserver` line (exactly when musl would fall back to
  *     127.0.0.1): Android, or a barebones container; and
  *   - the node is a real hostname (not a numeric literal).
- * In that case it does its own DNS query over UDP/53 to a public resolver
- * (1.1.1.1, then 8.8.8.8). This never masks a configured resolver's NXDOMAIN
- * on a normal system, and it avoids the ~10 s 127.0.0.1 probe musl would
- * otherwise spend before failing (we skip __real_getaddrinfo entirely on the
- * fallback path).
+ * In that case it does its own DNS query over UDP/53 to a public resolver —
+ * 1.1.1.1 then 8.8.8.8 by default, or the space-separated IPv4 literals in
+ * $UNPIN_DNS when the user sets it (to point the fallback at their own
+ * resolver). This never masks a configured resolver's NXDOMAIN on a normal
+ * system, and it avoids the ~10 s 127.0.0.1 probe musl would otherwise spend
+ * before failing (we skip __real_getaddrinfo entirely on the fallback path).
  *
  * Second stage — DoH over HTTPS/443 (optional)
  * --------------------------------------------
@@ -134,10 +135,53 @@ extern int unpin_readurl(const char *url,
 #define UNPIN_DNS_MAGIC 0x756E70696E444E53ULL /* "unpinDNS" */
 #define MAXADDR         8
 #define DNS_TIMEOUT_MS  3000
+#define MAX_RESOLVERS   8
 
-/* Public resolvers tried in order. Hardcoded on purpose: a binary with no
- * /etc/resolv.conf (Android, minimal containers) still resolves. */
-static const char *const RESOLVERS[] = { "1.1.1.1", "8.8.8.8" };
+/* Default public resolvers, tried in order when UNPIN_DNS is unset: a binary
+ * with no /etc/resolv.conf (Android, minimal containers) still resolves. */
+static const char *const DEFAULT_RESOLVERS[] = { "1.1.1.1", "8.8.8.8" };
+
+/* The resolver list for this call: the space-separated IPv4 literals in
+ * $UNPIN_DNS when the user sets it (to point the fallback at their own resolver
+ * — privacy, a local cache, a corporate DNS), else the built-in defaults above.
+ * UNPIN_DNS *replaces* the defaults rather than extending them; include them
+ * explicitly if you want them too.
+ *
+ * Entries MUST be IPv4 literals — they are used verbatim both as the UDP/53 peer
+ * and, for DoH, as the host in https://<ip>/dns-query (where the cert is checked
+ * against that IP's SAN). A hostname can't be allowed: the DoH leg would try to
+ * resolve it and recurse straight back through this wrap. Non-literal, IPv6, or
+ * past-MAX_RESOLVERS entries are silently skipped; if nothing valid is left
+ * (unset, empty, oversized, or all junk) we fall back to the defaults so a
+ * typo never leaves a resolver-less host with no way to resolve.
+ *
+ * `buf` (caller-owned, alive for the whole resolution) backs the returned
+ * pointers — strtok_r tokenises in place and `out[]` points into it. */
+static size_t resolver_list(const char **out, char *buf, size_t bufcap)
+{
+    const char *env = getenv("UNPIN_DNS");
+    size_t n = 0;
+    if (env && *env) {
+        size_t len = strlen(env);
+        if (len < bufcap) {
+            memcpy(buf, env, len + 1);
+            char *save = NULL;
+            for (char *tok = strtok_r(buf, " \t", &save);
+                 tok && n < MAX_RESOLVERS;
+                 tok = strtok_r(NULL, " \t", &save)) {
+                struct in_addr a4;
+                if (inet_pton(AF_INET, tok, &a4) == 1)
+                    out[n++] = tok;            /* IPv4 literal — safe for UDP + DoH URL */
+            }
+        }
+    }
+    if (n == 0) {
+        size_t nd = sizeof DEFAULT_RESOLVERS / sizeof *DEFAULT_RESOLVERS;
+        for (size_t i = 0; i < nd && i < MAX_RESOLVERS; i++)
+            out[n++] = DEFAULT_RESOLVERS[i];
+    }
+    return n;
+}
 
 /* One contiguous allocation per resolved name. `magic` MUST sit immediately
  * before `ai[]` (no padding: sockaddr_storage/uint64_t/addrinfo are all
@@ -385,7 +429,11 @@ int __wrap_getaddrinfo(const char *node, const char *service,
      * UDP answers at 512). */
     unsigned char q[300], r[4096];
     uint16_t id = (uint16_t)(getpid() ^ (uintptr_t)b);
-    const size_t nres = sizeof RESOLVERS / sizeof *RESOLVERS;
+    /* Resolvers for this call — $UNPIN_DNS if the user set it, else the defaults.
+     * `dnsbuf` backs the parsed strings and must outlive the loop below. */
+    const char *resolvers[MAX_RESOLVERS];
+    char dnsbuf[256];
+    const size_t nres = resolver_list(resolvers, dnsbuf, sizeof dnsbuf);
     const int have_fetch = (unpin_readurl != NULL); /* TLS-carrying binary? */
     int udp_dead = 0;                               /* set once UDP/53 is blocked */
     int doh_dead = 0;                               /* set once DoH/443 is blocked */
@@ -398,7 +446,7 @@ int __wrap_getaddrinfo(const char *node, const char *service,
         int answered = 0;                  /* got a DNS response (any rcode) */
         if (!udp_dead) {
             for (size_t si = 0; si < nres; si++) {
-                int rlen = dns_exchange(RESOLVERS[si], q, qlen, r, sizeof r, qid);
+                int rlen = dns_exchange(resolvers[si], q, qlen, r, sizeof r, qid);
                 if (rlen > 0) {
                     parse_resp(r, rlen, qtypes[qi], port, b, &count);
                     answered = 1;
@@ -418,7 +466,7 @@ int __wrap_getaddrinfo(const char *node, const char *service,
             int reached = 0;               /* a resolver answered over DoH */
             for (size_t si = 0; si < nres; si++) {
                 char url[64];
-                snprintf(url, sizeof url, "https://%s/dns-query", RESOLVERS[si]);
+                snprintf(url, sizeof url, "https://%s/dns-query", resolvers[si]);
                 int rlen = unpin_readurl(url, q, qlen, "application/dns-message",
                                          r, (int)sizeof r);
                 if (rlen > 0) {
