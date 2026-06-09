@@ -131,9 +131,22 @@
               case "$a" in -r|--relocatable|-i) reloc=1 ;; esac
             done
             if [ "$reloc" = 1 ]; then
+              # Strip flags that are illegal or wrong on a relocatable (`-r`)
+              # partial link: --icf ("-r and --icf may not be used together"),
+              # and --wrap (the DNS-fallback wrap must apply only at the FINAL
+              # full link — applying it on a kbuild partial-link too would
+              # double-rewrite getaddrinfo refs). `--wrap SYM` (two-token) and
+              # `--wrap=SYM` (one-token) both handled.
               args=()
+              skip=0
               for a in "$@"; do
-                case "$a" in --icf|--icf=*) ;; *) args+=("$a") ;; esac
+                if [ "$skip" = 1 ]; then skip=0; continue; fi
+                case "$a" in
+                  --icf|--icf=*) ;;
+                  --wrap=*) ;;
+                  --wrap) skip=1 ;;
+                  *) args+=("$a") ;;
+                esac
               done
               exec ${buildPkgs.lld}/bin/ld.lld "''${args[@]}"
             fi
@@ -220,6 +233,19 @@
         # structuredAttrs-aware like appendCFlags. Unlike NIX_LDFLAGS this
         # reaches ONLY $CC-driven links, never a direct `ld -r`, so
         # --gc-sections/--icf are safe to carry here.
+        # Append to NIX_CFLAGS_LINK (cc-wrapper LINK-time flags),
+        # structuredAttrs-aware like appendCFlags. Unlike NIX_LDFLAGS this
+        # reaches ONLY $CC-driven links, never a direct `ld -r`, so
+        # --gc-sections/--icf are safe to carry here.
+        #
+        # The `old ? env && old.env ? VAR` test is the right signal (NOT
+        # `old.__structuredAttrs`, which is NOT visible in overrideAttrs' `old`):
+        # when a structuredAttrs build presets `env.NIX_CFLAGS_LINK` (e.g. whois'
+        # " -static") we MUST append inside `env`, since adding a top-level
+        # NIX_CFLAGS_LINK would overlap and nixpkgs rejects the duplicate. When
+        # the var is absent, a top-level scalar is exported fine even under
+        # structuredAttrs (verified: withDnsFallback's top-level NIX_LDFLAGS
+        # reaches whois' linker).
         appendLinkFlags = drv: flagStr:
           drv.overrideAttrs (old:
             if old ? env && old.env ? NIX_CFLAGS_LINK then {
@@ -227,6 +253,82 @@
             } else if old ? NIX_CFLAGS_LINK then {
               NIX_CFLAGS_LINK = old.NIX_CFLAGS_LINK + " " + flagStr;
             } else { NIX_CFLAGS_LINK = flagStr; });
+
+        # Append raw `ld` flags to NIX_LDFLAGS, structuredAttrs-aware. Unlike
+        # NIX_CFLAGS_LINK this survives a build that wipes NIX_CFLAGS_LINK in
+        # postConfigure (nixpkgs' whois drops the bootstrap `-static` that way),
+        # and it's the mechanism fastfetch already uses for its `--wrap=dlopen`.
+        # Entries are passed straight to ld, so use `--wrap=…` (not `-Wl,…`).
+        appendLdFlags = drv: flagStr:
+          drv.overrideAttrs (old:
+            if old ? env && old.env ? NIX_LDFLAGS then {
+              env = old.env // { NIX_LDFLAGS = old.env.NIX_LDFLAGS + " " + flagStr; };
+            } else if old ? NIX_LDFLAGS then {
+              NIX_LDFLAGS = old.NIX_LDFLAGS + " " + flagStr;
+            } else { NIX_LDFLAGS = flagStr; });
+
+        # DNS fallback (linux-static). A tiny C archive providing
+        # __wrap_getaddrinfo / __wrap_freeaddrinfo, linked into every
+        # linux-static artifact. musl's resolver falls back to 127.0.0.1 when
+        # /etc/resolv.conf is absent — which is the case on Android (no
+        # resolv.conf; DNS lives behind Bionic + netd, unreachable from a
+        # non-Bionic static binary), so every catalog binary fails to resolve.
+        # The wrapper delegates to the real resolver in every normal case and
+        # only does its own UDP/53 query to a public resolver (1.1.1.1/8.8.8.8)
+        # when there is NO configured resolver AND the node is a hostname. See
+        # dns-fallback/dns-fallback.c for the full contract.
+        #
+        # Built with the TARGET stdenv so it cross-compiles per musl arch, and
+        # pulled by the linker only if the binary references getaddrinfo (DCE
+        # drops it from tree/jq/coreutils/…). The wrapped symbol is also what
+        # Rust's std::net resolution emits, so this fixes the Rust catalog
+        # binaries (unpin/unpin-man/…) with no Rust-side change.
+        dnsFallbackLib = pkgs: pkgs.stdenv.mkDerivation {
+          pname = "unpin-dns-fallback";
+          version = "0.1";
+          src = ./dns-fallback;
+          dontConfigure = true;
+          buildPhase = ''
+            runHook preBuild
+            $CC -O2 -fPIC -ffunction-sections -fdata-sections \
+              -c dns-fallback.c -o dns-fallback.o
+            $AR rcs libunpindns.a dns-fallback.o
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out/lib
+            cp libunpindns.a $out/lib/
+            runHook postInstall
+          '';
+        };
+
+        # Wrap a built drv's final link with the DNS fallback (linux-static
+        # only; darwin/windows keep their native resolver). `--wrap` rides
+        # NIX_LDFLAGS (not NIX_CFLAGS_LINK — that gets wiped in postConfigure by
+        # some builds, e.g. whois). The lldRSafe ld wrapper strips `--wrap` from
+        # any `-r` relocatable partial-link routed through ld.lld, so the wrap
+        # applies only at the final full link. The archive is pulled by the
+        # linker only when (and only when) getaddrinfo is referenced.
+        #
+        # `staticPkgs` is the static scope the drv was actually built in
+        # (`pkgs.pkgsStatic` — NOT the native `pkgs` `stripped` receives, whose
+        # hostPlatform is the glibc build host). Both the guard and the
+        # archive's toolchain come from it, so the .a matches the consumer's
+        # arch (native or cross-musl) exactly.
+        withDnsFallback = staticPkgs: drv:
+          let h = staticPkgs.stdenv.hostPlatform;
+          in if (h.isLinux && (h.isStatic or false))
+             then appendLdFlags drv
+               # Trailing `-lc`: NIX_LDFLAGS lands at the END of the link line,
+               # after the toolchain's own `-lc`. Our archive's libc references
+               # (inet_pton/getaddrinfo/htons/…) would otherwise be undefined —
+               # static archives only satisfy references that come BEFORE them.
+               # rustc's `-nodefaultlibs` link exposes this; re-stating `-lc`
+               # after our archive resolves them (harmless duplicate for C).
+               ("--wrap=getaddrinfo --wrap=freeaddrinfo "
+               + "-L${dnsFallbackLib staticPkgs}/lib -l:libunpindns.a -lc")
+             else drv;
 
         # Make a build scope link `pkgName`'s final $CC link with lld + the
         # standard options, via NIX_CFLAGS_LINK (build-system agnostic —
@@ -1286,6 +1388,13 @@ CBODY
           # by the website packages page; reusable by `unpin info`.
           , license ? null
           , optimize ? { }
+          # Link the DNS fallback (__wrap_getaddrinfo) into the linux-static
+          # artifact so it resolves names where /etc/resolv.conf is absent
+          # (Android, minimal containers). On by default; harmless on binaries
+          # that never resolve (DCE drops it). Set false to opt a package out
+          # (e.g. if a multicall `-r` link ever misbehaves despite the lldRSafe
+          # --wrap strip). No-op on darwin/windows. See withDnsFallback.
+          , dnsFallback ? true
           }:
           let
             optimize_ = { lto = false; opt = null; ssp = true; gc = true; } // optimize;
@@ -1330,7 +1439,8 @@ CBODY
               else nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
             stripped = pkgs:
               let
-                base = dropSharedLibs (filterEnableStaticOnDarwin (applyOptSsp (rawBuild pkgs)));
+                core = dropSharedLibs (filterEnableStaticOnDarwin (applyOptSsp (rawBuild pkgs)));
+                base = if dnsFallback then withDnsFallback pkgs.pkgsStatic core else core;
                 # withMan must run on the underlying drv (it edits the bin
                 # output and reads the man output) BEFORE strippedOrJoined
                 # collapses multi-output drvs into a symlinkJoin.
