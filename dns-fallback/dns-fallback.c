@@ -38,6 +38,23 @@
  * otherwise spend before failing (we skip __real_getaddrinfo entirely on the
  * fallback path).
  *
+ * Second stage — DoH over HTTPS/443 (optional)
+ * --------------------------------------------
+ * Some resolver-less networks also block UDP/53 (captive portals, corporate
+ * firewalls, a few mobile carriers). When no resolver answers over UDP, this
+ * wrap escalates to DNS-over-HTTPS (RFC 8484) against the SAME resolvers — but
+ * it carries no TLS itself. Instead it calls an optional weak hook,
+ * unpin_readurl (see its declaration below): a generic "fetch this URL" call
+ * that a consumer already linking a TLS stack provides from that stack. Every
+ * unpins program that resolves names over the network also speaks HTTPS, so it
+ * has a TLS stack to lend — the Rust tools over their rustls (minreq), a C tool
+ * over its libcurl/OpenSSL. The shim builds the full DoH request (URL + wire
+ * body + content-type) and hands it to the hook; the hook knows nothing about
+ * DNS, just how to fetch a URL. A program that provides no hook stays UDP-only
+ * at zero cost. DoH is thus a strictly opt-in, last-resort stage, reached only
+ * after UDP yields nothing on a resolver-less host — it never runs on a normal
+ * system.
+ *
  * Memory contract with the wrapped freeaddrinfo
  * ---------------------------------------------
  * musl's freeaddrinfo assumes its addrinfo is embedded in musl's private
@@ -64,9 +81,9 @@
  *   - Named services beyond a tiny built-in table resolve to port 0 (the real
  *     resolver would consult /etc/services). Numeric ports (the common case)
  *     are exact.
- *   - DoH (443) is the intended last-resort second fallback for networks that
- *     block UDP/53; it needs a TLS stack and is deliberately NOT here. See the
- *     design notes — it belongs only where a TLS stack already exists.
+ *   - The DoH second stage (above) still has no TCP fallback either: a
+ *     truncated (TC=1) DoH answer is taken as-is. Irrelevant for A/AAAA of the
+ *     hosts unpins tools reach, whose answer sets are tiny.
  */
 
 #define _GNU_SOURCE
@@ -81,10 +98,38 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 
 extern int  __real_getaddrinfo(const char *, const char *,
                                const struct addrinfo *, struct addrinfo **);
 extern void __real_freeaddrinfo(struct addrinfo *);
+
+/* Optional generic HTTP-fetch hook — the TLS transport for the DoH second
+ * stage. This wrap deliberately carries NO TLS stack (it must stay tiny and
+ * linkable into every catalog binary), so it calls out to this *weak* hook,
+ * which a consumer that ALREADY links a TLS client provides from that stack:
+ * the Rust tools (unpin, unpin-readme) over their rustls (minreq); a C tool
+ * over its libcurl/OpenSSL. Left unprovided, the weak symbol resolves to NULL —
+ * the binary stays UDP-only, exactly as before — so DoH is strictly opt-in,
+ * gated on "a TLS stack is already here", with zero size cost where it is not
+ * (and a weak *undefined* ref links clean even under -static).
+ *
+ * Contract — a dumb URL fetch that knows nothing about DNS:
+ *   - Fetch `url`. If `body != NULL && bodylen > 0`, POST it with header
+ *     `Content-Type: content_type` (and the same `Accept`); otherwise GET.
+ *   - Write the response body into `result` (capacity `resultcap`).
+ *   - Return the response length (> 0) on HTTP 200, or <= 0 on any failure
+ *     (transport error, non-200, or a body that exceeds `resultcap`).
+ * For DoH the shim passes url = "https://<resolver>/dns-query", the DNS wire
+ * query as `body`, and content_type = "application/dns-message". The resolver
+ * in the URL is a v4 literal from RESOLVERS[], so the fetch needs no prior name
+ * resolution (no chicken-and-egg) and the cert validates against the resolver's
+ * IP-SAN — 1.1.1.1 and 8.8.8.8 both carry one. */
+extern int unpin_readurl(const char *url,
+                         const unsigned char *body, int bodylen,
+                         const char *content_type,
+                         unsigned char *result, int resultcap)
+    __attribute__((weak));
 
 #define UNPIN_DNS_MAGIC 0x756E70696E444E53ULL /* "unpinDNS" */
 #define MAXADDR         8
@@ -335,19 +380,57 @@ int __wrap_getaddrinfo(const char *node, const char *service,
     else if (family == AF_INET6) qtypes[nq++] = 28;
     else { qtypes[nq++] = 1; qtypes[nq++] = 28; }
 
-    unsigned char q[300], r[1500];
+    /* r is sized for a DoH reply (HTTPS has no 512-byte UDP limit); UDP recvs
+     * into the same buffer and never fills it (we set no EDNS, so servers cap
+     * UDP answers at 512). */
+    unsigned char q[300], r[4096];
     uint16_t id = (uint16_t)(getpid() ^ (uintptr_t)b);
+    const size_t nres = sizeof RESOLVERS / sizeof *RESOLVERS;
+    const int have_fetch = (unpin_readurl != NULL); /* TLS-carrying binary? */
+    int udp_dead = 0;                               /* set once UDP/53 is blocked */
+    int doh_dead = 0;                               /* set once DoH/443 is blocked */
 
     for (int qi = 0; qi < nq && count < MAXADDR; qi++) {
         uint16_t qid = id++;
         int qlen = build_query(node, qtypes[qi], q, sizeof q, qid);
         if (qlen < 0) continue;
-        for (size_t si = 0; si < sizeof RESOLVERS / sizeof *RESOLVERS; si++) {
-            int rlen = dns_exchange(RESOLVERS[si], q, qlen, r, sizeof r, qid);
-            if (rlen > 0) {
-                parse_resp(r, rlen, qtypes[qi], port, b, &count);
-                break;                       /* got an answer from this server */
+
+        int answered = 0;                  /* got a DNS response (any rcode) */
+        if (!udp_dead) {
+            for (size_t si = 0; si < nres; si++) {
+                int rlen = dns_exchange(RESOLVERS[si], q, qlen, r, sizeof r, qid);
+                if (rlen > 0) {
+                    parse_resp(r, rlen, qtypes[qi], port, b, &count);
+                    answered = 1;
+                    break;                 /* this resolver answered over UDP */
+                }
             }
+            /* No resolver answered over UDP — treat port 53 as blocked for the
+             * rest of this call, so the next qtype goes straight to DoH instead
+             * of eating another full round of UDP timeouts. */
+            if (!answered) udp_dead = 1;
+        }
+
+        /* Second stage: UDP got nothing and the binary can do TLS → DoH/443.
+         * We hand the consumer's fetch hook a ready-made DoH request and let it
+         * speak HTTPS; it never sees a DNS concept. */
+        if (!answered && have_fetch && !doh_dead) {
+            int reached = 0;               /* a resolver answered over DoH */
+            for (size_t si = 0; si < nres; si++) {
+                char url[64];
+                snprintf(url, sizeof url, "https://%s/dns-query", RESOLVERS[si]);
+                int rlen = unpin_readurl(url, q, qlen, "application/dns-message",
+                                         r, (int)sizeof r);
+                if (rlen > 0) {
+                    parse_resp(r, rlen, qtypes[qi], port, b, &count);
+                    reached = 1;
+                    break;                 /* this resolver answered over DoH */
+                }
+            }
+            /* No resolver answered over DoH either — 443 is blocked too. Skip the
+             * DoH round for the next qtype rather than re-paying the per-resolver
+             * HTTPS timeout we just proved hopeless (mirrors udp_dead above). */
+            if (!reached) doh_dead = 1;
         }
     }
 
