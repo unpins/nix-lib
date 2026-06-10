@@ -1,162 +1,219 @@
 /*
- * unpin DNS fallback — __wrap_getaddrinfo / __wrap_freeaddrinfo
- * ============================================================
+ * unpin DNS fallback — getaddrinfo interposition with a UDP + DoH safety net
+ * =========================================================================
  *
  * Why this exists
  * ---------------
- * unpins ships fully static musl binaries. musl's resolver reads
- * /etc/resolv.conf and, when that file is absent or has no `nameserver`
- * line, falls back to a single nameserver: 127.0.0.1. On Android there is
- * no /etc/resolv.conf (the OS resolves names through Bionic + netd, which a
- * non-Bionic static binary can't reach), so every catalog binary that
- * resolves a hostname queries 127.0.0.1:53, gets nothing, and fails — the
- * symptom is "can't download, won't resolve the host".
- *
- * The fix, applied catalog-wide at the libc boundary
- * --------------------------------------------------
- * Every linux-static artifact is linked with `-Wl,--wrap=getaddrinfo`
- * `-Wl,--wrap=freeaddrinfo` plus this archive (see nix-lib's withDnsFallback).
- * `--wrap` reroutes ALL references to getaddrinfo — including those inside
- * statically-linked libcurl.a etc., and including Rust's std::net resolution,
- * which emits the same getaddrinfo symbol — to __wrap_getaddrinfo here. So a
- * single C object fixes the whole C catalog AND the Rust binaries (unpin, …)
- * with no per-binary change. The linker pulls this object only if the binary
- * actually references getaddrinfo, so DCE drops it from tree/jq/coreutils/…
+ * An unpins program resolves names through the OS resolver (getaddrinfo). On a
+ * normal desktop that always works. But a fully static musl binary on Android
+ * has no /etc/resolv.conf — musl then falls back to 127.0.0.1:53, where nothing
+ * listens, and every lookup fails ("can't download, won't resolve the host").
+ * The same gap appears on any host whose configured resolver is dead/unreachable.
  *
  * What it does, precisely
  * -----------------------
- * __wrap_getaddrinfo delegates to the real resolver in every normal case
- * (desktop Linux/macOS, IP literals, AI_NUMERICHOST). It only takes over when
- * BOTH hold:
- *   - there is no configured resolver — /etc/resolv.conf is absent, or present
- *     but with no `nameserver` line (exactly when musl would fall back to
- *     127.0.0.1): Android, or a barebones container; and
- *   - the node is a real hostname (not a numeric literal).
- * In that case it does its own DNS query over UDP/53 to a public resolver —
- * 1.1.1.1 then 8.8.8.8 by default, or the space-separated IPv4 literals in
- * $UNPIN_DNS when the user sets it (to point the fallback at their own
- * resolver). This never masks a configured resolver's NXDOMAIN on a normal
- * system, and it avoids the ~10 s 127.0.0.1 probe musl would otherwise spend
- * before failing (we skip __real_getaddrinfo entirely on the fallback path).
+ * It interposes getaddrinfo and always calls the real OS resolver FIRST — exactly
+ * as if this code weren't here — taking over only when that call could not REACH
+ * a resolver. The two failure outcomes are distinct:
+ *   - unreachable resolver  -> EAI_AGAIN  (our trigger): a resolver-less host
+ *     (Android, a barebones container) or a dead/unreachable nameserver;
+ *   - "no such name"        -> EAI_NONAME (respected, NOT a trigger): an
+ *     authoritative NXDOMAIN from a working resolver. Re-asking a public resolver
+ *     would mask it and break split-horizon DNS, so we never do.
+ * Only for a real hostname (numeric literals / AI_NUMERICHOST need no DNS) and
+ * only on a reach failure does it run its own query over UDP/53 to a public
+ * resolver — 1.1.1.1 then 8.8.8.8 by default, or the space-separated IPv4
+ * literals in $UNPIN_DNS when the user sets it. The rule is uniform on every
+ * platform: try the OS resolver, fall back only when it can't reach one — so on
+ * a normal host the OS answers and the fallback never runs.
+ *
+ * How it is interposed (per toolchain)
+ * ------------------------------------
+ * The same C, three link mechanisms, selected by #ifdef:
+ *   - Linux (static musl) and Windows (mingw): GNU ld's `-Wl,--wrap=getaddrinfo`
+ *     `-Wl,--wrap=freeaddrinfo` reroute every reference (the C catalog, libcurl,
+ *     and Rust's std::net all emit the same symbol) to __wrap_getaddrinfo; the
+ *     originals are reachable as __real_getaddrinfo. See nix-lib's withDnsFallback.
+ *   - macOS: Apple's ld64 has no --wrap, so we DEFINE getaddrinfo/freeaddrinfo
+ *     (the linker binds every in-binary reference to ours; the build force-loads
+ *     this archive so the definition wins over libSystem's) and reach the real
+ *     libSystem ones via dlsym(RTLD_NEXT, …).
+ * The linker pulls this object only when getaddrinfo is referenced, so it is
+ * dropped from non-resolving tools (tree/jq/coreutils/…).
  *
  * Second stage — DoH over HTTPS/443 (optional)
  * --------------------------------------------
- * Some resolver-less networks also block UDP/53 (captive portals, corporate
- * firewalls, a few mobile carriers). When no resolver answers over UDP, this
- * wrap escalates to DNS-over-HTTPS (RFC 8484) against the SAME resolvers — but
- * it carries no TLS itself. Instead it calls an optional weak hook,
- * unpin_readurl (see its declaration below): a generic "fetch this URL" call
- * that a consumer already linking a TLS stack provides from that stack. Every
- * unpins program that resolves names over the network also speaks HTTPS, so it
- * has a TLS stack to lend — the Rust tools over their rustls (minreq), a C tool
- * over its libcurl/OpenSSL. The shim builds the full DoH request (URL + wire
- * body + content-type) and hands it to the hook; the hook knows nothing about
- * DNS, just how to fetch a URL. A program that provides no hook stays UDP-only
- * at zero cost. DoH is thus a strictly opt-in, last-resort stage, reached only
- * after UDP yields nothing on a resolver-less host — it never runs on a normal
- * system.
+ * Some resolver-less networks also block UDP/53 (captive portals, firewalls).
+ * When no resolver answers over UDP, this escalates to DNS-over-HTTPS (RFC 8484)
+ * against the SAME resolvers — but it carries no TLS itself. Instead it calls
+ * unpin_readurl, a generic "fetch this URL" hook provided as a WEAK definition
+ * here (returning -1 = no transport) that a consumer already linking a TLS stack
+ * OVERRIDES with a strong definition from that stack: the Rust tools over their
+ * rustls (minreq); a C tool over its libcurl/OpenSSL. The shim builds the full
+ * DoH request (URL + wire body + content-type) and hands it over; the hook knows
+ * nothing about DNS. A program with no strong override keeps the weak stub and
+ * stays UDP-only. (A weak *definition* — not a weak undefined reference — links
+ * clean on ELF, Mach-O and COFF alike, unlike weak-undef which each format
+ * resolves to NULL differently.)
  *
  * Memory contract with the wrapped freeaddrinfo
  * ---------------------------------------------
- * musl's freeaddrinfo assumes its addrinfo is embedded in musl's private
- * `struct aibuf` and frees the enclosing block — it would corrupt heap if
- * handed our own allocation. So freeaddrinfo is wrapped too: addrinfo chains
- * we allocate carry a magic word in the 8 bytes immediately preceding the
- * first addrinfo; __wrap_freeaddrinfo recognises ours by that word and frees
- * our block, delegating everything else to the real freeaddrinfo. Reading the
- * 8 bytes before a *foreign* addrinfo never faults: musl hands back
- * `&aibuf->ai` with addrinfo as the FIRST member of its aibuf, so those bytes
- * are the allocator's own chunk metadata — always mapped just below a live
- * heap block. They won't equal the magic, so we fall through to the real
- * freeaddrinfo. (Formally it is an 8-byte read just under the user allocation:
- * harmless on musl, though ASAN would flag it; a locked registry of our own
- * pointers would avoid it but isn't worth the cost for static-musl-only.)
+ * The real freeaddrinfo would corrupt the heap if handed our own allocation, so
+ * it is interposed too: addrinfo chains we allocate carry a magic word in the 8
+ * bytes immediately preceding the first addrinfo; the wrapped freeaddrinfo frees
+ * our block on a match and delegates everything else to the real one. Reading the
+ * 8 bytes before a *foreign* addrinfo reads the allocator's own chunk metadata —
+ * mapped just below a live heap block on every platform's allocator; it won't
+ * equal the magic, so we fall through. (An 8-byte read just under the user
+ * allocation: harmless in practice, though ASAN would flag it.)
  *
- * Known prototype simplifications (follow-ups)
- * --------------------------------------------
- *   - UDP only; no TCP fallback on a truncated (TC=1) response. Fine for the
+ * Known simplifications (follow-ups)
+ * ----------------------------------
+ *   - UDP/DoH only; no TCP fallback on a truncated (TC=1) response. Fine for the
  *     small A/AAAA sets of github.com & friends.
- *   - When hints->ai_socktype is 0 we emit SOCK_STREAM entries (what every
- *     unpins network tool connects with); the real getaddrinfo would also
- *     emit DGRAM/RAW variants.
- *   - Named services beyond a tiny built-in table resolve to port 0 (the real
- *     resolver would consult /etc/services). Numeric ports (the common case)
- *     are exact.
- *   - The DoH second stage (above) still has no TCP fallback either: a
- *     truncated (TC=1) DoH answer is taken as-is. Irrelevant for A/AAAA of the
- *     hosts unpins tools reach, whose answer sets are tiny.
+ *   - hints->ai_socktype == 0 emits SOCK_STREAM entries (what unpins tools use).
+ *   - Named services beyond a tiny built-in table resolve to port 0; numeric
+ *     ports (the common case) are exact.
  */
 
-#define _GNU_SOURCE
-#include <netdb.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <poll.h>
-#include <unistd.h>
-#include <fcntl.h>
+/* Feature-test macros must precede every system header. */
+#if defined(__APPLE__)
+#  define _DARWIN_C_SOURCE 1
+#elif !defined(_WIN32)
+#  define _GNU_SOURCE 1
+#endif
+
+#if defined(_WIN32)
+#  define UNPIN_WINDOWS 1
+#  ifndef _WIN32_WINNT
+#    define _WIN32_WINNT 0x0600          /* WSAPoll + inet_pton need Vista+ */
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN 1
+#  endif
+#elif defined(__APPLE__)
+#  define UNPIN_MACOS 1
+#else
+#  define UNPIN_LINUX 1
+#endif
+
+#if defined(UNPIN_WINDOWS)
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>
+#else
+#  include <netdb.h>
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <arpa/inet.h>
+#  include <poll.h>
+#  include <unistd.h>
+#  if defined(UNPIN_MACOS)
+#    include <dlfcn.h>
+#  endif
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
-#include <stdio.h>
 
+/* ---- portable socket layer ------------------------------------------------ */
+#if defined(UNPIN_WINDOWS)
+typedef SOCKET    unpin_sock;
+typedef WSAPOLLFD unpin_pollfd;
+#  define UNPIN_BADSOCK     INVALID_SOCKET
+#  define unpin_closesocket closesocket
+#  define unpin_poll        WSAPoll
+#  define UNPIN_PID()       ((unsigned)GetCurrentProcessId())
+#else
+typedef int           unpin_sock;
+typedef struct pollfd unpin_pollfd;
+#  define UNPIN_BADSOCK     (-1)
+#  define unpin_closesocket close
+#  define unpin_poll        poll
+#  define UNPIN_PID()       ((unsigned)getpid())
+#endif
+
+/* ---- real getaddrinfo/freeaddrinfo + interposed entry-point names --------- */
+#if defined(UNPIN_MACOS)
+/* ld64 has no --wrap: we DEFINE getaddrinfo/freeaddrinfo and reach the real
+ * libSystem implementations through dlsym(RTLD_NEXT, …). */
+static int real_getaddrinfo(const char *node, const char *service,
+                            const struct addrinfo *hints, struct addrinfo **res)
+{
+    typedef int (*fn_t)(const char *, const char *,
+                        const struct addrinfo *, struct addrinfo **);
+    static fn_t fn;
+    if (!fn) fn = (fn_t)dlsym(RTLD_NEXT, "getaddrinfo");
+    return fn(node, service, hints, res);
+}
+static void real_freeaddrinfo(struct addrinfo *res)
+{
+    typedef void (*fn_t)(struct addrinfo *);
+    static fn_t fn;
+    if (!fn) fn = (fn_t)dlsym(RTLD_NEXT, "freeaddrinfo");
+    fn(res);
+}
+#  define ENTRY_GETADDRINFO  getaddrinfo
+#  define ENTRY_FREEADDRINFO freeaddrinfo
+#else
 extern int  __real_getaddrinfo(const char *, const char *,
                                const struct addrinfo *, struct addrinfo **);
 extern void __real_freeaddrinfo(struct addrinfo *);
+#  define real_getaddrinfo   __real_getaddrinfo
+#  define real_freeaddrinfo  __real_freeaddrinfo
+#  define ENTRY_GETADDRINFO  __wrap_getaddrinfo
+#  define ENTRY_FREEADDRINFO __wrap_freeaddrinfo
+#endif
 
-/* Optional generic HTTP-fetch hook — the TLS transport for the DoH second
- * stage. This wrap deliberately carries NO TLS stack (it must stay tiny and
- * linkable into every catalog binary), so it calls out to this *weak* hook,
- * which a consumer that ALREADY links a TLS client provides from that stack:
- * the Rust tools (unpin, unpin-readme) over their rustls (minreq); a C tool
- * over its libcurl/OpenSSL. Left unprovided, the weak symbol resolves to NULL —
- * the binary stays UDP-only, exactly as before — so DoH is strictly opt-in,
- * gated on "a TLS stack is already here", with zero size cost where it is not
- * (and a weak *undefined* ref links clean even under -static).
+/* ---- optional generic HTTP-fetch hook for the DoH second stage ------------ *
+ * A WEAK DEFINITION (returns -1 = no DoH transport). A consumer that links a TLS
+ * stack provides a STRONG definition that overrides this — the Rust tools over
+ * their rustls (minreq); a C tool over its libcurl/OpenSSL. A weak *definition*
+ * (not a weak undefined reference) links clean on ELF, Mach-O and COFF.
  *
  * Contract — a dumb URL fetch that knows nothing about DNS:
  *   - Fetch `url`. If `body != NULL && bodylen > 0`, POST it with header
  *     `Content-Type: content_type` (and the same `Accept`); otherwise GET.
  *   - Write the response body into `result` (capacity `resultcap`).
- *   - Return the response length (> 0) on HTTP 200, or <= 0 on any failure
- *     (transport error, non-200, or a body that exceeds `resultcap`).
+ *   - Return the response length (> 0) on HTTP 200, or <= 0 on any failure.
  * For DoH the shim passes url = "https://<resolver>/dns-query", the DNS wire
- * query as `body`, and content_type = "application/dns-message". The resolver
- * in the URL is a v4 literal from RESOLVERS[], so the fetch needs no prior name
- * resolution (no chicken-and-egg) and the cert validates against the resolver's
- * IP-SAN — 1.1.1.1 and 8.8.8.8 both carry one. */
-extern int unpin_readurl(const char *url,
-                         const unsigned char *body, int bodylen,
-                         const char *content_type,
-                         unsigned char *result, int resultcap)
-    __attribute__((weak));
+ * query as `body`, content_type = "application/dns-message". The resolver in the
+ * URL is a v4 literal, so the fetch needs no prior name resolution and the cert
+ * validates against the resolver's IP-SAN (1.1.1.1 / 8.8.8.8 both carry one). */
+__attribute__((weak))
+int unpin_readurl(const char *url,
+                  const unsigned char *body, int bodylen,
+                  const char *content_type,
+                  unsigned char *result, int resultcap)
+{
+    (void)url; (void)body; (void)bodylen;
+    (void)content_type; (void)result; (void)resultcap;
+    return -1;
+}
 
 #define UNPIN_DNS_MAGIC 0x756E70696E444E53ULL /* "unpinDNS" */
 #define MAXADDR         8
 #define DNS_TIMEOUT_MS  3000
 #define MAX_RESOLVERS   8
 
-/* Default public resolvers, tried in order when UNPIN_DNS is unset: a binary
- * with no /etc/resolv.conf (Android, minimal containers) still resolves. */
+/* Default public resolvers, tried in order when UNPIN_DNS is unset. */
 static const char *const DEFAULT_RESOLVERS[] = { "1.1.1.1", "8.8.8.8" };
 
 /* The resolver list for this call: the space-separated IPv4 literals in
  * $UNPIN_DNS when the user sets it (to point the fallback at their own resolver
  * — privacy, a local cache, a corporate DNS), else the built-in defaults above.
- * UNPIN_DNS *replaces* the defaults rather than extending them; include them
- * explicitly if you want them too.
+ * UNPIN_DNS *replaces* the defaults rather than extending them.
  *
- * Entries MUST be IPv4 literals — they are used verbatim both as the UDP/53 peer
- * and, for DoH, as the host in https://<ip>/dns-query (where the cert is checked
- * against that IP's SAN). A hostname can't be allowed: the DoH leg would try to
- * resolve it and recurse straight back through this wrap. Non-literal, IPv6, or
- * past-MAX_RESOLVERS entries are silently skipped; if nothing valid is left
- * (unset, empty, oversized, or all junk) we fall back to the defaults so a
- * typo never leaves a resolver-less host with no way to resolve.
+ * Entries MUST be IPv4 literals — used verbatim both as the UDP/53 peer and, for
+ * DoH, as the host in https://<ip>/dns-query (cert checked against that IP's
+ * SAN). A hostname can't be allowed: the DoH leg would try to resolve it and
+ * recurse straight back through this interposer. Non-literal / IPv6 / overflow
+ * entries are skipped; if nothing valid remains we fall back to the defaults so
+ * a typo never leaves a resolver-less host mute.
  *
  * `buf` (caller-owned, alive for the whole resolution) backs the returned
- * pointers — strtok_r tokenises in place and `out[]` points into it. */
+ * pointers — we tokenise it in place and `out[]` points into it. */
 static size_t resolver_list(const char **out, char *buf, size_t bufcap)
 {
     const char *env = getenv("UNPIN_DNS");
@@ -165,13 +222,16 @@ static size_t resolver_list(const char **out, char *buf, size_t bufcap)
         size_t len = strlen(env);
         if (len < bufcap) {
             memcpy(buf, env, len + 1);
-            char *save = NULL;
-            for (char *tok = strtok_r(buf, " \t", &save);
-                 tok && n < MAX_RESOLVERS;
-                 tok = strtok_r(NULL, " \t", &save)) {
+            char *p = buf;
+            while (n < MAX_RESOLVERS) {
+                while (*p == ' ' || *p == '\t') p++;        /* skip separators */
+                if (!*p) break;
+                char *tok = p;
+                while (*p && *p != ' ' && *p != '\t') p++;
+                if (*p) *p++ = '\0';                        /* terminate token */
                 struct in_addr a4;
                 if (inet_pton(AF_INET, tok, &a4) == 1)
-                    out[n++] = tok;            /* IPv4 literal — safe for UDP + DoH URL */
+                    out[n++] = tok;        /* IPv4 literal — safe for UDP + DoH URL */
             }
         }
     }
@@ -185,7 +245,7 @@ static size_t resolver_list(const char **out, char *buf, size_t bufcap)
 
 /* One contiguous allocation per resolved name. `magic` MUST sit immediately
  * before `ai[]` (no padding: sockaddr_storage/uint64_t/addrinfo are all
- * 8-aligned), so __wrap_freeaddrinfo can detect ours by reading the 8 bytes
+ * 8-aligned), so the wrapped freeaddrinfo can detect ours by reading the 8 bytes
  * just before the returned addrinfo. */
 struct fb {
     struct sockaddr_storage ss[MAXADDR];
@@ -194,36 +254,8 @@ struct fb {
     struct addrinfo         ai[MAXADDR];
 };
 
-/* Mirror musl's own resolver-fallback trigger: /etc/resolv.conf absent, or
- * present but with no usable `nameserver` line. In both cases musl would query
- * 127.0.0.1 and fail, so that's precisely where we take over. A file WITH a
- * nameserver (even an unreachable one) means a resolver IS configured — we
- * delegate and never mask it. */
-static int no_configured_resolver(void)
-{
-    int fd = open("/etc/resolv.conf", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return 1;                       /* absent */
-    char buf[4096];
-    ssize_t n = read(fd, buf, sizeof buf - 1);
-    close(fd);
-    if (n <= 0) return 1;                       /* empty / unreadable */
-    buf[n] = '\0';
-    for (char *p = buf; *p; ) {
-        char *s = p;
-        while (*s == ' ' || *s == '\t') s++;
-        if (strncmp(s, "nameserver", 10) == 0 &&
-            (s[10] == ' ' || s[10] == '\t'))
-            return 0;                           /* a resolver is configured */
-        char *nl = strchr(p, '\n');
-        if (!nl) break;
-        p = nl + 1;
-    }
-    return 1;                                   /* no nameserver line */
-}
-
-/* Fallback only when there is no configured resolver and `node` is a hostname.
- * Numeric literals (v4/v6) and NULL go to the real resolver, which needs no
- * DNS for them. */
+/* Our DNS fallback can only help a real hostname. Numeric literals (v4/v6) and
+ * NULL need no DNS — the real resolver already handled or rejected them. */
 static int want_fallback(const char *node)
 {
     struct in_addr  a4;
@@ -231,7 +263,7 @@ static int want_fallback(const char *node)
     if (!node || !*node)                       return 0;
     if (inet_pton(AF_INET,  node, &a4) == 1)   return 0;
     if (inet_pton(AF_INET6, node, &a6) == 1)   return 0;
-    return no_configured_resolver();
+    return 1;                                   /* a real hostname */
 }
 
 static int parse_port(const char *service, const struct addrinfo *hints)
@@ -245,24 +277,22 @@ static int parse_port(const char *service, const struct addrinfo *hints)
     if (num) { long v = atol(service); return (v >= 0 && v <= 65535) ? (int)v : 0; }
 
     /* named — resolve it exactly as getaddrinfo would, by asking the real
-     * resolver to map the service only (node = NULL → no DNS). This reuses
-     * libc + /etc/services, so anything in /etc/services works (e.g. whois'
-     * "nicname"). */
+     * resolver to map the service only (node = NULL → no DNS). Reuses the OS
+     * services database, so anything there works (e.g. whois' "nicname"). */
     {
         struct addrinfo h, *r = NULL;
         memset(&h, 0, sizeof h);
         h.ai_family   = AF_INET;
         h.ai_socktype = (hints && hints->ai_socktype) ? hints->ai_socktype : SOCK_STREAM;
-        if (__real_getaddrinfo(NULL, service, &h, &r) == 0 && r) {
+        if (real_getaddrinfo(NULL, service, &h, &r) == 0 && r) {
             int p = ntohs(((struct sockaddr_in *)r->ai_addr)->sin_port);
-            __real_freeaddrinfo(r);
+            real_freeaddrinfo(r);
             if (p) return p;
         }
     }
 
-    /* last resort — a tiny built-in table for the case where /etc/services is
-     * also absent (some Android layouts). Covers the services unpins tools
-     * actually use. */
+    /* last resort — a tiny built-in table for when the services database is also
+     * absent (some Android layouts). Covers the services unpins tools use. */
     static const struct { const char *n; int p; } svc[] = {
         { "http", 80 }, { "https", 443 }, { "domain", 53 }, { "ftp", 21 },
         { "ssh", 22 }, { "ntp", 123 }, { "whois", 43 }, { "nicname", 43 }, { 0, 0 }
@@ -295,14 +325,14 @@ static int build_query(const char *host, int qtype,
 {
     if (cap < 16) return -1;
     memset(buf, 0, 12);
-    buf[0] = id >> 8; buf[1] = id & 0xff;
+    buf[0] = (unsigned char)(id >> 8); buf[1] = (unsigned char)(id & 0xff);
     buf[2] = 0x01;                      /* RD (recursion desired) */
     buf[5] = 0x01;                      /* QDCOUNT = 1 */
     int qn = encode_qname(host, buf + 12, cap - 16);
     if (qn < 0) return -1;
-    size_t o = 12 + qn;
-    buf[o++] = qtype >> 8; buf[o++] = qtype & 0xff;  /* QTYPE */
-    buf[o++] = 0x00;       buf[o++] = 0x01;          /* QCLASS = IN */
+    size_t o = 12 + (size_t)qn;
+    buf[o++] = (unsigned char)(qtype >> 8); buf[o++] = (unsigned char)(qtype & 0xff);
+    buf[o++] = 0x00;                        buf[o++] = 0x01;          /* QCLASS = IN */
     return (int)o;
 }
 
@@ -311,29 +341,34 @@ static int build_query(const char *host, int qtype,
 static int dns_exchange(const char *server, const unsigned char *q, int qlen,
                         unsigned char *resp, size_t rcap, uint16_t id)
 {
+#if defined(UNPIN_WINDOWS)
+    { WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); }   /* refcounted; idempotent */
+#endif
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
     sa.sin_port   = htons(53);
     if (inet_pton(AF_INET, server, &sa.sin_addr) != 1) return -1;
 
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return -1;
+    unpin_sock fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == UNPIN_BADSOCK) return -1;
 
     int rc = -1;
-    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0 &&
-        send(fd, q, qlen, 0) == qlen) {
-        struct pollfd pf = { .fd = fd, .events = POLLIN };
-        if (poll(&pf, 1, DNS_TIMEOUT_MS) == 1 && (pf.revents & POLLIN)) {
-            ssize_t n = recv(fd, resp, rcap, 0);
-            /* Match the transaction ID. The socket is connect()ed on a fresh
-             * ephemeral port per call, so off-path packets are already
-             * filtered; this rejects a stray/duplicate datagram. */
+    if (connect(fd, (struct sockaddr *)&sa, (int)sizeof sa) == 0 &&
+        send(fd, (const char *)q, qlen, 0) == qlen) {
+        unpin_pollfd pf;
+        memset(&pf, 0, sizeof pf);
+        pf.fd = fd; pf.events = POLLIN;
+        if (unpin_poll(&pf, 1, DNS_TIMEOUT_MS) == 1 && (pf.revents & POLLIN)) {
+            /* The socket is connect()ed on a fresh ephemeral port per call, so
+             * off-path packets are already filtered; the id check rejects a
+             * stray/duplicate datagram. */
+            int n = (int)recv(fd, (char *)resp, (int)rcap, 0);
             if (n >= 12 && resp[0] == (id >> 8) && resp[1] == (id & 0xff))
-                rc = (int)n;
+                rc = n;
         }
     }
-    close(fd);
+    unpin_closesocket(fd);
     return rc;
 }
 
@@ -350,8 +385,8 @@ static const unsigned char *skip_name(const unsigned char *p,
     return NULL;
 }
 
-/* Parse answers of type `qtype` (1=A, 28=AAAA) into b->ss/b->ai, appending
- * from *count. Returns 0 on success (possibly 0 records), -1 if malformed. */
+/* Parse answers of type `qtype` (1=A, 28=AAAA) into b->ss/b->ai, appending from
+ * *count. Returns 0 on success (possibly 0 records), -1 if malformed. */
 static int parse_resp(const unsigned char *r, int rlen, int qtype, int port,
                       struct fb *b, int *count)
 {
@@ -380,7 +415,7 @@ static int parse_resp(const unsigned char *r, int rlen, int qtype, int port,
                 struct sockaddr_in *s = (struct sockaddr_in *)&b->ss[idx];
                 memset(s, 0, sizeof *s);
                 s->sin_family = AF_INET;
-                s->sin_port   = htons(port);
+                s->sin_port   = htons((uint16_t)port);
                 memcpy(&s->sin_addr, p, 4);
                 b->ai[idx].ai_family  = AF_INET;
                 b->ai[idx].ai_addrlen = sizeof(struct sockaddr_in);
@@ -389,7 +424,7 @@ static int parse_resp(const unsigned char *r, int rlen, int qtype, int port,
                 struct sockaddr_in6 *s = (struct sockaddr_in6 *)&b->ss[idx];
                 memset(s, 0, sizeof *s);
                 s->sin6_family = AF_INET6;
-                s->sin6_port   = htons(port);
+                s->sin6_port   = htons((uint16_t)port);
                 memcpy(&s->sin6_addr, p, 16);
                 b->ai[idx].ai_family  = AF_INET6;
                 b->ai[idx].ai_addrlen = sizeof(struct sockaddr_in6);
@@ -401,13 +436,20 @@ static int parse_resp(const unsigned char *r, int rlen, int qtype, int port,
     return 0;
 }
 
-int __wrap_getaddrinfo(const char *node, const char *service,
-                       const struct addrinfo *hints, struct addrinfo **res)
+int ENTRY_GETADDRINFO(const char *node, const char *service,
+                      const struct addrinfo *hints, struct addrinfo **res)
 {
-    int flags = hints ? hints->ai_flags : 0;
+    /* Always try the system resolver first — identical path on every platform. */
+    int rc = real_getaddrinfo(node, service, hints, res);
 
-    if ((flags & AI_NUMERICHOST) || !want_fallback(node))
-        return __real_getaddrinfo(node, service, hints, res);
+    /* Take over only when it could not REACH a resolver (EAI_AGAIN and the other
+     * transport/system failures). A success is returned as-is; EAI_NONAME is an
+     * authoritative NXDOMAIN we must not mask; numeric literals / AI_NUMERICHOST
+     * need no DNS. */
+    int flags = hints ? hints->ai_flags : 0;
+    if (rc == 0 || rc == EAI_NONAME ||
+        (flags & AI_NUMERICHOST) || !want_fallback(node))
+        return rc;
 
     int family   = hints ? hints->ai_family   : AF_UNSPEC;
     int socktype = hints ? hints->ai_socktype : 0;
@@ -415,7 +457,7 @@ int __wrap_getaddrinfo(const char *node, const char *service,
     int port     = parse_port(service, hints);
 
     struct fb *b = calloc(1, sizeof *b);
-    if (!b) return EAI_MEMORY;
+    if (!b) return rc;                 /* keep the real resolver's error */
     b->magic = UNPIN_DNS_MAGIC;
     int count = 0;
 
@@ -428,15 +470,14 @@ int __wrap_getaddrinfo(const char *node, const char *service,
      * into the same buffer and never fills it (we set no EDNS, so servers cap
      * UDP answers at 512). */
     unsigned char q[300], r[4096];
-    uint16_t id = (uint16_t)(getpid() ^ (uintptr_t)b);
-    /* Resolvers for this call — $UNPIN_DNS if the user set it, else the defaults.
-     * `dnsbuf` backs the parsed strings and must outlive the loop below. */
+    uint16_t id = (uint16_t)(UNPIN_PID() ^ (uintptr_t)b);
+    /* Resolvers for this call — $UNPIN_DNS if set, else the defaults. `dnsbuf`
+     * backs the parsed strings and must outlive the loop below. */
     const char *resolvers[MAX_RESOLVERS];
     char dnsbuf[256];
     const size_t nres = resolver_list(resolvers, dnsbuf, sizeof dnsbuf);
-    const int have_fetch = (unpin_readurl != NULL); /* TLS-carrying binary? */
-    int udp_dead = 0;                               /* set once UDP/53 is blocked */
-    int doh_dead = 0;                               /* set once DoH/443 is blocked */
+    int udp_dead = 0;                  /* set once UDP/53 is blocked */
+    int doh_dead = 0;                  /* set once DoH/443 is blocked */
 
     for (int qi = 0; qi < nq && count < MAXADDR; qi++) {
         uint16_t qid = id++;
@@ -459,14 +500,23 @@ int __wrap_getaddrinfo(const char *node, const char *service,
             if (!answered) udp_dead = 1;
         }
 
-        /* Second stage: UDP got nothing and the binary can do TLS → DoH/443.
-         * We hand the consumer's fetch hook a ready-made DoH request and let it
-         * speak HTTPS; it never sees a DNS concept. */
-        if (!answered && have_fetch && !doh_dead) {
+        /* Second stage: UDP got nothing → DoH/443. unpin_readurl is the weak stub
+         * (returns -1) unless a TLS-carrying consumer overrode it; the doh_dead
+         * short-circuit below then skips the rest cheaply. */
+        if (!answered && !doh_dead) {
             int reached = 0;               /* a resolver answered over DoH */
             for (size_t si = 0; si < nres; si++) {
+                /* "https://<ip>/dns-query" without snprintf — mingw routes
+                 * snprintf through wide-char CRT code, dragging in extra deps;
+                 * memcpy keeps the archive's libc footprint to the basics. */
                 char url[64];
-                snprintf(url, sizeof url, "https://%s/dns-query", resolvers[si]);
+                static const char pfx[] = "https://", sfx[] = "/dns-query";
+                size_t ip = strlen(resolvers[si]);
+                if (sizeof pfx - 1 + ip + sizeof sfx > sizeof url) continue;
+                size_t o = sizeof pfx - 1;
+                memcpy(url, pfx, o);
+                memcpy(url + o, resolvers[si], ip); o += ip;
+                memcpy(url + o, sfx, sizeof sfx);   /* includes the NUL */
                 int rlen = unpin_readurl(url, q, qlen, "application/dns-message",
                                          r, (int)sizeof r);
                 if (rlen > 0) {
@@ -475,14 +525,14 @@ int __wrap_getaddrinfo(const char *node, const char *service,
                     break;                 /* this resolver answered over DoH */
                 }
             }
-            /* No resolver answered over DoH either — 443 is blocked too. Skip the
-             * DoH round for the next qtype rather than re-paying the per-resolver
-             * HTTPS timeout we just proved hopeless (mirrors udp_dead above). */
+            /* No resolver answered over DoH either — 443 is blocked or no TLS
+             * provider is linked. Skip the DoH round for the next qtype rather
+             * than re-paying the per-resolver timeout (mirrors udp_dead above). */
             if (!reached) doh_dead = 1;
         }
     }
 
-    if (count == 0) { free(b); return EAI_NONAME; }
+    if (count == 0) { free(b); return rc; }   /* fallback empty → real's error */
 
     for (int i = 0; i < count; i++) {
         b->ai[i].ai_flags     = 0;
@@ -500,7 +550,7 @@ int __wrap_getaddrinfo(const char *node, const char *service,
     return 0;
 }
 
-void __wrap_freeaddrinfo(struct addrinfo *res)
+void ENTRY_FREEADDRINFO(struct addrinfo *res)
 {
     if (res) {
         uint64_t m;
@@ -510,5 +560,5 @@ void __wrap_freeaddrinfo(struct addrinfo *res)
             return;
         }
     }
-    __real_freeaddrinfo(res);
+    real_freeaddrinfo(res);
 }

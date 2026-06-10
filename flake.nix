@@ -284,11 +284,11 @@
         # libcurl/OpenSSL. Left unprovided, the binary stays UDP-only at zero
         # cost. See dns-fallback/dns-fallback.c for the full contract.
         #
-        # Built with the TARGET stdenv so it cross-compiles per musl arch, and
-        # pulled by the linker only if the binary references getaddrinfo (DCE
-        # drops it from tree/jq/coreutils/…). The wrapped symbol is also what
-        # Rust's std::net resolution emits, so this fixes the Rust catalog
-        # binaries (unpin/unpin-man/…) with no Rust-side change.
+        # Built with the TARGET stdenv so it compiles per arch/OS — one C file,
+        # three link mechanisms selected by #ifdef (see dns-fallback.c): musl/
+        # mingw via `--wrap`, darwin via a getaddrinfo redefinition + dlsym. The
+        # interposed symbol is also what Rust's std::net resolution emits, so this
+        # fixes the Rust binaries (unpin/unpin-readme) with no Rust-side change.
         dnsFallbackLib = pkgs: pkgs.stdenv.mkDerivation {
           pname = "unpin-dns-fallback";
           version = "0.1";
@@ -322,18 +322,31 @@
         # hostPlatform is the glibc build host). Both the guard and the
         # archive's toolchain come from it, so the .a matches the consumer's
         # arch (native or cross-musl) exactly.
+        # Interpose getaddrinfo per toolchain (see dns-fallback.c's header):
+        #   - linux musl / windows mingw: GNU ld `--wrap`. NIX_LDFLAGS lands at
+        #     the END of the link line, after the toolchain's own libc, and a
+        #     static archive only satisfies references that come BEFORE it — so we
+        #     re-state the libc AFTER our archive (`-lc` on linux; `-lws2_32`
+        #     `-lmsvcrt` on windows, for the socket + CRT calls it makes).
+        #     rustc's `-nodefaultlibs` link is what exposes this.
+        #   - darwin: ld64 has no `--wrap`, so the archive DEFINES getaddrinfo/
+        #     freeaddrinfo and we `-force_load` it to win over libSystem; the real
+        #     ones are reached at runtime via dlsym(RTLD_NEXT).
+        # The archive is pulled by the linker only when getaddrinfo is referenced.
         withDnsFallback = staticPkgs: drv:
-          let h = staticPkgs.stdenv.hostPlatform;
+          let h   = staticPkgs.stdenv.hostPlatform;
+              lib = "${dnsFallbackLib staticPkgs}/lib";
           in if (h.isLinux && (h.isStatic or false))
              then appendLdFlags drv
-               # Trailing `-lc`: NIX_LDFLAGS lands at the END of the link line,
-               # after the toolchain's own `-lc`. Our archive's libc references
-               # (inet_pton/getaddrinfo/htons/…) would otherwise be undefined —
-               # static archives only satisfy references that come BEFORE them.
-               # rustc's `-nodefaultlibs` link exposes this; re-stating `-lc`
-               # after our archive resolves them (harmless duplicate for C).
-               ("--wrap=getaddrinfo --wrap=freeaddrinfo "
-               + "-L${dnsFallbackLib staticPkgs}/lib -l:libunpindns.a -lc")
+               ("--wrap=getaddrinfo --wrap=freeaddrinfo -L${lib} -l:libunpindns.a -lc")
+             else if h.isWindows
+             then appendLdFlags drv
+               # -lws2_32 for the socket calls, -lkernel32 for GetCurrentProcessId,
+               # -lmsvcrt for the basic CRT (calloc/getenv/memcpy/…). The archive
+               # avoids snprintf, so no wide-char CRT cascade is pulled.
+               ("--wrap=getaddrinfo --wrap=freeaddrinfo -L${lib} -l:libunpindns.a -lws2_32 -lkernel32 -lmsvcrt")
+             else if h.isDarwin
+             then appendLdFlags drv "-force_load ${lib}/libunpindns.a"
              else drv;
 
         # Make a build scope link `pkgName`'s final $CC link with lld + the
@@ -1457,7 +1470,11 @@ CBODY
             stripped = pkgs:
               let
                 core = dropSharedLibs (filterEnableStaticOnDarwin (applyOptSsp (rawBuild pkgs)));
-                base = if dnsFallback then withDnsFallback pkgs.pkgsStatic core else core;
+                # C catalog keeps the fallback linux-only for now; the darwin-C
+                # and windows-cosmo paths are a deliberate follow-up (the Rust
+                # tools opt into darwin/windows by calling withDnsFallback directly).
+                base = if dnsFallback && pkgs.stdenv.hostPlatform.isLinux
+                       then withDnsFallback pkgs.pkgsStatic core else core;
                 # withMan must run on the underlying drv (it edits the bin
                 # output and reads the man output) BEFORE strippedOrJoined
                 # collapses multi-output drvs into a symlinkJoin.
