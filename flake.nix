@@ -1681,8 +1681,19 @@ CBODY
                 }));
               }
               // nixpkgs.lib.optionalAttrs (nativeBuild && system == "aarch64-linux") {
-                # armv7l-hf-multiplatform = armv7l-unknown-linux-musleabihf,
-                # hardware float (VFPv3) + hardware 64-bit atomics
+                # armv7l-unknown-linux-musleabihf: nixpkgs.pkgsCross has no
+                # musl example for armv7l (muslpi is armv6), so spell the
+                # crossSystem out — exactly like riscv64 above. Until 2026-06
+                # this used the glibc `armv7l-hf-multiplatform` example and
+                # relied on pkgsStatic's automatic glibc→musl swap; the inner
+                # static drvs are IDENTICAL either way (verified by drv hash),
+                # but the glibc top scope leaked into consumer `build`
+                # closures that read `pkgs` directly (the Rust path), so make
+                # the scope say what we ship. Only the light wrapper drvs
+                # (withMan repack/strip) changed hash.
+                #
+                # The triple means: hardware float (VFPv3) + hardware 64-bit
+                # atomics
                 # (LDREXD/STREXD). Covers Pi 2/3/4 in 32-bit mode,
                 # BeagleBoneBlack, Odroid, and the dominant ARM 32-bit
                 # hardware that runs Linux today. Matches the Rust
@@ -1694,7 +1705,10 @@ CBODY
                 # (libssh2, glib ≥ 2.68, any modern threading wrapper)
                 # fails to link on armv6 with __atomic_*_8 undefined,
                 # since musl doesn't ship libatomic in pkgsStatic.
-                "linux-armv7l" = stripped (withLLDLink pkgsAttr pkgs.pkgsCross.armv7l-hf-multiplatform);
+                "linux-armv7l" = stripped (withLLDLink pkgsAttr (import nixpkgs {
+                  inherit system;
+                  crossSystem = { config = "armv7l-unknown-linux-musleabihf"; };
+                }));
               }
               // nixpkgs.lib.optionalAttrs (windowsEnabled && system == "x86_64-linux") {
                 "windows-x86_64" = windowsPkg;
@@ -1724,6 +1738,120 @@ CBODY
               darwin_allow_private_frameworks = darwinAllowPrivateFrameworks;
             };
           };
+
+        # Rust-crate flake template — pure-Rust crates only (no C in the dep
+        # closure: ring, openssl-sys, vendored-C *-sys crates need real cross
+        # toolchains; see unpins/unpin for that shape). A thin wrapper over
+        # mkStandaloneFlake that supplies Rust-aware build closures:
+        #
+        #   native linux/darwin → pkgs.pkgsStatic.<pkgsAttr>: the nixpkgs
+        #     recipe as-is (src, cargoHash, meta all reused).
+        #   cross-musl (i686, armv7l, ppc64le, riscv64, local aarch64 check)
+        #     → NO C cross toolchain at all: rustup's rust-std for *-musl
+        #     (via the consumer's rust-overlay input) bundles musl's libc.a
+        #     + crt objects (self-contained linking) and the build host's
+        #     ld.lld links any ELF arch. rustc, cargo and the crate build
+        #     scripts all run as native binaries; only --target + the linker
+        #     differ. First proven on unpins/cfonts, all nine targets.
+        #   cross darwin (CI aarch64→x86_64; local Intel→arm64 gate)
+        #     → nixpkgs cross rustPlatform + the pkgsStatic.libiconv pin
+        #     (rustc injects -liconv; a libiconv.2.dylib load command flunks
+        #     the portability check) + a build-arch -L for the proc-macro
+        #     dylib links (the unpin-readme recipe).
+        #   windows → pkgs.pkgsCross.mingwW64.<pkgsAttr> (pure Rust needs
+        #     none of the mingw-overlay C fixes).
+        #
+        # dnsFallback is forced off: withDnsFallback's unsalted NIX_LDFLAGS
+        # leaks the arch-specific libunpindns.a into the BUILD-host link of
+        # crate build scripts under the rustup-toolchain crosses. A Rust
+        # crate that resolves hostnames needs bespoke wiring (unpins/unpin);
+        # asking for dnsFallback here is an eval-time error on purpose.
+        #
+        # The consumer passes its own `rust-overlay` input (pin it with
+        # `inputs.nixpkgs.follows = "unpins-lib/nixpkgs"`); nix-lib itself
+        # takes no new input, so the C catalog's lock files are untouched.
+        mkRustCrate =
+          { self
+          , name
+          , rust-overlay
+          , pkgsAttr ? name
+          , ...
+          }@args:
+          let
+            muslCross = pkgs:
+              let
+                # Eval-only peek at the scope mkStandaloneFlake hands us:
+                # pkgsStatic elaborates the static-musl host (and converts a
+                # glibc top scope, as armv7l's was on older nix-lib). No
+                # derivation from the cross scope is ever built.
+                triple = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTarget;
+                npkgs = import nixpkgs {
+                  system = pkgs.stdenv.buildPlatform.system;
+                  overlays = [ rust-overlay.overlays.default ];
+                };
+                rust = npkgs.rust-bin.stable.latest.default.override {
+                  targets = [ triple ];
+                };
+                base = npkgs.${pkgsAttr};
+                bin = base.meta.mainProgram or name;
+              in
+              npkgs.stdenv.mkDerivation {
+                pname = "${pkgsAttr}-${triple}";
+                inherit (base) version src meta;
+                cargoDeps = base.cargoDeps;
+                nativeBuildInputs = [
+                  rust
+                  npkgs.rustPlatform.cargoSetupHook
+                  npkgs.lld
+                ];
+                # ld.lld by name → rustc infers the gnu-lld flavor;
+                # link-self-contained uses rust-std's bundled musl crt/libc;
+                # -C strip replaces the fixup strip (native strip can't edit
+                # a foreign-arch ELF, hence dontStrip).
+                env.RUSTFLAGS = "-C linker=ld.lld -C link-self-contained=yes -C target-feature=+crt-static -C strip=symbols";
+                dontStrip = true;
+                buildPhase = ''
+                  runHook preBuild
+                  cargo build --release --offline --target ${triple}
+                  runHook postBuild
+                '';
+                installPhase = ''
+                  runHook preInstall
+                  install -Dm755 target/${triple}/release/${bin} $out/bin/${bin}
+                  runHook postInstall
+                '';
+              };
+
+            darwinCross = pkgs:
+              let
+                salt = builtins.replaceStrings [ "-" "." ] [ "_" "_" ]
+                  pkgs.stdenv.buildPlatform.config;
+              in
+              pkgs.${pkgsAttr}.overrideAttrs (old: {
+                buildInputs = [ pkgs.pkgsStatic.libiconv ] ++ (old.buildInputs or [ ]);
+                "NIX_LDFLAGS_${salt}" = "-L${pkgs.buildPackages.libiconv}/lib";
+              });
+
+            rustBuild = pkgs:
+              let
+                host = pkgs.stdenv.hostPlatform;
+                cross = host.config != pkgs.stdenv.buildPlatform.config;
+              in
+              if !cross then pkgs.pkgsStatic.${pkgsAttr}
+              else if host.isDarwin then darwinCross pkgs
+              else muslCross pkgs;
+          in
+          assert nixpkgs.lib.assertMsg (!(args.dnsFallback or false))
+            "mkRustCrate: dnsFallback is unsupported for Rust crates (the unsalted NIX_LDFLAGS breaks crate build scripts) — see unpins/unpin for bespoke wiring";
+          mkStandaloneFlake (
+            builtins.removeAttrs args [ "rust-overlay" ]
+            // {
+              build = args.build or rustBuild;
+              windowsBuild = args.windowsBuild
+                or (pkgs: pkgs.pkgsCross.mingwW64.${pkgsAttr});
+              dnsFallback = false;
+            }
+          );
 
         # mkPkgsLTO: pkgsStatic with a chain-wide LTO overlay. Every drv in
         # the closure rebuilds with -flto + gcc-ar + --gc-sections. Stack
