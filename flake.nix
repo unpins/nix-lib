@@ -1739,20 +1739,24 @@ CBODY
             };
           };
 
-        # Rust-crate flake template — pure-Rust crates only (no C in the dep
-        # closure: ring, openssl-sys, vendored-C *-sys crates need real cross
-        # toolchains; see unpins/unpin for that shape). A thin wrapper over
-        # mkStandaloneFlake that supplies Rust-aware build closures:
+        # Rust-crate flake template. A thin wrapper over mkStandaloneFlake
+        # that supplies Rust-aware build closures. Two source modes (nixpkgs
+        # attr vs own-source, see the `src` arg) × two dep-closure shapes
+        # (pure Rust vs vendored C, see `vendoredC`). Crates with real
+        # external C/TLS deps (ring, openssl-sys) are out of scope — see
+        # unpins/unpin for that hand-rolled shape.
         #
         #   native linux/darwin → pkgs.pkgsStatic.<pkgsAttr>: the nixpkgs
         #     recipe as-is (src, cargoHash, meta all reused).
         #   cross-musl (i686, armv7l, ppc64le, riscv64, local aarch64 check)
-        #     → NO C cross toolchain at all: rustup's rust-std for *-musl
-        #     (via the consumer's rust-overlay input) bundles musl's libc.a
-        #     + crt objects (self-contained linking) and the build host's
-        #     ld.lld links any ELF arch. rustc, cargo and the crate build
-        #     scripts all run as native binaries; only --target + the linker
-        #     differ. First proven on unpins/cfonts, all nine targets.
+        #     → pure Rust: NO C cross toolchain at all — rustup's rust-std
+        #     for *-musl (via the consumer's rust-overlay input) bundles
+        #     musl's libc.a + crt objects (self-contained linking) and the
+        #     build host's ld.lld links any ELF arch. rustc, cargo and the
+        #     crate build scripts all run as native binaries; only --target
+        #     + the linker differ. First proven on unpins/cfonts, all nine
+        #     targets. With vendoredC, the same scopes the C catalog caches
+        #     supply the C compiler/linker instead (unpins/unpin-man).
         #   cross darwin (CI aarch64→x86_64; local Intel→arm64 gate)
         #     → nixpkgs cross rustPlatform + the pkgsStatic.libiconv pin
         #     (rustc injects -liconv; a libiconv.2.dylib load command flunks
@@ -1826,11 +1830,11 @@ CBODY
                 # derivation from the cross scope is ever built.
                 triple = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTarget;
                 npkgs = rustPkgsFor pkgs.stdenv.buildPlatform.system;
-                rust = npkgs.rust-bin.stable.latest.default.override {
-                  targets = [ triple ];
-                };
+                rust = toolchainFor pkgs.stdenv.buildPlatform.system triple;
                 base = if ownSource then null else npkgs.${pkgsAttr};
-                bin = if ownSource then name else base.meta.mainProgram or name;
+                bin =
+                  if ownSource then args.binName or name
+                  else base.meta.mainProgram or name;
               in
               npkgs.stdenv.mkDerivation {
                 pname = "${pkgsAttr}-${triple}";
