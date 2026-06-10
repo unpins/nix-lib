@@ -562,8 +562,10 @@
           installPhase = ''mkdir -p $out/bin; cp unpin-vfs-pack $out/bin/'';
         };
 
-        # Shared embed primitive for withAliases/withMan: add a staging `unpin/`
-        # subtree to the binary's embedded ZIP (docs/embedded-metadata.md).
+        # Shared embed primitive for withAliases/withMan/withRuntimeData: add a
+        # staging tree (the ZIP-root layout: `unpin/...` metadata entries and/or
+        # a VFS runtime tree) to the binary's embedded ZIP
+        # (docs/embedded-metadata.md).
         # Every binary ends up with exactly ONE ZIP whose offsets are
         # file-adjusted (absolute) — the self-extracting-archive convention, so
         # `unzip <binary>` reads clean and cosmo's zipos can parse it (zipos
@@ -589,10 +591,13 @@
             if [ ! -f "$__ues_bin" ]; then
               echo "unpin embed: $__ues_bin does not exist" >&2; exit 1
             fi
-            find "$__ues_stage/unpin" -exec touch -h -d "@''${SOURCE_DATE_EPOCH:-315532800}" {} + 2>/dev/null || true
-            __ues_names="$(cd "$__ues_stage" && find unpin -mindepth 1 \( -type f -o -type l \) | LC_ALL=C sort)"
+            find "$__ues_stage" -mindepth 1 -exec touch -h -d "@''${SOURCE_DATE_EPOCH:-315532800}" {} + 2>/dev/null || true
+            __ues_names="$(cd "$__ues_stage" && find . -mindepth 1 \( -type f -o -type l \) | sed 's|^\./||' | LC_ALL=C sort)"
             [ -n "$__ues_names" ] || return 0
-            if unzip -Z1 "$__ues_bin" 2>/dev/null | grep -qxF .cosmo; then
+            # grep WITHOUT -q so it consumes all of unzip's output: stdenv
+            # phases run `set -o pipefail`, and -q's early exit would SIGPIPE
+            # unzip on a tail-ZIP listing bigger than the pipe buffer.
+            if [ -n "$(unzip -Z1 "$__ues_bin" 2>/dev/null | grep -xF .cosmo)" ]; then
               # cosmo tail-ZIP edit. `zip -y` keeps `.so` symlinks; mtimes are
               # pinned by the touch above and `-X` drops uid/gid, for
               # reproducibility. Idempotent: re-adding an entry replaces it.
@@ -600,12 +605,12 @@
             else
               # Merge this call's subtree into the per-binary accumulator.
               __ues_acc="$NIX_BUILD_TOP/.unpin-embed-$(printf '%s' "$__ues_bin" | cksum | cut -d' ' -f1)"
-              mkdir -p "$__ues_acc/unpin"
-              cp -a "$__ues_stage/unpin/." "$__ues_acc/unpin/"
+              mkdir -p "$__ues_acc"
+              cp -a "$__ues_stage/." "$__ues_acc/"
               # unpin-vfs-pack stores no symlinks (miniz emits no unix link
               # mode), so resolve `.so`-redirect man links to their target's
               # bytes — same deref the @INC blob does with `cp -L`.
-              find "$__ues_acc/unpin" -type l | while IFS= read -r __ues_l; do
+              find "$__ues_acc" -type l | while IFS= read -r __ues_l; do
                 __ues_t="$(readlink -f "$__ues_l" 2>/dev/null || true)"
                 if [ -n "$__ues_t" ] && [ -f "$__ues_t" ]; then
                   rm -f "$__ues_l"; cp "$__ues_t" "$__ues_l"
@@ -628,7 +633,7 @@
               # weight on a small one. So only train above a threshold, and keep the
               # dict variant ONLY if it actually came out smaller: the dict can never
               # make a package larger, and training too-few samples just falls back.
-              __ues_raw=$(find "$__ues_acc/unpin" -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}')
+              __ues_raw=$(find "$__ues_acc" -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}')
               if [ "''${__ues_raw:-0}" -ge 1048576 ] && command -v zstd >/dev/null 2>&1; then
                 if ( cd "$__ues_acc" && zstd -q -f --train $(find . -type f | LC_ALL=C sort) -o "$__ues_d/zdict" --maxdict=112640 2>/dev/null ) \
                    && unpin-vfs-pack "$__ues_d/md.zip" "$__ues_acc" --dict "$__ues_d/zdict" \
@@ -915,9 +920,12 @@
                 # share/man at all, or a share/man with no actual pages (e.g. a
                 # prune emptied man1/ and left only an empty tree). Borrow the
                 # version-locked pages from a man-bearing build (windows graft).
+                # -print -quit: no pipe — under stdenv's `set -o pipefail` a
+                # `find | grep -q` dies of grep's early-exit SIGPIPE on big
+                # man trees and misreads them as empty.
                 if [ -d "${manFallback}/share/man" ] \
                    && { [ -z "$__unpin_manroot" ] \
-                        || ! find "$__unpin_manroot/share/man" \( -type f -o -type l \) 2>/dev/null | grep -q .; }; then
+                        || [ -z "$(find "$__unpin_manroot/share/man" \( -type f -o -type l \) -print -quit 2>/dev/null)" ]; }; then
                   __unpin_manroot="${manFallback}"
                 fi''}
               ''}
@@ -957,6 +965,63 @@
                 fi
                 rm -rf "$__unpin_stage"
               fi
+            '';
+          });
+
+        # Embed a package's RUNTIME TREE (vim's share/vim, perl's @INC, …) into
+        # the binary's single embedded ZIP, next to the `unpin/*` metadata
+        # entries — the unpin-vfs self-EOF mode (-DUNPIN_VFS_SELF,
+        # github:unpins/unpin-vfs) reads it back from the executable's own EOF
+        # at run time. Replaces the .incbin/blob.S link-time embed: data
+        # changes no longer relink, and one binary carries exactly one ZIP.
+        #
+        # `stage` is a shell snippet run in postFixup (i.e. AFTER strip) with
+        # `$__unpin_stage` pointing at an empty directory that is the ZIP root:
+        # populate it with the tree exactly as the VFS should serve it (entry
+        # `a/b.vim` shows up as `<UNPIN_VFS_ROOT>/a/b.vim`). Composes
+        # order-free with withAliases/withMan — all three accumulate into the
+        # one per-binary ZIP. An empty stage fails the build: unlike man
+        # pages, a missing runtime tree is a broken program, not a degraded
+        # one.
+        withRuntimeData = pkgs: { primary, stage }: drv:
+          let
+            binOutputName =
+              let outs = drv.outputs or [ "out" ];
+              in
+              if builtins.elem "bin" outs then "bin"
+              else if builtins.elem "out" outs then "out"
+              else builtins.head outs;
+          in
+          drv.overrideAttrs (old: {
+            nativeBuildInputs = (old.nativeBuildInputs or [ ])
+              ++ [
+                pkgs.buildPackages.zip
+                pkgs.buildPackages.unzip
+                (unpinPackTool pkgs)
+                pkgs.buildPackages.zstd
+              ];
+
+            postFixup = (old.postFixup or "") + ''
+              ${unpinEmbedSh}
+              __unpin_bin="''${${binOutputName}}/bin/${primary}"
+              if [ ! -f "$__unpin_bin" ] && [ -f "$__unpin_bin.exe" ]; then
+                __unpin_bin="$__unpin_bin.exe"
+              fi
+              if [ ! -f "$__unpin_bin" ]; then
+                echo "withRuntimeData: $__unpin_bin does not exist" >&2
+                exit 1
+              fi
+              __unpin_stage="$(mktemp -d)"
+              ${stage}
+              # -print -quit: no pipe — stdenv phases run `set -o pipefail`, and
+              # a `find | grep -q` would die of grep's early-exit SIGPIPE on any
+              # tree bigger than the pipe buffer, misreading it as empty.
+              if [ -z "$(find "$__unpin_stage" -mindepth 1 \( -type f -o -type l \) -print -quit)" ]; then
+                echo "withRuntimeData: stage produced no files for ${primary}" >&2
+                exit 1
+              fi
+              __unpin_embed_subtree "$__unpin_bin" "$__unpin_stage"
+              rm -rf "$__unpin_stage"
             '';
           });
 
