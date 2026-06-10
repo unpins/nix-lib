@@ -25,15 +25,16 @@
  *     triggers): the lookup itself was malformed — a fallback answer would mask
  *     the caller's bug behind addresses carrying a port of 0.
  * The fallback is OPT-IN: it stays dormant unless the user pointed it at a
- * resolver, so by default a reach failure surfaces unchanged (and unpin then
- * teaches the user how to turn it on). Two opt-in sources, checked in order:
+ * resolver, so by default a reach failure surfaces unchanged (and unpin prints
+ * a hint about the opt-in when an error reads like a resolution failure). Two
+ * opt-in sources, checked in order:
  *   - $UNPIN_DNS — space-separated IPv4 literals, a one-shot override;
  *   - `dns = <ip> …` in unpin's config file — read by this shim itself (see
  *     config_dns), so EVERY unpins program honours it without an env var.
  * Only for a real hostname (numeric literals / AI_NUMERICHOST need no DNS), only
  * on a reach failure, and only when a resolver is configured does it run its own
- * query over UDP/53 to that resolver. With nothing configured it reports the
- * condition (unpin_dns_note_unreachable) and returns the real error untouched.
+ * query over UDP/53 to that resolver. With nothing configured it returns the
+ * real error untouched.
  * The rule is uniform on every platform: try the OS resolver, fall back only
  * when it can't reach one and the user opted in — so on a normal host the OS
  * answers and the fallback never runs.
@@ -209,16 +210,6 @@ int unpin_readurl(const char *url,
 #define DNS_TIMEOUT_MS  3000
 #define MAX_RESOLVERS   8
 
-/* Optional hook: the shim calls this once when a lookup needs the fallback but
- * the user has NOT opted in (no $UNPIN_DNS, no config `dns`), so it had to
- * surface the real EAI_AGAIN. A WEAK no-op definition here; unpin overrides it
- * with a strong definition (see unpin/src/dns.rs) that records the condition so
- * it can teach the user about opt-in DNS. Other tools that link this archive
- * keep the no-op. Same weak-definition mechanism as unpin_readurl above (a weak
- * *definition* links clean on ELF, Mach-O and COFF alike). */
-__attribute__((weak))
-void unpin_dns_note_unreachable(void) { }
-
 /* Trim ASCII whitespace from both ends of `s` in place; returns the first
  * non-space byte. Mirrors the `.trim()` in unpin/src/config.rs (ASCII subset is
  * enough — a `dns` value is IPv4 literals, never multibyte whitespace). */
@@ -332,8 +323,8 @@ static size_t tokenize_resolvers(const char *src, const char **out,
  * override) when it yields ≥ 1 valid literal, else the config `dns` key, else
  * empty. There is deliberately NO built-in default — the fallback never fires
  * without the user's explicit say-so; an empty return tells the caller to
- * surface the real EAI_AGAIN (and call unpin_dns_note_unreachable). `buf`
- * (caller-owned, alive for the whole resolution) backs the returned pointers. */
+ * surface the real EAI_AGAIN. `buf` (caller-owned, alive for the whole
+ * resolution) backs the returned pointers. */
 static size_t resolver_list(const char **out, char *buf, size_t bufcap)
 {
     const char *env = getenv("UNPIN_DNS");
@@ -575,17 +566,15 @@ int ENTRY_GETADDRINFO(const char *node, const char *service,
         (flags & AI_NUMERICHOST) || !want_fallback(node))
         return rc;
 
-    /* …and only when the user OPTED IN (env $UNPIN_DNS or config `dns`). With no
-     * resolver configured we can't help: latch the condition so unpin can teach
-     * the user, and surface the real error unchanged. `dnsbuf` backs the parsed
-     * strings and must outlive the loop below. */
+    /* …and only when the user OPTED IN (env $UNPIN_DNS or config `dns`). With
+     * no resolver configured we can't help: surface the real error unchanged
+     * (unpin prints a hint pointing at the opt-in when an error reads like a
+     * resolution failure). `dnsbuf` backs the parsed strings and must outlive
+     * the loop below. */
     const char *resolvers[MAX_RESOLVERS];
     char dnsbuf[256];
     const size_t nres = resolver_list(resolvers, dnsbuf, sizeof dnsbuf);
-    if (nres == 0) {
-        unpin_dns_note_unreachable();
-        return rc;
-    }
+    if (nres == 0) return rc;
 
     int family   = hints ? hints->ai_family   : AF_UNSPEC;
     int socktype = hints ? hints->ai_socktype : 0;
