@@ -2,6 +2,7 @@
  * from a directory tree. Build-time tool; not shipped in the final binary.
  *
  *   unpin-vfs-pack OUT.zip ROOTDIR [--dict DICT] [--level N]
+ *                  [--base N] [--deflate NAME]...
  *
  * Every regular file under ROOTDIR is stored under its ROOTDIR-relative path,
  * compressed with zstd. With --dict, a trained zstd dictionary (from
@@ -9,6 +10,14 @@
  * reserved STORED entry ".unpin/zdict", so the reader can self-load it -- the
  * one piece a vanilla zstd-zip tool won't understand. Without --dict the output
  * is plain, interoperable zstd-in-zip.
+ *
+ * --base N rewrites the central directory so every offset is N bytes larger:
+ * the file-adjusted ("self-extracting archive") convention for a ZIP appended
+ * to an N-byte executable. The whole binary+ZIP then reads as one clean
+ * archive (`zip -A` semantics), which is also the only convention cosmo's
+ * zipos accepts. --deflate NAME (repeatable, exact ROOTDIR-relative match)
+ * stores that entry with plain deflate instead of zstd -- for entries that
+ * pre-zstd readers must still decode (unpin/aliases).
  *
  * The archive stays a structurally standard .zip: any tool lists it; only
  * zstd-aware tools decode the entries.
@@ -32,6 +41,16 @@ static const char *g_root;
 static size_t g_root_len;
 static int g_level = 19;
 static long g_files, g_bytes_in, g_bytes_out;
+
+#define MAX_DEFLATE 16
+static const char *g_deflate[MAX_DEFLATE];
+static int g_ndeflate;
+
+static int wants_deflate(const char *rel) {
+    for (int i = 0; i < g_ndeflate; i++)
+        if (!strcmp(rel, g_deflate[i])) return 1;
+    return 0;
+}
 
 static void *slurp(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
@@ -78,23 +97,87 @@ static int visit(const char *fpath, const struct stat *sb, int typeflag, struct 
     size_t len = 0;
     void *data = slurp(fpath, &len);
     if (!data) { fprintf(stderr, "read failed: %s\n", fpath); return 1; }
-    int rc = add_file(rel, data, len);
+    int rc;
+    if (wants_deflate(rel)) {
+        rc = mz_zip_writer_add_mem(&g_zip, rel, data, len, MZ_BEST_COMPRESSION) ? 0 : -1;
+        if (!rc) { g_files++; g_bytes_in += (long)len; }
+    } else {
+        rc = add_file(rel, data, len);
+    }
     free(data);
     if (rc) { fprintf(stderr, "add failed: %s\n", rel); return 1; }
     return 0;
 }
 
+/* Rewrite OUT.zip's central directory in place, adding `base` to every
+ * local-header offset and to the EOCD's central-directory offset. Assumes the
+ * archive we just wrote: no ZIP64, no archive comment, EOCD as the last 22
+ * bytes. Fails loudly on anything else rather than corrupting the output. */
+static int adjust_offsets(const char *out, unsigned long base) {
+    FILE *f = fopen(out, "r+b");
+    if (!f) { fprintf(stderr, "reopen failed: %s\n", out); return -1; }
+    unsigned char eocd[22];
+    if (fseek(f, -22, SEEK_END) || fread(eocd, 1, 22, f) != 22 ||
+        memcmp(eocd, "PK\x05\x06", 4) != 0) {
+        fprintf(stderr, "no EOCD at end of %s\n", out); fclose(f); return -1;
+    }
+    unsigned nrec = eocd[10] | (eocd[11] << 8);
+    unsigned long cd_size = eocd[12] | ((unsigned long)eocd[13] << 8) |
+                            ((unsigned long)eocd[14] << 16) | ((unsigned long)eocd[15] << 24);
+    unsigned long cd_off = eocd[16] | ((unsigned long)eocd[17] << 8) |
+                           ((unsigned long)eocd[18] << 16) | ((unsigned long)eocd[19] << 24);
+    if (cd_size == 0xffffffffUL || cd_off == 0xffffffffUL ||
+        cd_off + base > 0xffffffffUL) {
+        fprintf(stderr, "ZIP64 territory, cannot adjust %s\n", out); fclose(f); return -1;
+    }
+    unsigned char *cd = malloc(cd_size ? cd_size : 1);
+    if (!cd || fseek(f, (long)cd_off, SEEK_SET) || fread(cd, 1, cd_size, f) != cd_size) {
+        fprintf(stderr, "central directory read failed: %s\n", out);
+        free(cd); fclose(f); return -1;
+    }
+    unsigned long p = 0;
+    for (unsigned i = 0; i < nrec; i++) {
+        if (p + 46 > cd_size || memcmp(cd + p, "PK\x01\x02", 4) != 0) {
+            fprintf(stderr, "central directory walk failed: %s\n", out);
+            free(cd); fclose(f); return -1;
+        }
+        unsigned long lho = cd[p + 42] | ((unsigned long)cd[p + 43] << 8) |
+                            ((unsigned long)cd[p + 44] << 16) | ((unsigned long)cd[p + 45] << 24);
+        lho += base;
+        cd[p + 42] = lho & 0xff; cd[p + 43] = (lho >> 8) & 0xff;
+        cd[p + 44] = (lho >> 16) & 0xff; cd[p + 45] = (lho >> 24) & 0xff;
+        p += 46 + (cd[p + 28] | (cd[p + 29] << 8))   /* name */
+                + (cd[p + 30] | (cd[p + 31] << 8))   /* extra */
+                + (cd[p + 32] | (cd[p + 33] << 8));  /* comment */
+    }
+    cd_off += base;
+    eocd[16] = cd_off & 0xff; eocd[17] = (cd_off >> 8) & 0xff;
+    eocd[18] = (cd_off >> 16) & 0xff; eocd[19] = (cd_off >> 24) & 0xff;
+    int rc = fseek(f, (long)(cd_off - base), SEEK_SET) || fwrite(cd, 1, cd_size, f) != cd_size ||
+             fseek(f, -22, SEEK_END) || fwrite(eocd, 1, 22, f) != 22;
+    free(cd);
+    if (fclose(f) || rc) { fprintf(stderr, "offset rewrite failed: %s\n", out); return -1; }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *out = NULL, *root = NULL, *dictpath = NULL;
+    unsigned long base = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dict") && i + 1 < argc) dictpath = argv[++i];
         else if (!strcmp(argv[i], "--level") && i + 1 < argc) g_level = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--base") && i + 1 < argc) base = strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--deflate") && i + 1 < argc) {
+            if (g_ndeflate == MAX_DEFLATE) { fprintf(stderr, "too many --deflate\n"); return 2; }
+            g_deflate[g_ndeflate++] = argv[++i];
+        }
         else if (!out) out = argv[i];
         else if (!root) root = argv[i];
         else { fprintf(stderr, "unexpected arg: %s\n", argv[i]); return 2; }
     }
     if (!out || !root) {
-        fprintf(stderr, "usage: %s OUT.zip ROOTDIR [--dict DICT] [--level N]\n", argv[0]);
+        fprintf(stderr, "usage: %s OUT.zip ROOTDIR [--dict DICT] [--level N] "
+                        "[--base N] [--deflate NAME]...\n", argv[0]);
         return 2;
     }
 
@@ -125,6 +208,8 @@ int main(int argc, char **argv) {
     }
     mz_zip_writer_end(&g_zip);
     free(dict);
+
+    if (base && adjust_offsets(out, base) != 0) return 1;
 
     fprintf(stderr, "packed %ld files: %ld -> %ld bytes (%.1f%%)%s\n",
             g_files, g_bytes_in, g_bytes_out,
