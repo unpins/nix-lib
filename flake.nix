@@ -649,14 +649,48 @@
           }
         '';
 
-        withAliases = pkgs:
+        # ---- withUnpinEmbed: the ONE call that builds a package's embedded
+        # container ---------------------------------------------------------
+        #
+        # Stages every kind of embedded payload into a single ZIP-root tree
+        # and packs the binary's single EOF ZIP ONCE:
+        #
+        #   * aliases       → `unpin/aliases` (explicit list or symlink harvest)
+        #   * man pages     → `unpin/man/*` via mkmeta.py (`man = true`, or an
+        #                     explicit `manRoot`; optional `manFallback`)
+        #   * runtime tree  → arbitrary entries at the ZIP root, served by the
+        #                     unpin-vfs self-EOF mode (`runtimeStage` snippet,
+        #                     run with $__unpin_stage = the empty ZIP root)
+        #
+        # withAliases / withMan / withRuntimeData below are thin wrappers over
+        # this; composing several of them still works (the accumulator in
+        # `unpinEmbedSh` repacks a superset), it just repacks once per call —
+        # a package that passes everything here pays for ONE pack.
+        #
+        # When man is included, the result carries `passthru.unpinEmbedsMan =
+        # true` and mkStandaloneFlake skips its own withMan application, so
+        # the consumer's single call really is the only embed step.
+        #
+        # Failure policy: a missing primary binary is a hard error when the
+        # call ships aliases or a runtime tree (the caller knows the layout),
+        # but a warn-and-skip for man-only calls — embedMan is default-on
+        # across the catalog and a man-less package is degraded, not broken.
+        # An empty runtime stage always fails: a missing runtime tree is a
+        # broken program.
+        withUnpinEmbed = pkgs:
           { primary
           , aliases ? null
           , aliasesFromSymlinksIn ? null
+          , man ? false
+          , manRoot ? null
+          , manFallback ? null
+          , runtimeStage ? null
           }: drv:
           let
             hasExplicit = aliases != null;
             hasAuto = aliasesFromSymlinksIn != null;
+            manEnabled = man || manRoot != null;
+            aliasesActive = (hasExplicit && aliases != [ ]) || hasAuto;
 
             # Mirrors `validate_alias` in unpin/src/aliases.rs so a bogus
             # name fails the build instead of the install. Kept in sync
@@ -725,7 +759,6 @@
             # multi-output drvs put bins under the `bin` output (jq, htop in
             # some configs); pkgsStatic typically collapses to `out` even with
             # `info`/`debug` siblings (so `bin` is absent → fall back to `out`).
-            # Coreutils on pkgsStatic is the latter — single binary in `$out/bin`.
             # In the inline shell snippets below, `''${${binOutputName}}` renders
             # as e.g. `${bin}` or `${out}` for bash to expand to the path.
             binOutputName =
@@ -741,13 +774,19 @@
                   # Build + add to the binary's embedded ZIP. Build-only (~few
                   # MB closure), never linked into the shipped artifact. zip/
                   # unzip drive the cosmo tail-ZIP branch; the pack tool (and
-                  # zstd for dict training) the single-overlay repack, which
-                  # may run from this hook when withAliases is applied last.
+                  # zstd for dict training) the single-overlay repack.
                   pkgs.buildPackages.zip
                   pkgs.buildPackages.unzip
                   (unpinPackTool pkgs)
                   pkgs.buildPackages.zstd
-                ];
+                ]
+                ++ nixpkgs.lib.optional manEnabled
+                  pkgs.buildPackages.python3Minimal;  # mkmeta.py builds the man tree
+
+              # Lets mkStandaloneFlake see that man is already handled here
+              # and skip its own withMan application (one pack, not two).
+              passthru = (old.passthru or { })
+                // nixpkgs.lib.optionalAttrs manEnabled { unpinEmbedsMan = true; };
 
               postInstall = (old.postInstall or "")
                 + nixpkgs.lib.optionalString hasAuto ''
@@ -807,223 +846,169 @@
 
               postFixup = (old.postFixup or "") + ''
                 ${unpinEmbedSh}
-                ${if hasExplicit
-                  then "__unpin_aliases='${explicitCsv}'"
-                  else ''__unpin_aliases="$(cat "$NIX_BUILD_TOP/.unpin-aliases")"''}
-
-                # Short-circuit: nothing to embed when the collected/declared
-                # list ended up empty (auto-mode: no symlinks matched the
-                # validator; explicit-mode: caller passed `aliases = [ ]`).
-                if [ -z "$__unpin_aliases" ]; then
-                  echo "withAliases: no aliases to embed for ${primary}, skipping" >&2
-                else
-                  __unpin_bin="''${${binOutputName}}/bin/${primary}"
-                  if [ ! -f "$__unpin_bin" ] && [ -f "$__unpin_bin.exe" ]; then
-                    __unpin_bin="$__unpin_bin.exe"
-                  fi
-                  if [ ! -f "$__unpin_bin" ]; then
-                    echo "withAliases: $__unpin_bin does not exist" >&2
+                __unpin_bin="''${${binOutputName}}/bin/${primary}"
+                # Windows artifacts are `<primary>.exe`.
+                if [ ! -f "$__unpin_bin" ] && [ -f "$__unpin_bin.exe" ]; then
+                  __unpin_bin="$__unpin_bin.exe"
+                fi
+                if [ ! -f "$__unpin_bin" ]; then
+                  ${if aliasesActive || runtimeStage != null then ''
+                  echo "withUnpinEmbed: $__unpin_bin does not exist" >&2
+                  exit 1
+                  '' else ''
+                  # Man-only call (embedMan is default-on across the catalog):
+                  # warn and skip rather than fail — worst case is no embedded
+                  # man for this package, a degraded result, not a broken one.
+                  echo "withUnpinEmbed: $__unpin_bin missing — skipping embed for ${primary}" >&2
+                  __unpin_bin=""
+                  ''}
+                fi
+                if [ -n "$__unpin_bin" ]; then
+                  # ONE staging dir = the ZIP root; every payload lands here
+                  # and a single __unpin_embed_subtree packs it all.
+                  __unpin_stage="$(mktemp -d)"
+                  ${nixpkgs.lib.optionalString (runtimeStage != null) ''
+                  ${runtimeStage}
+                  # -print -quit: no pipe — stdenv phases run `set -o pipefail`,
+                  # and a `find | grep -q` would die of grep's early-exit
+                  # SIGPIPE on any tree bigger than the pipe buffer,
+                  # misreading it as empty.
+                  if [ -z "$(find "$__unpin_stage" -mindepth 1 \( -type f -o -type l \) -print -quit)" ]; then
+                    echo "withUnpinEmbed: runtime stage produced no files for ${primary}" >&2
                     exit 1
                   fi
-                  # Write `unpin/aliases` (one name per line) into a staging tree
-                  # and add it to the binary's embedded ZIP. Aliases are a
-                  # security boundary, but that is enforced at install time
-                  # (catalog-owner gate + blocklist), not here — we just ship
-                  # the declared list.
-                  __unpin_stage="$(mktemp -d)"
-                  mkdir -p "$__unpin_stage/unpin"
-                  printf '%s' "$__unpin_aliases" | tr ',' '\n' > "$__unpin_stage/unpin/aliases"
-                  __unpin_embed_subtree "$__unpin_bin" "$__unpin_stage"
+                  ''}
+                  ${nixpkgs.lib.optionalString aliasesActive ''
+                  ${if hasExplicit
+                    then "__unpin_aliases='${explicitCsv}'"
+                    else ''__unpin_aliases="$(cat "$NIX_BUILD_TOP/.unpin-aliases")"''}
+                  # Short-circuit: nothing to stage when the collected list
+                  # ended up empty (auto-mode: no symlinks matched the
+                  # validator). Aliases are a security boundary, but that is
+                  # enforced at install time (catalog-owner gate + blocklist),
+                  # not here — we just ship the declared list.
+                  if [ -z "$__unpin_aliases" ]; then
+                    echo "withAliases: no aliases to embed for ${primary}, skipping" >&2
+                  else
+                    mkdir -p "$__unpin_stage/unpin"
+                    printf '%s' "$__unpin_aliases" | tr ',' '\n' > "$__unpin_stage/unpin/aliases"
+                  fi
+                  ''}
+                  ${nixpkgs.lib.optionalString manEnabled ''
+                  # Locate the man tree to embed.
+                  ${if manRoot != null then ''
+                  # Externally supplied man source (windows/cosmo path).
+                  __unpin_manroot="${manRoot}"
+                  if [ ! -d "$__unpin_manroot/share/man" ]; then
+                    echo "withMan: manRoot ${manRoot} has no share/man" >&2
+                    __unpin_manroot=""
+                  fi
+                  '' else ''
+                  # Harvest from the drv's own outputs (native path). nixpkgs
+                  # puts man in the `man` output when present; pkgsStatic
+                  # single-output drvs keep it in `out`/the bin output under
+                  # share/man.
+                  __unpin_manroot=""
+                  for __unpin_d in "''${man:-}" "''${${binOutputName}}" "''${out:-}"; do
+                    if [ -n "$__unpin_d" ] && [ -d "$__unpin_d/share/man" ]; then
+                      __unpin_manroot="$__unpin_d"; break
+                    fi
+                  done${nixpkgs.lib.optionalString (manFallback != null) ''
+
+                  # Cross build shipped no man pages of its own — either no
+                  # share/man at all, or a share/man with no actual pages
+                  # (e.g. a prune emptied man1/ and left only an empty tree).
+                  # Borrow the version-locked pages from a man-bearing build
+                  # (windows graft). -print -quit: no pipe (pipefail/SIGPIPE,
+                  # see above).
+                  if [ -d "${manFallback}/share/man" ] \
+                     && { [ -z "$__unpin_manroot" ] \
+                          || [ -z "$(find "$__unpin_manroot/share/man" \( -type f -o -type l \) -print -quit 2>/dev/null)" ]; }; then
+                    __unpin_manroot="${manFallback}"
+                  fi''}
+                  ''}
+                  if [ -z "$__unpin_manroot" ]; then
+                    echo "withMan: no share/man found for ${primary}, skipping" >&2
+                  else
+                    # mkmeta.py populates a staging `unpin/man/` tree (roff
+                    # files + symlinks for `.so`) in its OWN temp dir — merged
+                    # into the shared stage only on success, so an exit-3 skip
+                    # leaves no partial unpin/man behind. Exit 3 = no man pages
+                    # (legit skip); any other nonzero = real failure → fail the
+                    # build (don't silently ship man-less).
+                    __unpin_manstage="$(mktemp -d)"
+                    __unpin_rc=0
+                    python3 ${./mkmeta.py} "$__unpin_manroot" "$__unpin_manstage" || __unpin_rc=$?
+                    if [ "$__unpin_rc" = 3 ]; then
+                      echo "withMan: no man pages for ${primary}, skipping" >&2
+                    elif [ "$__unpin_rc" != 0 ]; then
+                      echo "withMan: mkmeta.py failed (exit $__unpin_rc) for ${primary}" >&2
+                      exit "$__unpin_rc"
+                    else
+                      cp -a "$__unpin_manstage/." "$__unpin_stage/"
+                    fi
+                    rm -rf "$__unpin_manstage"
+                  fi
+                  ''}
+                  # A man-only call may legitimately have staged nothing
+                  # (no man found / exit-3 skip) — embed only when something
+                  # is there. Runtime emptiness already failed hard above.
+                  if [ -n "$(find "$__unpin_stage" -mindepth 1 \( -type f -o -type l \) -print -quit)" ]; then
+                    __unpin_embed_subtree "$__unpin_bin" "$__unpin_stage"
+                  fi
                   rm -rf "$__unpin_stage"
                 fi
               '';
             });
           in
           if hasExplicit && hasAuto then
-            throw "withAliases: pass either `aliases` or `aliasesFromSymlinksIn`, not both"
-          else if !hasExplicit && !hasAuto then
-            throw "withAliases: requires `aliases` or `aliasesFromSymlinksIn`"
+            throw "withUnpinEmbed: pass either `aliases` or `aliasesFromSymlinksIn`, not both"
           else if hasExplicit && builtins.length aliases > 512 then
-            throw "withAliases: ${toString (builtins.length aliases)} aliases exceeds limit 512"
-          # Explicit-empty short-circuit: nothing to validate, nothing to
-          # embed — return the input drv untouched (no nativeBuildInputs
-          # bloat, no postInstall/postFixup hooks).
-          else if hasExplicit && aliases == [ ] then drv
+            throw "withUnpinEmbed: ${toString (builtins.length aliases)} aliases exceeds limit 512"
+          # Nothing to embed at all → return the input drv untouched (no
+          # nativeBuildInputs bloat, no postInstall/postFixup hooks).
+          else if !aliasesActive && !manEnabled && runtimeStage == null then drv
           # deepSeq forces each `validateAliasName` invocation now instead
           # of deferring it to when the postFixup string is constructed.
           # Without this, throws fire at build-graph realization, not eval.
           else builtins.deepSeq validatedAliases wrapped;
 
-        # Embed the package's OWN man pages as `unpin/man/<name>.<section>`
-        # entries of the binary's embedded ZIP (roff verbatim; `.so` stubs as
-        # ZIP symlink entries), so `unpin man <pkg>` reads docs straight out of
-        # the binary — no companion data tarball. `./mkmeta.py` populates a
-        # staging `unpin/man/` tree, then the shared `__unpin_embed_subtree`
-        # (see `unpinEmbedSh`) adds it to the binary's ZIP.
-        #
-        # Composition with withAliases: order-free. Both just ADD entries to the
-        # one embedded ZIP (creating it if absent), so neither clobbers the
-        # other — the old Mach-O "withMan after withAliases" ordering invariant
-        # is gone. See docs/embedded-metadata.md.
-        # `manRoot`: when null, harvest man from the drv's own outputs
-        # (`$man`/`$out`) — the native path, where the static build produces
-        # man. When set to a store path, read `$manRoot/share/man` instead —
-        # an explicit external override (consumer-supplied `winManRoot`).
+        # Thin wrapper over withUnpinEmbed — embed only the alias list. See
+        # the doc block above unpinPackTool for the alias model (two input
+        # modes, symlink harvest, security gates).
+        withAliases = pkgs:
+          { primary
+          , aliases ? null
+          , aliasesFromSymlinksIn ? null
+          }: drv:
+          if aliases == null && aliasesFromSymlinksIn == null then
+            throw "withAliases: requires `aliases` or `aliasesFromSymlinksIn`"
+          else
+            withUnpinEmbed pkgs { inherit primary aliases aliasesFromSymlinksIn; } drv;
+
+        # Thin wrapper over withUnpinEmbed — embed only the package's man
+        # pages as `unpin/man/<name>.<section>` entries, so `unpin man <pkg>`
+        # reads docs straight out of the binary. `manRoot`: when null, harvest
+        # man from the drv's own outputs (`$man`/`$out`) — the native path.
+        # When set to a store path, read `$manRoot/share/man` instead — an
+        # explicit external override (consumer-supplied `winManRoot`).
         # `manFallback`: optional store path consulted ONLY on the harvest-own
         # path (manRoot == null) when the drv ships no man of its own — the
-        # windows/cosmo default, where most cross builds DO install their own
-        # man (pre-generated roff in the tarball), but the rare help2man-driven
-        # package produces none and borrows version-locked pages from a
-        # man-bearing nixpkgs build. Leaving manFallback null keeps the native
-        # path byte-identical (the fallback block emits nothing).
+        # windows/cosmo default. Composition with withAliases/withRuntimeData
+        # is order-free: all calls accumulate into the binary's one ZIP.
         withMan = pkgs: { primary, manRoot ? null, manFallback ? null }: drv:
-          let
-            binOutputName =
-              let outs = drv.outputs or [ "out" ];
-              in
-              if builtins.elem "bin" outs then "bin"
-              else if builtins.elem "out" outs then "out"
-              else builtins.head outs;
-          in
-          drv.overrideAttrs (old: {
-            nativeBuildInputs = (old.nativeBuildInputs or [ ])
-              ++ [
-                pkgs.buildPackages.python3Minimal  # mkmeta.py builds the man tree
-                pkgs.buildPackages.zip
-                pkgs.buildPackages.unzip
-                (unpinPackTool pkgs)               # zstd-in-zip packer for the man overlay
-                pkgs.buildPackages.zstd            # `zstd --train` for the shared man dict
-              ];
+          withUnpinEmbed pkgs { inherit primary manRoot manFallback; man = true; } drv;
 
-            postFixup = (old.postFixup or "") + ''
-              ${unpinEmbedSh}
-              # Locate the man tree to embed.
-              ${if manRoot != null then ''
-                # Externally supplied man source (windows/cosmo path).
-                __unpin_manroot="${manRoot}"
-                if [ ! -d "$__unpin_manroot/share/man" ]; then
-                  echo "withMan: manRoot ${manRoot} has no share/man" >&2
-                  __unpin_manroot=""
-                fi
-              '' else ''
-                # Harvest from the drv's own outputs (native path). nixpkgs puts
-                # man in the `man` output when present; pkgsStatic single-output
-                # drvs keep it in `out`/the bin output under share/man.
-                __unpin_manroot=""
-                for __unpin_d in "''${man:-}" "''${${binOutputName}}" "''${out:-}"; do
-                  if [ -n "$__unpin_d" ] && [ -d "$__unpin_d/share/man" ]; then
-                    __unpin_manroot="$__unpin_d"; break
-                  fi
-                done${nixpkgs.lib.optionalString (manFallback != null) ''
-
-                # Cross build shipped no man pages of its own — either no
-                # share/man at all, or a share/man with no actual pages (e.g. a
-                # prune emptied man1/ and left only an empty tree). Borrow the
-                # version-locked pages from a man-bearing build (windows graft).
-                # -print -quit: no pipe — under stdenv's `set -o pipefail` a
-                # `find | grep -q` dies of grep's early-exit SIGPIPE on big
-                # man trees and misreads them as empty.
-                if [ -d "${manFallback}/share/man" ] \
-                   && { [ -z "$__unpin_manroot" ] \
-                        || [ -z "$(find "$__unpin_manroot/share/man" \( -type f -o -type l \) -print -quit 2>/dev/null)" ]; }; then
-                  __unpin_manroot="${manFallback}"
-                fi''}
-              ''}
-              if [ -z "$__unpin_manroot" ]; then
-                echo "withMan: no share/man found for ${primary}, skipping" >&2
-              else
-                # mkmeta.py populates a staging `unpin/man/` tree (roff files +
-                # symlinks for `.so`). Exit 3 = no man pages (legit skip); any
-                # other nonzero = real failure → fail the build (don't silently
-                # ship man-less). `|| rc=$?` keeps errexit from aborting first.
-                __unpin_stage="$(mktemp -d)"
-                __unpin_rc=0
-                python3 ${./mkmeta.py} "$__unpin_manroot" "$__unpin_stage" || __unpin_rc=$?
-                if [ "$__unpin_rc" = 3 ]; then
-                  echo "withMan: no man pages for ${primary}, skipping" >&2
-                elif [ "$__unpin_rc" != 0 ]; then
-                  echo "withMan: mkmeta.py failed (exit $__unpin_rc) for ${primary}" >&2
-                  exit "$__unpin_rc"
-                else
-                  __unpin_bin="''${${binOutputName}}/bin/${primary}"
-                  # Windows artifacts are `<primary>.exe`.
-                  if [ ! -f "$__unpin_bin" ] && [ -f "$__unpin_bin.exe" ]; then
-                    __unpin_bin="$__unpin_bin.exe"
-                  fi
-                  if [ ! -f "$__unpin_bin" ]; then
-                    # Man exists but we can't find the primary binary (binName
-                    # mismatch / unusual layout). Since embedMan is default-on
-                    # across the catalog, warn and skip rather than fail the
-                    # build — worst case is no embedded man for this package.
-                    echo "withMan: man found but $__unpin_bin missing — skipping embed for ${primary}" >&2
-                  else
-                    # No ordering guard needed: the embed accumulates across
-                    # calls and repacks one ZIP, so whatever withAliases staged
-                    # is carried along, never clobbered.
-                    __unpin_embed_subtree "$__unpin_bin" "$__unpin_stage"
-                  fi
-                fi
-                rm -rf "$__unpin_stage"
-              fi
-            '';
-          });
-
-        # Embed a package's RUNTIME TREE (vim's share/vim, perl's @INC, …) into
-        # the binary's single embedded ZIP, next to the `unpin/*` metadata
-        # entries — the unpin-vfs self-EOF mode (-DUNPIN_VFS_SELF,
-        # github:unpins/unpin-vfs) reads it back from the executable's own EOF
-        # at run time. Replaces the .incbin/blob.S link-time embed: data
-        # changes no longer relink, and one binary carries exactly one ZIP.
-        #
-        # `stage` is a shell snippet run in postFixup (i.e. AFTER strip) with
-        # `$__unpin_stage` pointing at an empty directory that is the ZIP root:
-        # populate it with the tree exactly as the VFS should serve it (entry
-        # `a/b.vim` shows up as `<UNPIN_VFS_ROOT>/a/b.vim`). Composes
-        # order-free with withAliases/withMan — all three accumulate into the
-        # one per-binary ZIP. An empty stage fails the build: unlike man
-        # pages, a missing runtime tree is a broken program, not a degraded
-        # one.
+        # Thin wrapper over withUnpinEmbed — embed only a runtime tree (vim's
+        # share/vim, perl's @INC, …), read back at run time by the unpin-vfs
+        # self-EOF mode (-DUNPIN_VFS_SELF, github:unpins/unpin-vfs). `stage`
+        # is a shell snippet run in postFixup (i.e. AFTER strip) with
+        # `$__unpin_stage` pointing at an empty directory that is the ZIP
+        # root: populate it with the tree exactly as the VFS should serve it.
+        # An empty stage fails the build: unlike man pages, a missing runtime
+        # tree is a broken program, not a degraded one.
         withRuntimeData = pkgs: { primary, stage }: drv:
-          let
-            binOutputName =
-              let outs = drv.outputs or [ "out" ];
-              in
-              if builtins.elem "bin" outs then "bin"
-              else if builtins.elem "out" outs then "out"
-              else builtins.head outs;
-          in
-          drv.overrideAttrs (old: {
-            nativeBuildInputs = (old.nativeBuildInputs or [ ])
-              ++ [
-                pkgs.buildPackages.zip
-                pkgs.buildPackages.unzip
-                (unpinPackTool pkgs)
-                pkgs.buildPackages.zstd
-              ];
-
-            postFixup = (old.postFixup or "") + ''
-              ${unpinEmbedSh}
-              __unpin_bin="''${${binOutputName}}/bin/${primary}"
-              if [ ! -f "$__unpin_bin" ] && [ -f "$__unpin_bin.exe" ]; then
-                __unpin_bin="$__unpin_bin.exe"
-              fi
-              if [ ! -f "$__unpin_bin" ]; then
-                echo "withRuntimeData: $__unpin_bin does not exist" >&2
-                exit 1
-              fi
-              __unpin_stage="$(mktemp -d)"
-              ${stage}
-              # -print -quit: no pipe — stdenv phases run `set -o pipefail`, and
-              # a `find | grep -q` would die of grep's early-exit SIGPIPE on any
-              # tree bigger than the pipe buffer, misreading it as empty.
-              if [ -z "$(find "$__unpin_stage" -mindepth 1 \( -type f -o -type l \) -print -quit)" ]; then
-                echo "withRuntimeData: stage produced no files for ${primary}" >&2
-                exit 1
-              fi
-              __unpin_embed_subtree "$__unpin_bin" "$__unpin_stage"
-              rm -rf "$__unpin_stage"
-            '';
-          });
+          withUnpinEmbed pkgs { inherit primary; runtimeStage = stage; } drv;
 
         # Drop Cosmopolitan's `.symtab.amd64` from a cosmo APE's tail-ZIP.
         # That entry is the symbol table cosmocc's apelink adds for crash
@@ -1615,9 +1600,12 @@ CBODY
                        then withDnsFallback pkgs.pkgsStatic core else core;
                 # withMan must run on the underlying drv (it edits the bin
                 # output and reads the man output) BEFORE strippedOrJoined
-                # collapses multi-output drvs into a symlinkJoin.
+                # collapses multi-output drvs into a symlinkJoin. Skipped when
+                # the consumer's own withUnpinEmbed call already included man
+                # (passthru.unpinEmbedsMan) — one pack, not two.
                 withMaybeMan =
-                  if embedMan then withMan pkgs { primary = binName; } base
+                  if embedMan && !(base.unpinEmbedsMan or false)
+                  then withMan pkgs { primary = binName; } base
                   else base;
               in
               withLicense (withDescription (strippedOrJoined pkgs name withMaybeMan));
@@ -1711,7 +1699,9 @@ CBODY
               in if p == null then null else (p.man or p.out or p);
             windowsBase = dropSharedLibs (applyOptSsp (windowsRawBuild windowsPkgs));
             windowsWithMan =
-              if !embedMan then windowsBase
+              # Skip when the consumer's windowsBuild already embedded man via
+              # its own withUnpinEmbed call (passthru.unpinEmbedsMan).
+              if !embedMan || windowsBase.unpinEmbedsMan or false then windowsBase
               else if winManRoot != null
               then withMan windowsPkgs { primary = binName; manRoot = "${winManRoot}"; } windowsBase
               else withMan windowsPkgs {
