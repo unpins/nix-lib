@@ -1,0 +1,78 @@
+Make the Windows system-timezone detection actually work.
+
+cosmo's localtime constructor maps the Windows zone to an IANA name so
+`localtime()` shows local time without TZ being set — POSIX-compat for
+the 99% of Windows processes that have no TZ in the environment. Two
+bugs make it silently fall back to UTC on most real machines:
+
+1. It matches `GetTimeZoneInformation().StandardName` against the
+   English names in kWindowsZones — but StandardName is the LOCALIZED
+   display string (e.g. "Hora oficial do Brasil" on pt-BR Windows for
+   "E. South America Standard Time"), so the table never matches on any
+   non-English-locale Windows. Use the invariant registry key instead:
+   `GetDynamicTimeZoneInformation().TimeZoneKeyName` (Vista+; the import
+   stub already ships in libcosmo.a).
+
+2. The numeric `<±HHMM>±HH:MM` fallback skips buf[3] (assigns buf[2]
+   then jumps to buf[4]), leaving an uninitialized byte mid-string, so
+   tzset() rejects it and the zone degrades to UTC anyway. Renumber the
+   slots.
+
+Verified on a pt-BR Windows 10 VM set to "E. South America Standard
+Time": before the patch `date` prints UTC, after it prints -03.
+
+--- a/third_party/tz/localtime.c
++++ b/third_party/tz/localtime.c
+@@ -20,6 +20,7 @@
+ #include "libc/runtime/runtime.h"
+ #include "libc/stdckdint.h"
+ #include "libc/time.h"
++#include "libc/nt/struct/dynamictimezoneinformation.h"
+ #include "libc/nt/struct/timezoneinformation.h"
+ #include "libc/nt/time.h"
+ #include "libc/dce.h"
+@@ -593,12 +594,13 @@
+ 	int i;
+ 	if (getenv("TZ"))
+ 		return;
+-	struct NtTimeZoneInformation tzi;
+-	GetTimeZoneInformation(&tzi);
++	struct NtDynamicTimeZoneInformation tzi;
++	if (GetDynamicTimeZoneInformation(&tzi) == -1u)
++		return;
+ 	if (!tzi.Bias)
+ 		return;
+ 	for (i = 0; i < sizeof(kWindowsZones) / sizeof(kWindowsZones[0]); ++i) {
+-		if (!strcmp168(tzi.StandardName, kWindowsZones[i].wname)) {
++		if (!strcmp168(tzi.TimeZoneKeyName, kWindowsZones[i].wname)) {
+ 			setenv("TZ", kWindowsZones[i].zname, true);
+ 			return;
+ 		}
+@@ -609,17 +611,17 @@
+ 	buf[0] = '<';
+ 	buf[1] = tzi.Bias > 0 ? '-' : '+';
+ 	buf[2] = '0' + hours / 10;
+-	buf[4] = '0' + hours % 10;
+-	buf[5] = '0' + minutes / 10;
+-	buf[6] = '0' + minutes % 10;
+-	buf[7] = '>';
+-	buf[8] = tzi.Bias > 0 ? '+' : '-';
+-	buf[9] = '0' + hours / 10;
+-	buf[10] = '0' + hours % 10;
+-	buf[11] = ':';
+-	buf[12] = '0' + minutes / 10;
+-	buf[13] = '0' + minutes % 10;
+-	buf[14] = 0;
++	buf[3] = '0' + hours % 10;
++	buf[4] = '0' + minutes / 10;
++	buf[5] = '0' + minutes % 10;
++	buf[6] = '>';
++	buf[7] = tzi.Bias > 0 ? '+' : '-';
++	buf[8] = '0' + hours / 10;
++	buf[9] = '0' + hours % 10;
++	buf[10] = ':';
++	buf[11] = '0' + minutes / 10;
++	buf[12] = '0' + minutes % 10;
++	buf[13] = 0;
+ 	setenv("TZ", buf, true);
+ }

@@ -28,6 +28,22 @@ let
     hash = "sha256-xHsnD5UZCwpmPOtgWklpbXzDCFY2aVaY0YUkpTpb54k=";
   };
 
+  # Upstream third_party/tz sources at the same tag. localtime.c gets the
+  # Windows system-timezone fix (see cosmocc-tz-fix/); the four headers are
+  # its quoted includes, which cosmocc.zip doesn't ship.
+  cosmoTzSrcs = builtins.mapAttrs
+    (name: hash: pkgs.fetchurl {
+      url = "https://raw.githubusercontent.com/jart/cosmopolitan/${version}/third_party/tz/${name}";
+      inherit hash;
+    })
+    {
+      "localtime.c" = "sha256-lhDnhwhOdXu59BtzelkXllzC1Zng6siYpUUBf0dx9+k=";
+      "lock.h" = "sha256-ZHyA5uTlWh3UVz8sp2m03ldNMShajporm0N1cyCnZHo=";
+      "tzdir.h" = "sha256-8HhA+3dQNQ5Q+keJC6NoyvsJ143BsqZUbVf5Cv0DezM=";
+      "tzfile.h" = "sha256-bnnpA+HGbij354n8+mdQn+hLFY3uf7N9ZqVDG1sF6Cw=";
+      "private.h" = "sha256-wxo0bQWnO/yOfoU85XVlZUNmJZvPDGrDZmeTWIqRS50=";
+    };
+
   # See docs/platforms/cosmocc.md for why dontPatchELF / dontStrip / etc. are
   # required on APE polyglots.
   cosmocc = pkgs.stdenvNoCC.mkDerivation {
@@ -74,6 +90,26 @@ let
         $out/x86_64-linux-cosmo/lib/libcosmo.a $TMPDIR/build/mmap.o
       $out/bin/aarch64-linux-cosmo-ar r \
         $out/aarch64-linux-cosmo/lib/libcosmo.a $TMPDIR/build/.aarch64/mmap.o
+
+      # Same surgery on localtime.o: upstream's Windows timezone detection
+      # matches the LOCALIZED zone name (never matches on non-English
+      # Windows) and its numeric fallback writes a garbage byte mid-string
+      # (skips buf[3]) — both silently degrade localtime() to UTC. The patch
+      # matches the invariant TimeZoneKeyName instead and renumbers the
+      # fallback slots; see cosmocc-tz-fix/ for the root-cause writeup.
+      mkdir -p $TMPDIR/cosmosrc/third_party/tz $TMPDIR/tzbuild/.aarch64
+      ${lib.concatStrings (lib.mapAttrsToList (name: src: ''
+        cp ${src} $TMPDIR/cosmosrc/third_party/tz/${name}
+      '') cosmoTzSrcs)}
+      chmod -R u+w $TMPDIR/cosmosrc/third_party/tz
+      patch -p1 -d $TMPDIR/cosmosrc < ${./cosmocc-tz-fix/tz-windows-fix.patch}
+      ( cd $TMPDIR/tzbuild && $out/bin/cosmocc -U__COSMOCC__ -D_COSMO_SOURCE \
+          -O2 -ffunction-sections -fdata-sections \
+          -c -o localtime.o $TMPDIR/cosmosrc/third_party/tz/localtime.c )
+      $out/bin/x86_64-linux-cosmo-ar r \
+        $out/x86_64-linux-cosmo/lib/libcosmo.a $TMPDIR/tzbuild/localtime.o
+      $out/bin/aarch64-linux-cosmo-ar r \
+        $out/aarch64-linux-cosmo/lib/libcosmo.a $TMPDIR/tzbuild/.aarch64/localtime.o
 
       runHook postUnpack
     '';
