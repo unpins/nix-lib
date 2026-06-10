@@ -1775,30 +1775,72 @@ CBODY
           , name
           , rust-overlay
           , pkgsAttr ? name
+          # Own-source crate (the project's own Rust tools — unpin-man,
+          # unpin-readme): pass all three of src / version / cargoLock (path
+          # to the Cargo.lock). Default (null) reuses the nixpkgs recipe for
+          # `pkgsAttr` — src, cargoHash and meta come from nixpkgs.
+          , src ? null
+          , version ? null
+          , cargoLock ? null
+          # True when the crate's dep closure compiles vendored C through a
+          # build.rs (the cc crate — e.g. unpin-man's mandoc render subset).
+          # Chain-free linking is impossible then: the musl crosses build
+          # through the SAME top cross scopes the C catalog already caches
+          # (musl32, musl-power, the spelled-out riscv64/armv7l), so no new
+          # toolchain is ever built — and rust-overlay's rustc still avoids
+          # any cross-rustc source bootstrap.
+          , vendoredC ? false
           , ...
           }@args:
           let
-            muslCross = pkgs:
+            ownSource = src != null;
+
+            # The buildRustPackage shape shared by every own-source scope —
+            # the proven unpin/unpin-readme/unpin-man recipe.
+            mkOwn = { rustPlatform, env ? { }, auditable ? true }:
+              (rustPlatform.buildRustPackage {
+                pname = name;
+                inherit version src auditable env;
+                cargoLock.lockFile = cargoLock;
+                doCheck = false;
+              }).overrideAttrs (_: { stripAllList = [ "bin" ]; });
+
+            rustPkgsFor = system: import nixpkgs {
+              inherit system;
+              overlays = [ rust-overlay.overlays.default ];
+            };
+            toolchainFor = system: triple:
+              (rustPkgsFor system).rust-bin.stable.latest.default.override {
+                targets = [ triple ];
+              };
+
+            # Chain-free cross-musl build (pure Rust only): rust-std bundles
+            # musl's libc.a + crt objects, the native ld.lld links any ELF
+            # arch — rustc, cargo and the crate build scripts all run as
+            # native binaries.
+            muslCrossPure = pkgs:
               let
                 # Eval-only peek at the scope mkStandaloneFlake hands us:
                 # pkgsStatic elaborates the static-musl host (and converts a
                 # glibc top scope, as armv7l's was on older nix-lib). No
                 # derivation from the cross scope is ever built.
                 triple = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTarget;
-                npkgs = import nixpkgs {
-                  system = pkgs.stdenv.buildPlatform.system;
-                  overlays = [ rust-overlay.overlays.default ];
-                };
+                npkgs = rustPkgsFor pkgs.stdenv.buildPlatform.system;
                 rust = npkgs.rust-bin.stable.latest.default.override {
                   targets = [ triple ];
                 };
-                base = npkgs.${pkgsAttr};
-                bin = base.meta.mainProgram or name;
+                base = if ownSource then null else npkgs.${pkgsAttr};
+                bin = if ownSource then name else base.meta.mainProgram or name;
               in
               npkgs.stdenv.mkDerivation {
                 pname = "${pkgsAttr}-${triple}";
-                inherit (base) version src meta;
-                cargoDeps = base.cargoDeps;
+                version = if ownSource then version else base.version;
+                src = if ownSource then src else base.src;
+                meta = if ownSource then { mainProgram = bin; } else base.meta;
+                cargoDeps =
+                  if ownSource
+                  then npkgs.rustPlatform.importCargoLock { lockFile = cargoLock; }
+                  else base.cargoDeps;
                 nativeBuildInputs = [
                   rust
                   npkgs.rustPlatform.cargoSetupHook
@@ -1822,12 +1864,46 @@ CBODY
                 '';
               };
 
+            # Cross-musl with vendored C: the handed scope's makeRustPlatform
+            # bakes --target plus CC_<T>/CARGO_TARGET_<T>_LINKER to that
+            # scope's C cross toolchain (catalog-cached); rust-overlay
+            # supplies rustc/cargo as native binaries. crt-static because
+            # rust-overlay's musl specs default it off; auditable=false as on
+            # every rustup-toolchain cross (the unpin precedent).
+            muslCrossVendored = pkgs:
+              let
+                rust = toolchainFor pkgs.stdenv.buildPlatform.system
+                  pkgs.stdenv.hostPlatform.rust.rustcTarget;
+                rp = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
+              in
+              if ownSource then
+                mkOwn {
+                  rustPlatform = rp;
+                  auditable = false;
+                  env.RUSTFLAGS = "-C target-feature=+crt-static";
+                }
+              else
+                (pkgs.${pkgsAttr}.override { rustPlatform = rp; }).overrideAttrs (_: {
+                  RUSTFLAGS = "-C target-feature=+crt-static";
+                });
+
+            # rustc injects `-liconv` on darwin targets: pin the static
+            # archive first so no libiconv.2.dylib load command is emitted
+            # (the portability check rejects it), and hand the build→build
+            # cc-wrapper a -L for the BUILD-arch libiconv too — proc-macro
+            # dylibs also link with -liconv and that wrapper has no default
+            # path for it (the unpin-readme recipe; salt var because
+            # depsBuildBuild doesn't populate it under buildRustPackage).
             darwinCross = pkgs:
               let
                 salt = builtins.replaceStrings [ "-" "." ] [ "_" "_" ]
                   pkgs.stdenv.buildPlatform.config;
+                inner =
+                  if ownSource
+                  then mkOwn { rustPlatform = pkgs.rustPlatform; }
+                  else pkgs.${pkgsAttr};
               in
-              pkgs.${pkgsAttr}.overrideAttrs (old: {
+              inner.overrideAttrs (old: {
                 buildInputs = [ pkgs.pkgsStatic.libiconv ] ++ (old.buildInputs or [ ]);
                 "NIX_LDFLAGS_${salt}" = "-L${pkgs.buildPackages.libiconv}/lib";
               });
@@ -1837,18 +1913,36 @@ CBODY
                 host = pkgs.stdenv.hostPlatform;
                 cross = host.config != pkgs.stdenv.buildPlatform.config;
               in
-              if !cross then pkgs.pkgsStatic.${pkgsAttr}
+              if !cross then
+                (if ownSource then
+                  mkOwn {
+                    rustPlatform = pkgs.pkgsStatic.rustPlatform;
+                    env.RUSTFLAGS = "-C relocation-model=static";
+                  }
+                else pkgs.pkgsStatic.${pkgsAttr})
               else if host.isDarwin then darwinCross pkgs
-              else muslCross pkgs;
+              else if vendoredC then muslCrossVendored pkgs
+              else muslCrossPure pkgs;
+
+            # auditable=false on mingw: rustc + LTO + cargo-auditable
+            # overflows mingw's 32-bit relocation limit (unpin precedent).
+            rustWindowsBuild = pkgs:
+              if ownSource then
+                mkOwn {
+                  rustPlatform = pkgs.pkgsCross.mingwW64.rustPlatform;
+                  auditable = false;
+                }
+              else pkgs.pkgsCross.mingwW64.${pkgsAttr};
           in
           assert nixpkgs.lib.assertMsg (!(args.dnsFallback or false))
             "mkRustCrate: dnsFallback is unsupported for Rust crates (the unsalted NIX_LDFLAGS breaks crate build scripts) — see unpins/unpin for bespoke wiring";
+          assert nixpkgs.lib.assertMsg (!ownSource || (version != null && cargoLock != null))
+            "mkRustCrate: own-source mode needs all three of src / version / cargoLock";
           mkStandaloneFlake (
-            builtins.removeAttrs args [ "rust-overlay" ]
+            builtins.removeAttrs args [ "rust-overlay" "src" "version" "cargoLock" "vendoredC" ]
             // {
               build = args.build or rustBuild;
-              windowsBuild = args.windowsBuild
-                or (pkgs: pkgs.pkgsCross.mingwW64.${pkgsAttr});
+              windowsBuild = args.windowsBuild or rustWindowsBuild;
               dnsFallback = false;
             }
           );
