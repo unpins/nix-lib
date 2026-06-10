@@ -537,6 +537,25 @@
         # Alias security (no marker needed): aliases are honored at install time
         # only for catalog-owner packages, and every name passes the blocklist —
         # both upstream of the reader. See docs/embedded-metadata.md §4.
+
+        # Build-host-native tool that packs a staging `unpin/` tree into a
+        # zstd-in-zip (ZIP method 93) overlay — the format `withMan` uses for the
+        # man payload. Compresses with libzstd; shipped binaries decode method 93
+        # with `unpin`'s pure-Rust ruzstd reader (unpin/src/meta.rs). Sources
+        # vendored from unpins/unpin-vfs. `-DMINIZ_NO_TIME` zeroes entry mtimes
+        # so the overlay is byte-reproducible.
+        unpinPackTool = pkgs: pkgs.buildPackages.stdenv.mkDerivation {
+          name = "unpin-vfs-pack";
+          dontUnpack = true;
+          buildInputs = [ pkgs.buildPackages.zstd ];
+          buildPhase = ''
+            $CC -O2 -DMINIZ_USE_ZSTD -DMINIZ_NO_TIME -I${./vfs-pack} \
+              ${./vfs-pack/unpin-vfs-pack.c} ${./vfs-pack/miniz.c} ${./vfs-pack/unpin_zstd.c} \
+              -o unpin-vfs-pack -lzstd
+          '';
+          installPhase = ''mkdir -p $out/bin; cp unpin-vfs-pack $out/bin/'';
+        };
+
         # Shared embed primitive for withAliases/withMan: add a staging `unpin/`
         # subtree to the binary's embedded ZIP (docs/embedded-metadata.md). If
         # the binary already carries a tail-ZIP (cosmo APE runtime, or a prior
@@ -548,7 +567,7 @@
         # entry replaces it, so re-runs don't accrete duplicate ZIPs.
         unpinEmbedSh = ''
           __unpin_embed_subtree() {
-            __ues_bin="$1"; __ues_stage="$2"
+            __ues_bin="$1"; __ues_stage="$2"; __ues_comp="''${3:-deflate}"
             if [ ! -f "$__ues_bin" ]; then
               echo "unpin embed: $__ues_bin does not exist" >&2; exit 1
             fi
@@ -560,14 +579,49 @@
               # append a second ZIP after it — cosmo's loader finds its `/zip/`
               # runtime via the end-of-file EOCD, and a trailing ZIP would shadow
               # it. cosmo's ZIP has file-adjusted offsets, so `zip` can edit it.
+              # Always deflate here: the loader reads this ZIP and a separate
+              # zstd overlay can't be merged into it, so a `zstd` request degrades.
               ( cd "$__ues_stage" && printf '%s\n' "$__ues_names" | zip -y -X -q "$__ues_bin" -@ )
+            elif [ "$__ues_comp" = zstd ]; then
+              # Append a NEW zstd-in-zip overlay (ZIP method 93) at EOF — the man
+              # payload, where zstd beats deflate. The reader (unpin/src/meta.rs)
+              # unions `unpin/*` across every embedded ZIP, so this coexists with
+              # an earlier deflate aliases overlay. unpin-vfs-pack walks the tree
+              # itself and stores no symlinks (miniz emits no unix link mode), so
+              # first resolve the `.so`-redirect man links to their target's
+              # bytes — same deref the @INC blob does with `cp -L`.
+              find "$__ues_stage/unpin" -type l | while IFS= read -r __ues_l; do
+                __ues_t="$(readlink -f "$__ues_l" 2>/dev/null || true)"
+                if [ -n "$__ues_t" ] && [ -f "$__ues_t" ]; then
+                  rm -f "$__ues_l"; cp "$__ues_t" "$__ues_l"
+                fi
+              done
+              __ues_d="$(mktemp -d)"
+              unpin-vfs-pack "$__ues_d/m.zip" "$__ues_stage" >/dev/null
+              # A shared zstd dictionary (`zstd --train`, stored as `.unpin/zdict`,
+              # auto-loaded by the reader) exploits cross-page roff redundancy for a
+              # much bigger win on large man sets — but it's ~110 KB STORED, dead
+              # weight on a small one. So only train above a threshold, and keep the
+              # dict overlay ONLY if it actually came out smaller: the dict can never
+              # make a package larger, and training too-few samples just falls back.
+              __ues_raw=$(find "$__ues_stage/unpin" -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}')
+              if [ "''${__ues_raw:-0}" -ge 1048576 ] && command -v zstd >/dev/null 2>&1; then
+                if ( cd "$__ues_stage" && zstd -q -f --train $(find . -type f | LC_ALL=C sort) -o "$__ues_d/zdict" --maxdict=112640 2>/dev/null ) \
+                   && unpin-vfs-pack "$__ues_d/md.zip" "$__ues_stage" --dict "$__ues_d/zdict" >/dev/null; then
+                  if [ "$(wc -c < "$__ues_d/md.zip")" -lt "$(wc -c < "$__ues_d/m.zip")" ]; then
+                    mv "$__ues_d/md.zip" "$__ues_d/m.zip"
+                  fi
+                fi
+              fi
+              cat "$__ues_d/m.zip" >> "$__ues_bin"
+              rm -rf "$__ues_d"
             else
               # Fresh binary, or a binary that already carries one of OUR overlay
               # ZIPs (from a prior embed step). Append our subtree as a NEW
-              # overlay ZIP at EOF. We don't try to edit a prior overlay: `zip`
-              # rejects an unadjusted-prefix overlay ("structure invalid"), and
-              # the reader unions `unpin/*` across every embedded ZIP anyway — so
-              # aliases-overlay + man-overlay read back as one set. zip must
+              # deflate overlay ZIP at EOF. We don't try to edit a prior overlay:
+              # `zip` rejects an unadjusted-prefix overlay ("structure invalid"),
+              # and the reader unions `unpin/*` across every embedded ZIP anyway —
+              # so aliases-overlay + man-overlay read back as one set. zip must
               # CREATE the archive (a bare `mktemp` file is empty and rejected),
               # so point it at a fresh path.
               __ues_d="$(mktemp -d)"
@@ -815,6 +869,8 @@
                 pkgs.buildPackages.python3Minimal  # mkmeta.py builds the man tree
                 pkgs.buildPackages.zip
                 pkgs.buildPackages.unzip
+                (unpinPackTool pkgs)               # zstd-in-zip packer for the man overlay
+                pkgs.buildPackages.zstd            # `zstd --train` for the shared man dict
               ];
 
             postFixup = (old.postFixup or "") + ''
@@ -877,9 +933,10 @@
                     echo "withMan: man found but $__unpin_bin missing — skipping embed for ${primary}" >&2
                   else
                     # No ordering guard needed: __unpin_embed_subtree ADDS man
-                    # entries to whatever ZIP withAliases left (or creates one),
-                    # so it can't clobber the alias entry.
-                    __unpin_embed_subtree "$__unpin_bin" "$__unpin_stage"
+                    # entries as a separate overlay alongside whatever ZIP
+                    # withAliases left, so it can't clobber the alias entry. The
+                    # man payload is large and roff-redundant — pack it zstd.
+                    __unpin_embed_subtree "$__unpin_bin" "$__unpin_stage" zstd
                   fi
                 fi
                 rm -rf "$__unpin_stage"
