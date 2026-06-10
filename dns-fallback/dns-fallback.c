@@ -20,12 +20,19 @@
  *   - "no such name"        -> EAI_NONAME (respected, NOT a trigger): an
  *     authoritative NXDOMAIN from a working resolver. Re-asking a public resolver
  *     would mask it and break split-horizon DNS, so we never do.
- * Only for a real hostname (numeric literals / AI_NUMERICHOST need no DNS) and
- * only on a reach failure does it run its own query over UDP/53 to a public
- * resolver — 1.1.1.1 then 8.8.8.8 by default, or the space-separated IPv4
- * literals in $UNPIN_DNS when the user sets it. The rule is uniform on every
- * platform: try the OS resolver, fall back only when it can't reach one — so on
- * a normal host the OS answers and the fallback never runs.
+ * The fallback is OPT-IN: it stays dormant unless the user pointed it at a
+ * resolver, so by default a reach failure surfaces unchanged (and unpin then
+ * teaches the user how to turn it on). Two opt-in sources, checked in order:
+ *   - $UNPIN_DNS — space-separated IPv4 literals, a one-shot override;
+ *   - `dns = <ip> …` in unpin's config file — read by this shim itself (see
+ *     config_dns), so EVERY unpins program honours it without an env var.
+ * Only for a real hostname (numeric literals / AI_NUMERICHOST need no DNS), only
+ * on a reach failure, and only when a resolver is configured does it run its own
+ * query over UDP/53 to that resolver. With nothing configured it reports the
+ * condition (unpin_dns_note_unreachable) and returns the real error untouched.
+ * The rule is uniform on every platform: try the OS resolver, fall back only
+ * when it can't reach one and the user opted in — so on a normal host the OS
+ * answers and the fallback never runs.
  *
  * How it is interposed (per toolchain)
  * ------------------------------------
@@ -112,6 +119,7 @@
 #    include <dlfcn.h>
 #  endif
 #endif
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -197,50 +205,142 @@ int unpin_readurl(const char *url,
 #define DNS_TIMEOUT_MS  3000
 #define MAX_RESOLVERS   8
 
-/* Default public resolvers, tried in order when UNPIN_DNS is unset. */
-static const char *const DEFAULT_RESOLVERS[] = { "1.1.1.1", "8.8.8.8" };
+/* Optional hook: the shim calls this once when a lookup needs the fallback but
+ * the user has NOT opted in (no $UNPIN_DNS, no config `dns`), so it had to
+ * surface the real EAI_AGAIN. A WEAK no-op definition here; unpin overrides it
+ * with a strong definition (see unpin/src/dns.rs) that records the condition so
+ * it can teach the user about opt-in DNS. Other tools that link this archive
+ * keep the no-op. Same weak-definition mechanism as unpin_readurl above (a weak
+ * *definition* links clean on ELF, Mach-O and COFF alike). */
+__attribute__((weak))
+void unpin_dns_note_unreachable(void) { }
 
-/* The resolver list for this call: the space-separated IPv4 literals in
- * $UNPIN_DNS when the user sets it (to point the fallback at their own resolver
- * — privacy, a local cache, a corporate DNS), else the built-in defaults above.
- * UNPIN_DNS *replaces* the defaults rather than extending them.
+/* Trim ASCII whitespace from both ends of `s` in place; returns the first
+ * non-space byte. Mirrors the `.trim()` in unpin/src/config.rs (ASCII subset is
+ * enough — a `dns` value is IPv4 literals, never multibyte whitespace). */
+static char *trim(char *s)
+{
+    while (*s == ' ' || *s == '\t' || *s == '\r' ||
+           *s == '\n' || *s == '\f' || *s == '\v') s++;
+    char *e = s + strlen(s);
+    while (e > s) {
+        char c = e[-1];
+        if (c == ' ' || c == '\t' || c == '\r' ||
+            c == '\n' || c == '\f' || c == '\v') e--;
+        else break;
+    }
+    *e = '\0';
+    return s;
+}
+
+/* Join `a` + `b` into `out` (capacity `cap`, NUL-terminated). Returns 1, or 0
+ * if it wouldn't fit. */
+static int path_join(char *out, size_t cap, const char *a, const char *b)
+{
+    size_t la = strlen(a), lb = strlen(b);
+    if (la + lb + 1 > cap) return 0;
+    memcpy(out, a, la);
+    memcpy(out + la, b, lb + 1);                /* copy b including its NUL */
+    return 1;
+}
+
+/* Resolve unpin's config-file path into `out`. Mirrors unpin/src/platform.rs:
+ *   - POSIX: $XDG_CONFIG_HOME/unpin/config, else $HOME/.config/unpin/config;
+ *   - Windows: %APPDATA%\unpin\config.
+ * Returns 1 on success, 0 when the base env var is unset/empty (no config). */
+static int config_path(char *out, size_t cap)
+{
+#if defined(UNPIN_WINDOWS)
+    const char *base = getenv("APPDATA");
+    if (base && *base) return path_join(out, cap, base, "\\unpin\\config");
+    return 0;
+#else
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) return path_join(out, cap, xdg, "/unpin/config");
+    const char *home = getenv("HOME");
+    if (home && *home) return path_join(out, cap, home, "/.config/unpin/config");
+    return 0;
+#endif
+}
+
+/* Read the `dns` value from unpin's config file into `out` (capacity `cap`).
+ * Mirrors the flat grammar of unpin/src/config.rs: strip an inline `#` comment,
+ * trim, split on the first `=`, last-wins. Read lazily on the error path only
+ * (a lookup already failed), so the common case never touches the disk. Returns
+ * 1 and writes the value on success, else 0. This is the opt-in that lets EVERY
+ * unpins program (curl, git, …) honour the config — not just unpin — since the
+ * shim can't ask unpin and must read the file itself. */
+static int config_dns(char *out, size_t cap)
+{
+    char path[1024];
+    if (!config_path(path, sizeof path)) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char line[512];
+    int found = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';                 /* inline comment to EOL */
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        if (strcmp(trim(line), "dns") != 0) continue;
+        char *val = trim(eq + 1);
+        size_t vl = strlen(val);
+        if (vl && vl < cap) {                   /* last-wins: keep the final one */
+            memcpy(out, val, vl + 1);
+            found = 1;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+/* Tokenise a space/tab-separated list of IPv4 literals from `src` into `out[]`,
+ * using caller-owned `buf` (which backs the returned pointers) as scratch.
  *
  * Entries MUST be IPv4 literals — used verbatim both as the UDP/53 peer and, for
  * DoH, as the host in https://<ip>/dns-query (cert checked against that IP's
  * SAN). A hostname can't be allowed: the DoH leg would try to resolve it and
  * recurse straight back through this interposer. Non-literal / IPv6 / overflow
- * entries are skipped; if nothing valid remains we fall back to the defaults so
- * a typo never leaves a resolver-less host mute.
- *
- * `buf` (caller-owned, alive for the whole resolution) backs the returned
- * pointers — we tokenise it in place and `out[]` points into it. */
+ * tokens are skipped. Returns the count. */
+static size_t tokenize_resolvers(const char *src, const char **out,
+                                 char *buf, size_t bufcap)
+{
+    size_t n = 0, len = strlen(src);
+    if (len >= bufcap) return 0;
+    memcpy(buf, src, len + 1);
+    char *p = buf;
+    while (n < MAX_RESOLVERS) {
+        while (*p == ' ' || *p == '\t') p++;            /* skip separators */
+        if (!*p) break;
+        char *tok = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) *p++ = '\0';                            /* terminate token */
+        struct in_addr a4;
+        if (inet_pton(AF_INET, tok, &a4) == 1)
+            out[n++] = tok;            /* IPv4 literal — safe for UDP + DoH URL */
+    }
+    return n;
+}
+
+/* The resolver list for this call, OPT-IN only: $UNPIN_DNS (a one-shot
+ * override) when it yields ≥ 1 valid literal, else the config `dns` key, else
+ * empty. There is deliberately NO built-in default — the fallback never fires
+ * without the user's explicit say-so; an empty return tells the caller to
+ * surface the real EAI_AGAIN (and call unpin_dns_note_unreachable). `buf`
+ * (caller-owned, alive for the whole resolution) backs the returned pointers. */
 static size_t resolver_list(const char **out, char *buf, size_t bufcap)
 {
     const char *env = getenv("UNPIN_DNS");
-    size_t n = 0;
     if (env && *env) {
-        size_t len = strlen(env);
-        if (len < bufcap) {
-            memcpy(buf, env, len + 1);
-            char *p = buf;
-            while (n < MAX_RESOLVERS) {
-                while (*p == ' ' || *p == '\t') p++;        /* skip separators */
-                if (!*p) break;
-                char *tok = p;
-                while (*p && *p != ' ' && *p != '\t') p++;
-                if (*p) *p++ = '\0';                        /* terminate token */
-                struct in_addr a4;
-                if (inet_pton(AF_INET, tok, &a4) == 1)
-                    out[n++] = tok;        /* IPv4 literal — safe for UDP + DoH URL */
-            }
-        }
+        size_t n = tokenize_resolvers(env, out, buf, bufcap);
+        if (n) return n;                 /* env set and valid → use it */
     }
-    if (n == 0) {
-        size_t nd = sizeof DEFAULT_RESOLVERS / sizeof *DEFAULT_RESOLVERS;
-        for (size_t i = 0; i < nd && i < MAX_RESOLVERS; i++)
-            out[n++] = DEFAULT_RESOLVERS[i];
-    }
-    return n;
+    char cfg[256];
+    if (config_dns(cfg, sizeof cfg))
+        return tokenize_resolvers(cfg, out, buf, bufcap);
+    return 0;
 }
 
 /* One contiguous allocation per resolved name. `magic` MUST sit immediately
@@ -451,6 +551,18 @@ int ENTRY_GETADDRINFO(const char *node, const char *service,
         (flags & AI_NUMERICHOST) || !want_fallback(node))
         return rc;
 
+    /* …and only when the user OPTED IN (env $UNPIN_DNS or config `dns`). With no
+     * resolver configured we can't help: latch the condition so unpin can teach
+     * the user, and surface the real error unchanged. `dnsbuf` backs the parsed
+     * strings and must outlive the loop below. */
+    const char *resolvers[MAX_RESOLVERS];
+    char dnsbuf[256];
+    const size_t nres = resolver_list(resolvers, dnsbuf, sizeof dnsbuf);
+    if (nres == 0) {
+        unpin_dns_note_unreachable();
+        return rc;
+    }
+
     int family   = hints ? hints->ai_family   : AF_UNSPEC;
     int socktype = hints ? hints->ai_socktype : 0;
     int protocol = hints ? hints->ai_protocol : 0;
@@ -471,11 +583,6 @@ int ENTRY_GETADDRINFO(const char *node, const char *service,
      * UDP answers at 512). */
     unsigned char q[300], r[4096];
     uint16_t id = (uint16_t)(UNPIN_PID() ^ (uintptr_t)b);
-    /* Resolvers for this call — $UNPIN_DNS if set, else the defaults. `dnsbuf`
-     * backs the parsed strings and must outlive the loop below. */
-    const char *resolvers[MAX_RESOLVERS];
-    char dnsbuf[256];
-    const size_t nres = resolver_list(resolvers, dnsbuf, sizeof dnsbuf);
     int udp_dead = 0;                  /* set once UDP/53 is blocked */
     int doh_dead = 0;                  /* set once DoH/443 is blocked */
 

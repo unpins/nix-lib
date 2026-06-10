@@ -273,16 +273,22 @@
         # /etc/resolv.conf is absent — which is the case on Android (no
         # resolv.conf; DNS lives behind Bionic + netd, unreachable from a
         # non-Bionic static binary), so every catalog binary fails to resolve.
-        # The wrapper delegates to the real resolver in every normal case and
-        # only does its own UDP/53 query to a public resolver (1.1.1.1/8.8.8.8)
-        # when there is NO configured resolver AND the node is a hostname. If
-        # UDP/53 is itself blocked (captive portals, port-53 firewalls), it can
-        # escalate to DoH over HTTPS/443 through an OPTIONAL weak hook
-        # (unpin_readurl — a generic "fetch this URL" call) that a binary
-        # carrying a TLS stack provides from that stack: the Rust tools
-        # (unpin/unpin-readme) do, over rustls; a networked C tool could over its
-        # libcurl/OpenSSL. Left unprovided, the binary stays UDP-only at zero
-        # cost. See dns-fallback/dns-fallback.c for the full contract.
+        # The wrapper delegates to the real resolver in every normal case. It
+        # takes over only when the OS resolver can't be REACHED (EAI_AGAIN) for a
+        # real hostname AND the user OPTED IN to a fallback resolver — via
+        # $UNPIN_DNS or a `dns =` line in unpin's config file, which the shim
+        # reads itself so every unpins program honours it without an env var. The
+        # fallback is OFF by default: with nothing configured it surfaces the real
+        # error and calls a weak hook (unpin_dns_note_unreachable) that unpin
+        # overrides to teach the user how to opt in — there is no built-in public
+        # default, so it never fires without consent. If UDP/53 is itself blocked
+        # (captive portals, port-53 firewalls), it can escalate to DoH over
+        # HTTPS/443 through an OPTIONAL weak hook (unpin_readurl — a generic
+        # "fetch this URL" call) that a binary carrying a TLS stack provides from
+        # that stack: the Rust tools (unpin/unpin-readme) do, over rustls; a
+        # networked C tool could over its libcurl/OpenSSL. Left unprovided, the
+        # binary stays UDP-only at zero cost. See dns-fallback/dns-fallback.c for
+        # the full contract.
         #
         # Built with the TARGET stdenv so it compiles per arch/OS — one C file,
         # three link mechanisms selected by #ifdef (see dns-fallback.c): musl/
