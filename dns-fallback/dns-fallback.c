@@ -14,12 +14,16 @@
  * -----------------------
  * It interposes getaddrinfo and always calls the real OS resolver FIRST — exactly
  * as if this code weren't here — taking over only when that call could not REACH
- * a resolver. The two failure outcomes are distinct:
- *   - unreachable resolver  -> EAI_AGAIN  (our trigger): a resolver-less host
- *     (Android, a barebones container) or a dead/unreachable nameserver;
+ * a resolver. The failure outcomes are distinct:
+ *   - unreachable resolver  -> EAI_AGAIN / EAI_FAIL / EAI_SYSTEM (our triggers,
+ *     see reach_failure): a resolver-less host (Android, a barebones container)
+ *     or a dead/unreachable nameserver;
  *   - "no such name"        -> EAI_NONAME (respected, NOT a trigger): an
  *     authoritative NXDOMAIN from a working resolver. Re-asking a public resolver
- *     would mask it and break split-horizon DNS, so we never do.
+ *     would mask it and break split-horizon DNS, so we never do;
+ *   - caller errors         -> EAI_SERVICE, EAI_BADFLAGS, … (respected, NOT
+ *     triggers): the lookup itself was malformed — a fallback answer would mask
+ *     the caller's bug behind addresses carrying a port of 0.
  * The fallback is OPT-IN: it stays dormant unless the user pointed it at a
  * resolver, so by default a reach failure surfaces unchanged (and unpin then
  * teaches the user how to turn it on). Two opt-in sources, checked in order:
@@ -354,6 +358,25 @@ struct fb {
     struct addrinfo         ai[MAXADDR];
 };
 
+/* Is `rc` a could-not-REACH-a-resolver failure — the only condition the
+ * fallback may take over? A strict whitelist: every other nonzero code either
+ * carries an authoritative answer (EAI_NONAME = NXDOMAIN) or blames the call
+ * itself (EAI_SERVICE, EAI_BADFLAGS, EAI_MEMORY, EAI_FAMILY, …), and answering
+ * those would mask the real error. The reach failures are exactly:
+ *   - EAI_AGAIN   resolver unreachable / timed out (musl's no-resolv.conf
+ *                 path, a dead nameserver; mingw maps it to WSATRY_AGAIN);
+ *   - EAI_FAIL    non-recoverable resolver failure (WSANO_RECOVERY on mingw);
+ *   - EAI_SYSTEM  transport-level failure, where defined (POSIX only —
+ *                 Windows reports everything through the WSA EAI codes). */
+static int reach_failure(int rc)
+{
+    if (rc == EAI_AGAIN || rc == EAI_FAIL) return 1;
+#if defined(EAI_SYSTEM)
+    if (rc == EAI_SYSTEM) return 1;
+#endif
+    return 0;
+}
+
 /* Our DNS fallback can only help a real hostname. Numeric literals (v4/v6) and
  * NULL need no DNS — the real resolver already handled or rejected them. */
 static int want_fallback(const char *node)
@@ -486,12 +509,14 @@ static const unsigned char *skip_name(const unsigned char *p,
 }
 
 /* Parse answers of type `qtype` (1=A, 28=AAAA) into b->ss/b->ai, appending from
- * *count. Returns 0 on success (possibly 0 records), -1 if malformed. */
+ * *count. Returns the reply's rcode (0 = NOERROR, possibly with 0 records;
+ * records are only filled on NOERROR), or -1 if malformed. */
 static int parse_resp(const unsigned char *r, int rlen, int qtype, int port,
                       struct fb *b, int *count)
 {
     if (rlen < 12)              return -1;
-    if ((r[3] & 0x0f) != 0)     return 0;       /* rcode != NOERROR */
+    int rcode = r[3] & 0x0f;
+    if (rcode != 0)             return rcode;   /* NXDOMAIN/SERVFAIL/…: no records */
     int qd = (r[4] << 8) | r[5];
     int an = (r[6] << 8) | r[7];
     const unsigned char *p = r + 12, *end = r + rlen;
@@ -542,12 +567,11 @@ int ENTRY_GETADDRINFO(const char *node, const char *service,
     /* Always try the system resolver first — identical path on every platform. */
     int rc = real_getaddrinfo(node, service, hints, res);
 
-    /* Take over only when it could not REACH a resolver (EAI_AGAIN and the other
-     * transport/system failures). A success is returned as-is; EAI_NONAME is an
-     * authoritative NXDOMAIN we must not mask; numeric literals / AI_NUMERICHOST
-     * need no DNS. */
+    /* Take over only when it could not REACH a resolver (the reach_failure
+     * whitelist — EAI_NONAME and the caller errors pass through untouched, see
+     * its comment); numeric literals / AI_NUMERICHOST need no DNS. */
     int flags = hints ? hints->ai_flags : 0;
-    if (rc == 0 || rc == EAI_NONAME ||
+    if (!reach_failure(rc) ||
         (flags & AI_NUMERICHOST) || !want_fallback(node))
         return rc;
 
@@ -591,28 +615,34 @@ int ENTRY_GETADDRINFO(const char *node, const char *service,
         int qlen = build_query(node, qtypes[qi], q, sizeof q, qid);
         if (qlen < 0) continue;
 
-        int answered = 0;                  /* got a DNS response (any rcode) */
+        /* `final` = a NOERROR or NXDOMAIN reply: the resolver answered the
+         * question (even with zero records), nothing left to ask for this
+         * qtype. SERVFAIL/REFUSED/garbage is NOT final — a captive portal's
+         * port-53 interceptor or a broken forwarder answers that way while the
+         * next resolver, or DoH/443 right past the interceptor, may still
+         * succeed — so those keep trying. */
+        int final = 0;
         if (!udp_dead) {
-            for (size_t si = 0; si < nres; si++) {
+            int reached = 0;               /* any datagram came back at all */
+            for (size_t si = 0; si < nres && !final; si++) {
                 int rlen = dns_exchange(resolvers[si], q, qlen, r, sizeof r, qid);
-                if (rlen > 0) {
-                    parse_resp(r, rlen, qtypes[qi], port, b, &count);
-                    answered = 1;
-                    break;                 /* this resolver answered over UDP */
-                }
+                if (rlen <= 0) continue;   /* silence — try the next resolver */
+                reached = 1;
+                int rcode = parse_resp(r, rlen, qtypes[qi], port, b, &count);
+                if (rcode == 0 || rcode == 3) final = 1;   /* NOERROR | NXDOMAIN */
             }
-            /* No resolver answered over UDP — treat port 53 as blocked for the
-             * rest of this call, so the next qtype goes straight to DoH instead
-             * of eating another full round of UDP timeouts. */
-            if (!answered) udp_dead = 1;
+            /* Pure silence from every resolver — treat port 53 as blocked for
+             * the rest of this call, so the next qtype goes straight to DoH
+             * instead of eating another full round of UDP timeouts. */
+            if (!reached) udp_dead = 1;
         }
 
-        /* Second stage: UDP got nothing → DoH/443. unpin_readurl is the weak stub
-         * (returns -1) unless a TLS-carrying consumer overrode it; the doh_dead
-         * short-circuit below then skips the rest cheaply. */
-        if (!answered && !doh_dead) {
-            int reached = 0;               /* a resolver answered over DoH */
-            for (size_t si = 0; si < nres; si++) {
+        /* Second stage: UDP yielded no final answer → DoH/443. unpin_readurl is
+         * the weak stub (returns -1) unless a TLS-carrying consumer overrode it;
+         * the doh_dead short-circuit below then skips the rest cheaply. */
+        if (!final && !doh_dead) {
+            int reached = 0;               /* any HTTP response came back */
+            for (size_t si = 0; si < nres && !final; si++) {
                 /* "https://<ip>/dns-query" without snprintf — mingw routes
                  * snprintf through wide-char CRT code, dragging in extra deps;
                  * memcpy keeps the archive's libc footprint to the basics. */
@@ -626,13 +656,12 @@ int ENTRY_GETADDRINFO(const char *node, const char *service,
                 memcpy(url + o, sfx, sizeof sfx);   /* includes the NUL */
                 int rlen = unpin_readurl(url, q, qlen, "application/dns-message",
                                          r, (int)sizeof r);
-                if (rlen > 0) {
-                    parse_resp(r, rlen, qtypes[qi], port, b, &count);
-                    reached = 1;
-                    break;                 /* this resolver answered over DoH */
-                }
+                if (rlen <= 0) continue;   /* no transport / HTTP error — next */
+                reached = 1;
+                int rcode = parse_resp(r, rlen, qtypes[qi], port, b, &count);
+                if (rcode == 0 || rcode == 3) final = 1;   /* NOERROR | NXDOMAIN */
             }
-            /* No resolver answered over DoH either — 443 is blocked or no TLS
+            /* Nothing came back over DoH either — 443 is blocked or no TLS
              * provider is linked. Skip the DoH round for the next qtype rather
              * than re-paying the per-resolver timeout (mirrors udp_dead above). */
             if (!reached) doh_dead = 1;
