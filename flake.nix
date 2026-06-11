@@ -1558,11 +1558,18 @@ CBODY
           , optimize ? { }
           # Link the DNS fallback (__wrap_getaddrinfo) into the linux-static
           # artifact so it resolves names where /etc/resolv.conf is absent
-          # (Android, minimal containers). On by default; harmless on binaries
-          # that never resolve (DCE drops it). Set false to opt a package out
-          # (e.g. if a multicall `-r` link ever misbehaves despite the lldRSafe
-          # --wrap strip). No-op on darwin/windows. See withDnsFallback.
-          , dnsFallback ? true
+          # (Android, minimal containers). OPT-IN: set `dnsFallback = true` only
+          # on packages that actually resolve hostnames (curl, whois, nmap, …).
+          # It is NOT free on programs that never resolve: the appendix ends in
+          # `-lc` (needed so __wrap_getaddrinfo's own libc deps — inet_pton,
+          # fopen, getaddrinfo, … — resolve after the archive), and that trailing
+          # `-lc` plus `--wrap=getaddrinfo` makes ld pull ~25 KB of musl's
+          # resolver into EVERY binary, used or not. On a real DNS consumer the
+          # archive is genuinely linked so this is correct and free; on a
+          # non-consumer it is dead bloat that shifted bzip2's bss enough to tip
+          # its decompressor into a SIGSEGV (`bzip2 --help`). Hence opt-in, not
+          # catalog-wide. No-op on darwin/windows. See withDnsFallback.
+          , dnsFallback ? false
           }:
           let
             optimize_ = { lto = false; opt = null; ssp = true; gc = true; } // optimize;
