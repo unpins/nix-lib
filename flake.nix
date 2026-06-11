@@ -985,22 +985,30 @@
         # binary shares: a `copy_basename` (strips dir + the `.exe` suffix), an
         # applet table built at build time from `multicall/apps.list` (one applet
         # name per line — THE contract; the caller populates it before invoking),
-        # and an argv[0]-shim `main` with a `<pkg> <applet> [args]` fallback.
+        # and a `main` with the unified dispatch contract below.
         #
         # Canonical behaviour, uniform across the catalog (replaces the old
         # hand-copied per-package dispatchers that had drifted apart):
         #   * Applet name -> C symbol via `tr -c 'A-Za-z0-9_' '_'`, so hyphenated
         #     applets (srt-live-transmit) map to a legal identifier with no
         #     per-package sanitiser.
-        #   * Permissive dispatch: a basename that isn't an applet (the canonical
-        #     name, a full path, or a renamed copy like CI's `smoke.exe`) falls
-        #     through to `argv[1]` as the applet — so renamed binaries AND the
-        #     smoke test keep dispatching, without each package keying on its own
-        #     name (the strict form some packages used had to drop smoke).
+        #   * Dispatch (`base` = basename(argv[0]), CANON = `name`):
+        #       - `base != CANON` and `base` is an applet -> ALIAS path: run it
+        #         via argv[0]. `--unpin-program` is ignored here, so an alias
+        #         symlink is locked to its identity (`ls --unpin-program=rm`
+        #         runs ls, never rm).
+        #       - otherwise (CANON, a path, or a renamed copy like CI's
+        #         `smoke.exe`) -> MULTITOOL path: `--unpin-program=NAME` as the
+        #         first argument selects the applet (coreutils' `--coreutils-prog`
+        #         convention); an unknown NAME errors on stderr, exit 1. There is
+        #         no positional `<pkg> <applet>` form — the explicit flag is the
+        #         single, unambiguous selector (so a canonical name that is also
+        #         an applet, e.g. `zip`, is never confused with `zip <applet>`).
+        #   * A canonical name that is itself an applet (bzip2/zip/flac/unzip)
+        #     runs that applet on a bare invocation.
         #   * Bare invocation (and `--help`/`-h`/`help`) lists the programs on
-        #     stdout and exits 0; an unknown program name errors on stderr and
-        #     exits 1. Unless `defaultApplet` is set (libwebp: a bare `libwebp`
-        #     runs cwebp) — then bare/unknown runs that, listing is unreachable.
+        #     stdout and exits 0; unless `defaultApplet` is set (libwebp: a bare
+        #     `libwebp` runs cwebp) — then bare runs that, listing is unreachable.
         #
         # Params: `name` (banner + default argv0) and optional `defaultApplet`.
         # The list source / sanitiser / fallback-style that used to vary per
@@ -1010,19 +1018,27 @@
         # terminators reach the emitted script at column 0 (a shell requirement)
         # and the enclosing indented-string keeps a sane min-indent. The consumer
         # must have written `multicall/apps.list` earlier in postBuild. Drv-hash
-        # changes vs the old inline dispatchers (intended — behaviour is unified
-        # to the permissive form). See docs/multicall.md.
+        # changes vs the old inline dispatchers (intended). See docs/multicall.md.
         multicallDispatcherC = { name, defaultApplet ? null }:
           let
             sanDefault = nixpkgs.lib.replaceStrings [ "-" "." "+" ] [ "_" "_" "_" ]
               (if defaultApplet == null then "" else defaultApplet);
+            # When to honor `--unpin-program=` on a NON-canonical, non-applet
+            # name. With a defaultApplet the self-detect aliases (bunzip2,
+            # zipinfo — names NOT in apps.list that route to the defaultApplet)
+            # must stay argv[0]-locked, so the flag is honored only on the exact
+            # canonical name. Without a defaultApplet there are no such aliases
+            # (every alias is a real applet, already locked on the alias path),
+            # and a renamed copy (CI's smoke.exe) needs the flag — so honor it
+            # unconditionally there.
+            flagGuard = if defaultApplet == null then "1" else "is_canon";
             fallbackC =
               if defaultApplet == null
               then ''        if (argc < 2) { list_programs(stdout); return 0; }
         if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") || !strcmp(argv[1], "help")) {
             list_programs(stdout); return 0;
         }
-        fprintf(stderr, "${name}: no program '%s'. Available:", base);
+        fprintf(stderr, "${name}: select a program with --unpin-program=<name>. Available:");
         for (const struct applet *a = applets; a->name; a++)
             fprintf(stderr, "%s%s", a == applets ? " " : ", ", a->name);
         fprintf(stderr, "\n");
@@ -1065,23 +1081,40 @@ static void list_programs(FILE *out) {
     fprintf(out, "${name} is one binary with several programs:");
     for (const struct applet *a = applets; a->name; a++)
         fprintf(out, "%s%s", a == applets ? " " : ", ", a->name);
-    fprintf(out, "\nRun one: ${name} <program> [args...]\n");
+    fprintf(out, "\nRun one: ${name} --unpin-program=<program> [args...]\n");
 }
 int main(int argc, char **argv) {
     char base[64];
     const char *a0 = (argc > 0 && argv[0]) ? argv[0] : "${name}";
     copy_basename(base, sizeof base, a0);
-    /* argv[0] shim: invoked under an applet name -> run it directly. */
-    for (const struct applet *a = applets; a->name; a++)
-        if (strcmp(base, a->name) == 0) return a->fn(argc, argv);
-    /* Any other name (canonical "${name}", a path, or a renamed copy like
-       CI's smoke.exe) -> take argv[1] as the applet, so renamed binaries and
-       the smoke test still dispatch. */
-    if (argc >= 2) {
-        copy_basename(base, sizeof base, argv[1]);
+    int is_canon = strcmp(base, "${name}") == 0;
+    /* Alias path: a symlink whose basename is an applet (and not the canonical
+       binary "${name}") -> run that applet via argv[0]. The --unpin-program
+       selector is deliberately NOT honored here, so an alias is locked to its
+       argv[0] identity (ls --unpin-program=rm runs ls, never rm). */
+    if (!is_canon)
         for (const struct applet *a = applets; a->name; a++)
-            if (strcmp(base, a->name) == 0) return a->fn(argc - 1, argv + 1);
+            if (strcmp(base, a->name) == 0) return a->fn(argc, argv);
+    /* Multitool path: the canonical name "${name}" or a renamed copy (a path,
+       or CI's smoke.exe). Select the applet explicitly with the first argument
+       --unpin-program=NAME. The ${flagGuard} guard keeps self-detect aliases
+       argv[0]-locked when a defaultApplet is present (see flagGuard above). */
+    if (${flagGuard} && argc >= 2 && strncmp(argv[1], "--unpin-program=", 16) == 0) {
+        const char *sel = argv[1] + 16;
+        for (const struct applet *a = applets; a->name; a++)
+            if (strcmp(sel, a->name) == 0) {
+                /* Reuse the argv[1] slot as the applet's argv[0]=NAME. */
+                argv[1] = (char *)sel;
+                return a->fn(argc - 1, argv + 1);
+            }
+        fprintf(stderr, "${name}: no program '%s'\n", sel);
+        return 1;
     }
+    /* The canonical name when it is itself an applet (bzip2/zip/flac/unzip
+       style) runs that applet on a bare invocation. */
+    if (is_canon)
+        for (const struct applet *a = applets; a->name; a++)
+            if (strcmp(base, a->name) == 0) return a->fn(argc, argv);
 ${fallbackC}
 }
 CBODY
@@ -1100,18 +1133,19 @@ CBODY
         # Aliases are just extra rows pointing at the same <fn-base> (the upstream
         # tool re-checks argv[0] itself). util-linux/shadow/procps-ng already
         # produce this TSV from their Makefile parse; e2fsprogs/findutils write it
-        # from a static list. The dispatcher this emits is uniform and permissive
-        # (was strict in util-linux/shadow/procps-ng — unified to recover the
-        # renamed-binary smoke, like the Recipe-B helper): strips a `/`/`\\` dir
-        # prefix (the `\\` is unconditional — cosmo APE argv[0] can carry it and
-        # `_WIN32` isn't defined for cosmo), a trailing `.exe`, and a libtool
-        # `lt-` prefix before matching. Invoke at COLUMN 0, after writing the TSV.
+        # from a static list. The dispatcher this emits follows the SAME contract
+        # as multicallDispatcherC: an alias symlink (`base != CANON` matching an
+        # applet) runs via argv[0] and ignores `--unpin-program`; the canonical
+        # name (or a renamed copy) selects an applet with `--unpin-program=NAME`
+        # as the first argument (no positional form). `copy_basename` strips a
+        # `/`/`\\` dir prefix (the `\\` is unconditional — cosmo APE argv[0] can
+        # carry it and `_WIN32` isn't defined for cosmo), a trailing `.exe`, and a
+        # libtool `lt-` prefix before matching. Invoke at COLUMN 0, after the TSV.
         #
         # Optional `defaultApplet` (a <fn-base>, NOT an applet name — its symbol
-        # `<defaultApplet>_main` must exist): a bare/unknown invocation runs it
-        # instead of printing usage. procps-ng uses `src_ps_pscommand` so that
-        # `procps-ng --version` and a renamed binary route to ps. See
-        # docs/multicall.md.
+        # `<defaultApplet>_main` must exist): a bare invocation runs it instead of
+        # printing usage. procps-ng uses `src_ps_pscommand` so `procps-ng
+        # --version` and a renamed binary route to ps. See docs/multicall.md.
         multicallTableDispatcherC = { name, defaultApplet ? null }:
           let
             fallbackC =
@@ -1120,7 +1154,7 @@ CBODY
     if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") || !strcmp(argv[1], "help")) {
         list_programs(stdout); return 0;
     }
-    fprintf(stderr, "${name}: no program '%s'. Available:", base);
+    fprintf(stderr, "${name}: select a program with --unpin-program=<name>. Available:");
     for (const struct applet *a = applets; a->name; a++)
         fprintf(stderr, "%s%s", a == applets ? " " : ", ", a->name);
     fprintf(stderr, "\n");
@@ -1161,23 +1195,35 @@ static void list_programs(FILE *out) {
     fprintf(out, "${name} is one binary with several programs:");
     for (const struct applet *a = applets; a->name; a++)
         fprintf(out, "%s%s", a == applets ? " " : ", ", a->name);
-    fprintf(out, "\nRun one: ${name} <program> [args...]\n");
+    fprintf(out, "\nRun one: ${name} --unpin-program=<program> [args...]\n");
 }
 int main(int argc, char **argv) {
     char base[256];
     const char *a0 = (argc > 0 && argv[0]) ? argv[0] : "${name}";
     copy_basename(base, sizeof base, a0);
-    /* argv[0] shim: invoked under an applet name -> run it directly. */
-    for (const struct applet *a = applets; a->name; a++)
-        if (strcmp(base, a->name) == 0) return a->fn(argc, argv);
-    /* Any other name (canonical "${name}", a path, or a renamed copy like
-       CI's smoke.exe) -> take argv[1] as the applet, so renamed binaries and
-       the smoke test still dispatch. */
-    if (argc >= 2) {
-        copy_basename(base, sizeof base, argv[1]);
+    int is_canon = strcmp(base, "${name}") == 0;
+    /* Alias path: a symlink whose basename is an applet (and not the canonical
+       binary "${name}") -> run that applet via argv[0]. --unpin-program is
+       deliberately NOT honored here, locking an alias to its argv[0] identity. */
+    if (!is_canon)
         for (const struct applet *a = applets; a->name; a++)
-            if (strcmp(base, a->name) == 0) return a->fn(argc - 1, argv + 1);
+            if (strcmp(base, a->name) == 0) return a->fn(argc, argv);
+    /* Multitool path: the canonical name "${name}" or a renamed copy. Select
+       the applet explicitly with the first argument --unpin-program=NAME. */
+    if (argc >= 2 && strncmp(argv[1], "--unpin-program=", 16) == 0) {
+        const char *sel = argv[1] + 16;
+        for (const struct applet *a = applets; a->name; a++)
+            if (strcmp(sel, a->name) == 0) {
+                argv[1] = (char *)sel;   /* applet's argv[0]=NAME, args follow */
+                return a->fn(argc - 1, argv + 1);
+            }
+        fprintf(stderr, "${name}: no program '%s'\n", sel);
+        return 1;
     }
+    /* The canonical name when it is itself an applet runs that applet bare. */
+    if (is_canon)
+        for (const struct applet *a = applets; a->name; a++)
+            if (strcmp(base, a->name) == 0) return a->fn(argc, argv);
 ${fallbackC}
 }
 CBODY
