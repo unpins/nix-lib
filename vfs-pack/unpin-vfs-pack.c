@@ -2,7 +2,7 @@
  * from a directory tree. Build-time tool; not shipped in the final binary.
  *
  *   unpin-vfs-pack OUT.zip ROOTDIR [--dict DICT] [--level N]
- *                  [--base N] [--deflate NAME]...
+ *                  [--base N] [--carry FILE] [--deflate NAME]...
  *
  * Every regular file under ROOTDIR is stored under its ROOTDIR-relative path,
  * compressed with zstd. With --dict, a trained zstd dictionary (from
@@ -21,6 +21,17 @@
  *
  * The archive stays a structurally standard .zip: any tool lists it; only
  * zstd-aware tools decode the entries.
+ *
+ * --carry FILE copies every entry of FILE's (possibly file-adjusted) ZIP into
+ * the output VERBATIM -- same method, bytes and CRC -- before adding ROOTDIR's
+ * entries. This is how a Cosmopolitan APE keeps its `/zip/` store (`.cosmo`,
+ * the `zoneinfo` tree, a bundled stdlib, ...) intact while gaining our zstd
+ * `unpin/` metadata: the existing entries stay deflate/store so cosmo still
+ * reads them, ours go in as method 93. cosmo's now-unused `.symtab.amd64` is
+ * dropped on the way through. With --carry the base defaults to where FILE's
+ * ZIP begins (its lowest local-header offset) so the rebuilt archive can be
+ * appended there; an explicit --base still wins. The resolved base is printed
+ * to stdout so the caller knows where to truncate-and-append.
  */
 #define _XOPEN_SOURCE 700  /* nftw + FTW_PHYS */
 #ifndef MINIZ_USE_ZSTD
@@ -160,13 +171,62 @@ static int adjust_offsets(const char *out, unsigned long base) {
     return 0;
 }
 
+static long file_size(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END)) { fclose(f); return -1; }
+    long n = ftell(f);
+    fclose(f);
+    return n;
+}
+
+/* Copy every entry of FILE's (possibly file-adjusted / SFX) ZIP into g_zip
+ * verbatim, except cosmo's unused ".symtab.amd64". Sets *out_base to where
+ * FILE's ZIP begins -- its lowest local-header offset -- so the rebuilt archive
+ * is appended at exactly that point. If FILE has no trailing ZIP (a plain
+ * executable), copies nothing and sets *out_base to FILE's size (append after
+ * it). Returns 0 on success, -1 on a real error. */
+static int carry_from(const char *file, unsigned long *out_base) {
+    mz_zip_archive src;
+    memset(&src, 0, sizeof src);
+    if (!mz_zip_reader_init_file(&src, file, 0)) {
+        long sz = file_size(file);
+        if (sz < 0) { fprintf(stderr, "carry: cannot size %s\n", file); return -1; }
+        *out_base = (unsigned long)sz;
+        return 0;
+    }
+    mz_uint n = mz_zip_reader_get_num_files(&src);
+    unsigned long minofs = (unsigned long)-1;
+    int rc = 0;
+    for (mz_uint i = 0; i < n; i++) {
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&src, i, &st)) {
+            fprintf(stderr, "carry: stat failed at entry %u of %s\n", i, file);
+            rc = -1; break;
+        }
+        if ((unsigned long)st.m_local_header_ofs < minofs)
+            minofs = (unsigned long)st.m_local_header_ofs;
+        if (!strcmp(st.m_filename, ".symtab.amd64")) continue;  /* drop cosmo symtab */
+        if (!mz_zip_writer_add_from_zip_reader(&g_zip, &src, i)) {
+            fprintf(stderr, "carry: copy failed for %s\n", st.m_filename);
+            rc = -1; break;
+        }
+    }
+    mz_zip_reader_end(&src);
+    if (rc) return -1;
+    *out_base = n ? minofs : (unsigned long)file_size(file);
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    const char *out = NULL, *root = NULL, *dictpath = NULL;
+    const char *out = NULL, *root = NULL, *dictpath = NULL, *carry = NULL;
     unsigned long base = 0;
+    int have_base = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dict") && i + 1 < argc) dictpath = argv[++i];
         else if (!strcmp(argv[i], "--level") && i + 1 < argc) g_level = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--base") && i + 1 < argc) base = strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--base") && i + 1 < argc) { base = strtoul(argv[++i], NULL, 10); have_base = 1; }
+        else if (!strcmp(argv[i], "--carry") && i + 1 < argc) carry = argv[++i];
         else if (!strcmp(argv[i], "--deflate") && i + 1 < argc) {
             if (g_ndeflate == MAX_DEFLATE) { fprintf(stderr, "too many --deflate\n"); return 2; }
             g_deflate[g_ndeflate++] = argv[++i];
@@ -177,7 +237,7 @@ int main(int argc, char **argv) {
     }
     if (!out || !root) {
         fprintf(stderr, "usage: %s OUT.zip ROOTDIR [--dict DICT] [--level N] "
-                        "[--base N] [--deflate NAME]...\n", argv[0]);
+                        "[--base N] [--carry FILE] [--deflate NAME]...\n", argv[0]);
         return 2;
     }
 
@@ -192,6 +252,11 @@ int main(int argc, char **argv) {
     if (!mz_zip_writer_init_file(&g_zip, out, 0)) {
         fprintf(stderr, "cannot create %s\n", out); return 2;
     }
+
+    /* Carry an existing tail-ZIP (cosmo's `/zip/` store) in first, verbatim,
+     * and default the base to where it began. */
+    unsigned long carry_base = 0;
+    if (carry && carry_from(carry, &carry_base) != 0) { free(dict); return 1; }
 
     /* The dict must be readable WITHOUT the dict, so store it (method 0). */
     if (dict)
@@ -209,7 +274,11 @@ int main(int argc, char **argv) {
     mz_zip_writer_end(&g_zip);
     free(dict);
 
+    if (!have_base && carry) base = carry_base;
     if (base && adjust_offsets(out, base) != 0) return 1;
+
+    /* Report the resolved base so the caller can truncate-and-append there. */
+    printf("%lu\n", base);
 
     fprintf(stderr, "packed %ld files: %ld -> %ld bytes (%.1f%%)%s\n",
             g_files, g_bytes_in, g_bytes_out,
