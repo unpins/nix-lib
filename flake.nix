@@ -2131,27 +2131,6 @@ CBODY
                   RUSTFLAGS = "-C target-feature=+crt-static";
                 });
 
-            # rustc injects `-liconv` on darwin targets: pin the static
-            # archive first so no libiconv.2.dylib load command is emitted
-            # (the portability check rejects it), and hand the build→build
-            # cc-wrapper a -L for the BUILD-arch libiconv too — proc-macro
-            # dylibs also link with -liconv and that wrapper has no default
-            # path for it (the unpin-readme recipe; salt var because
-            # depsBuildBuild doesn't populate it under buildRustPackage).
-            darwinCross = pkgs:
-              let
-                salt = builtins.replaceStrings [ "-" "." ] [ "_" "_" ]
-                  pkgs.stdenv.buildPlatform.config;
-                inner =
-                  if ownSource
-                  then mkOwn { rustPlatform = pkgs.rustPlatform; }
-                  else pkgs.${pkgsAttr};
-              in
-              inner.overrideAttrs (old: {
-                buildInputs = [ pkgs.pkgsStatic.libiconv ] ++ (old.buildInputs or [ ]);
-                "NIX_LDFLAGS_${salt}" = "-L${pkgs.buildPackages.libiconv}/lib";
-              });
-
             rustBuild = pkgs:
               let
                 host = pkgs.stdenv.hostPlatform;
@@ -2164,7 +2143,18 @@ CBODY
                     env.RUSTFLAGS = "-C relocation-model=static";
                   }
                 else pkgs.pkgsStatic.${pkgsAttr})
-              else if host.isDarwin then darwinCross pkgs
+              # Within-darwin cross (CI builds x86_64-darwin from the arm64
+              # runner): build the crate against the host's default
+              # rustPlatform. rustc injects `-liconv` on darwin targets and the
+              # proc-macro/build-script host links want it too; both are now
+              # handled centrally by mkStandaloneFlake's `withDarwinIconv` (it
+              # pins the static target archive so no libiconv.2.dylib load
+              # command survives the portability check, and hands the
+              # build→build cc-wrapper a `-L` for the BUILD-arch libiconv,
+              # cross-only) — so no per-path iconv wiring is needed here.
+              else if host.isDarwin then
+                (if ownSource then mkOwn { rustPlatform = pkgs.rustPlatform; }
+                else pkgs.${pkgsAttr})
               else if vendoredC then muslCrossVendored pkgs
               else muslCrossPure pkgs;
 
