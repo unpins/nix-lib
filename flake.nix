@@ -533,6 +533,51 @@
           })
           else drv;
 
+        # Darwin libiconv handling, applied automatically to every darwin build
+        # in mkStandaloneFlake's pipeline (like filterEnableStaticOnDarwin) so
+        # individual packages stop re-solving the same two iconv traps. macOS
+        # keeps iconv in a standalone libiconv (not libSystem), and the darwin
+        # portability allow-list permits only libSystem/libobjc/Frameworks — so
+        # anything that references iconv must link it, and statically:
+        #
+        #  * Target link (every darwin build): C objects that reference iconv
+        #    (libxml2.a's encoding.o, ...) and rustc's default `-liconv` need a
+        #    libiconv to resolve against. Use the *static* libiconv — a leaf in
+        #    pkgsStatic, so it doesn't drag in the broken cctools-static cascade
+        #    — so the final binary carries no libiconv.2.dylib load command (the
+        #    allow-list rejects that). The bare `-liconv` is appended to the
+        #    unsalted NIX_LDFLAGS the target cc-wrapper reads; harmless when
+        #    nothing references iconv (a static archive contributes only the
+        #    objects that resolve undefined symbols — none, here).
+        #
+        #  * Build-host link (darwin CROSS only): cargo/cmake build scripts and
+        #    proc-macro dylibs are linked for the BUILD host, and rustc appends
+        #    `-liconv` there too, against the build cc-wrapper's salted
+        #    NIX_LDFLAGS_<buildSalt> — which has no default path for it, so the
+        #    build dies with "library not found for -liconv". Hand it a -L to the
+        #    build-arch libiconv. CROSS-ONLY: on a native build the build salt
+        #    equals the target salt, so this -L would instead pull a *dynamic*
+        #    libiconv into the final binary and trip the allow-list.
+        #
+        # Darwin-only; linux/windows/cosmo drvs pass through untouched (windows
+        # never reaches this pipeline anyway). See docs/platforms/darwin.md
+        # ("the libiconv catch").
+        withDarwinIconv = pkgs: drv:
+          let
+            host = pkgs.stdenv.hostPlatform;
+            cross = host.config != pkgs.stdenv.buildPlatform.config;
+            buildSalt = pkgs.buildPackages.stdenv.cc.suffixSalt;
+          in
+          if !(host.isDarwin or false) then drv
+          else drv.overrideAttrs (old: {
+            buildInputs = [ pkgs.pkgsStatic.libiconv ] ++ (old.buildInputs or [ ]);
+            NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " -liconv";
+            preBuild = (old.preBuild or "")
+              + nixpkgs.lib.optionalString cross ''
+                export NIX_LDFLAGS_${buildSalt}="''${NIX_LDFLAGS_${buildSalt}:-} -L${nixpkgs.lib.getLib pkgs.buildPackages.libiconv}/lib"
+              '';
+          });
+
         # Embed a package's multi-call alias list into `$out/bin/<primary>` as a
         # `unpin/aliases` entry of the binary's embedded ZIP, so unpin's
         # installer can spawn argv[0]-dispatch links (xz → xzcat/unxz/lzma…) at
@@ -1590,7 +1635,7 @@ CBODY
               else nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
             stripped = pkgs:
               let
-                core = dropSharedLibs (filterEnableStaticOnDarwin (applyOptSsp (rawBuild pkgs)));
+                core = withDarwinIconv pkgs (dropSharedLibs (filterEnableStaticOnDarwin (applyOptSsp (rawBuild pkgs))));
                 # C catalog keeps the fallback linux-only for now; the darwin-C
                 # and windows-cosmo paths are a deliberate follow-up (the Rust
                 # tools opt into darwin/windows by calling withDnsFallback directly).
