@@ -102,7 +102,18 @@
           in !(h.isDarwin)
           && !(h.isWindows && !(h.isMinGW or false))
           && !(h.isRiscV or false)
-          && !(h.isPower or false);
+          && !(h.isPower or false)
+          # m68k is a GNU-binutils-only target: ld.lld has no m68k backend
+          # ("unknown emulation: m68kelf"), so fall back to ld.bfd like
+          # riscv/power above. Without this, any $CC link via lld aborts.
+          && !(h.isM68k or false)
+          # Same story for the other tier-3 niche crosses exposed under
+          # `.#cross`: lld's mips/s390x support is absent or incomplete, so
+          # route them through ld.bfd (the binutils cross always ships it).
+          # Safe even where lld *might* work — bfd still does --gc-sections;
+          # matches what riscv/power already do.
+          && !(h.isMips or false)
+          && !(h.isS390 or false);
 
         # `ld.lld` aborts on a relocatable link that also carries `--icf`
         # ("-r and --icf may not be used together"). lldStdOpts carries
@@ -1773,6 +1784,138 @@ CBODY
                   program = "${self.packages.${system}.default}/bin/${binName}";
                 };
               });
+
+            # UNOFFICIAL extra targets — curated "tier-3" arches that we do
+            # NOT want in the CI matrix. `action-build` auto-discovers the
+            # build matrix from `.#packages` only (see build.yml), so anything
+            # exposed here is invisible to CI and never built for the whole
+            # catalog — yet it's available from a plain clone with a short
+            # path: `nix build .#cross.powerpc` (no script, no --override-input).
+            #
+            # `cross` is a FLAT (non-system-keyed) attrset, so `.#cross.<arch>`
+            # resolves literally with NO currentSystem insertion — which is why
+            # the build host is hardcoded `x86_64-linux` (cross is inherently
+            # build-host-specific, and flake purity forbids builtins.currentSystem).
+            # A cloner on a non-x86_64-linux host needs an x86_64-linux builder.
+            #
+            # Each entry maps a friendly uname-style name to its musl triple,
+            # built exactly like the official linux crosses (withLLDLink + strip
+            # + man overlay). Add one line per arch AFTER validating it builds +
+            # smoke-runs under qemu. Start small: powerpc (32-bit big-endian),
+            # proven on bash (ELF32 MSB PowerPC, runs under qemu-ppc).
+            cross = let
+              mk = triple: stripped (withLLDLink pkgsAttr (import nixpkgs {
+                system = "x86_64-linux";
+                crossSystem = { config = triple; };
+                # These are unofficial, opt-in tier-3 crosses. A niche arch can
+                # be absent from a package's `meta.platforms` whitelist — not
+                # because it can't build, but because no nixpkgs maintainer
+                # blessed it. `.#cross` is the explicit "best-effort, may not
+                # link" path, so we bypass that gate (same as the windows block
+                # above). No-op for arches already whitelisted (all current
+                # entries are), but keeps `.#cross` robust for future additions.
+                config.allowUnsupportedSystem = true;
+              }));
+              # x86-64 micro-architecture feature levels (psABI 2020): SAME
+              # triple as the default x86_64, just a higher `-march` baseline via
+              # gcc.arch. Unlike i586/armv6 (which go DOWN for old hardware /
+              # compat), these go UP (newer CPUs / perf) — a vN binary SIGILLs on
+              # any CPU below that level. So they're a perf OPT-IN, not a
+              # portability target: the default x86_64 deliberately stays v1, the
+              # "runs anywhere" floor. Handy for compute-heavy packages (e.g.
+              # libvpx encode); ~zero gain for text-y CLI tools. v2≈Nehalem'08
+              # (SSE4.2/POPCNT), v3≈Haswell'13 (AVX2/BMI/FMA), v4 (AVX-512).
+              mkV = arch: stripped (withLLDLink pkgsAttr (import nixpkgs {
+                system = "x86_64-linux";
+                crossSystem = { config = "x86_64-unknown-linux-musl"; gcc.arch = arch; };
+                config.allowUnsupportedSystem = true;
+              }));
+            in nixpkgs.lib.optionalAttrs nativeBuild (builtins.mapAttrs (_: mk) {
+              # ── Official CI targets, mirrored here so `.#cross.<arch>` is a
+              # UNIFORM interface for every arch — the user makes the same call
+              # whether the target is official or tier-3. These spell out the
+              # exact triples the official `.#packages` cross targets use
+              # (i686→pkgsCross.musl32, ppc64le→pkgsCross.musl-power, the rest
+              # already spelled out), so the derivations are IDENTICAL — cache
+              # hits, byte-for-byte the same binary CI ships. (`allowUnsupported‑
+              # System` in `mk` is an eval gate, not a build input, so it doesn't
+              # perturb the hash.) x86_64 is the native `.#default`, not mirrored.
+              i686 = "i686-unknown-linux-musl";
+              ppc64le = "powerpc64le-unknown-linux-musl";
+              riscv64 = "riscv64-unknown-linux-musl";
+              aarch64 = "aarch64-unknown-linux-musl";
+              armv7l = "armv7l-unknown-linux-musleabihf";
+
+              # ── Unofficial tier-3 arches (curated, NOT in the CI matrix) ──
+              # i586 (Pentium baseline) — the "armv6 of x86". Distinct from the
+              # official `i686` above: i586 has CMPXCHG8B (lock-free 64-bit
+              # atomics) but NO CMOV, so an i686 binary SIGILLs on these. Real
+              # niche: AMD Geode LX/GX (PC Engines ALIX firewalls/routers, OLPC
+              # XO-1), Vortex86, K6. Mainstream distros dropped it (Debian
+              # "i386"/Alpine x86 are i686 since ~2016), so this is the only way
+              # to target that hardware. isX86_32 → lld handles it (no isLLDTarget
+              # change). NOT i386/i486: i386 is dead in modern toolchains; i486
+              # lacks CMPXCHG8B (atomics fall to libatomic) for near-zero gain.
+              i586 = "i586-unknown-linux-musl";
+              powerpc = "powerpc-unknown-linux-musl";
+              m68k = "m68k-unknown-linux-musl";
+              loongarch64 = "loongarch64-unknown-linux-musl";
+              # Raspberry Pi 1 / Zero / Zero W (BCM2835, ARM1176 = ARMv6 hard-
+              # float). uname/Rust name `armv6l`; NOT Alpine's `armhf` (=ARMv6)
+              # nor Debian's `armhf` (=ARMv7) — those names collide, uname wins.
+              # Note: ARMv6 lacks LDREXD, so 64-bit atomics route through GCC's
+              # libatomic (lock fallback) — needs explicit `-latomic` for
+              # atomic-using packages; bash is single-threaded so it links clean.
+              armv6 = "armv6l-unknown-linux-musleabihf";
+              # Routers / NAS / IoT (OpenWrt) — MIPS little-endian. The single
+              # static-musl binary fits devices with no package manager + tiny
+              # flash. Biggest living "weird hardware" niche.
+              mipsel = "mipsel-unknown-linux-musl";
+              # IBM Z / mainframe (Linux on Z) — big-endian, enterprise niche.
+              s390x = "s390x-unknown-linux-musl";
+              # 32-bit RISC-V — embedded / microcontroller-class boards.
+              riscv32 = "riscv32-unknown-linux-musl";
+              # MIPS32 BIG-endian — older BE routers / embedded that the
+              # little-endian `mipsel` above doesn't cover. Routes via ld.bfd
+              # (isMips) like mipsel.
+              mips = "mips-unknown-linux-musl";
+              # MIPS64 (n64 ABI) — the 64-bit pair of mips/mipsel. musl's mips64
+              # port is n64 ONLY (its n32 is a separate `mipsn32` port), so we
+              # MUST spell out `muslabi64`: the bare `...-musl` triple parses as
+              # gcc's default ABI (n32) and would mismatch musl. el = little-
+              # endian (Loongson 3); BE = Cavium Octeon + lots of BE network
+              # gear. isMips → ld.bfd, same as the 32-bit mips above.
+              mips64el = "mips64el-unknown-linux-muslabi64";
+              mips64 = "mips64-unknown-linux-muslabi64";
+              # PowerPC 64-bit BIG-endian — distinct from the shipped `ppc64le`
+              # (LE). Retro/niche: PS3 Linux (Cell), Power Mac G5 64-bit,
+              # AIX-era POWER. Routes via ld.bfd (isPower) like powerpc.
+              powerpc64 = "powerpc64-unknown-linux-musl";
+              # NOTE: sparc64 is intentionally absent — musl has no SPARC port
+              # at all (`configure: unknown or unsupported target
+              # "sparc64-unknown-linux-musl"`), so it can't be built under the
+              # static-musl model these binaries rely on. It would need glibc,
+              # which breaks self-containment. Don't re-add without a libc story.
+              #
+              # NOTE: x32 (x86_64 ILP32) is deliberately kept OUT here — but,
+              # unlike sparc64, NOT because it's impossible. musl has an x32 port
+              # and it builds + smoke-runs fine (proven on bash; see the
+              # playground/x32-spike flake). The catch is COST: nixpkgs's
+              # lib.systems has no `muslx32` ABI, so enabling it needs PATCHING
+              # the nixpkgs SOURCE in 3 spots (parse.nix `abis`, inspect.nix
+              # `isMusl`, parse.nix `mkMuslSystem`) — lib.systems is evaluated
+              # before pkgs, so an overlay can't reach it. Every other entry in
+              # this map is just a curated triple over the pinned nixpkgs (free);
+              # x32 alone would force an applyPatches on the catalog-wide nixpkgs
+              # input. Not worth it for the niche — left as a spike. (Smoke also
+              # needs qemu-system + `syscall.x32=y`; qemu-user has no x32.)
+            }
+            // builtins.mapAttrs (_: mkV) {
+              # x86-64 perf feature levels (see mkV above). v1 == default x86_64.
+              "x86_64-v2" = "x86-64-v2";
+              "x86_64-v3" = "x86-64-v3";
+              "x86_64-v4" = "x86-64-v4";
+            });
 
             # Read by unpins/action-build to drive CI config.
             manifest = {
