@@ -1285,6 +1285,158 @@ ${fallbackC}
 CBODY
       } > multicall/dispatcher.c'';
 
+        # Cross-platform multicall fold (cpp-rename / "X+Z" recipe). A package
+        # that ships N sibling programs from one source tree (each its own
+        # subdir Makefile, sharing a clean static lib with no callbacks into the
+        # programs) is folded into ONE binary at bin/<primary>, every other
+        # program name an argv[0] alias.
+        #
+        # Each program is recompiled with a per-program `-include <p>.rename.h`
+        # that renames `main`→<san>_main and namespaces every other defined
+        # global behind `<san>__`, so two programs can't collide. Objects stay
+        # normal compiled .o (no partial link), so the cross lld's `--gc-sections`
+        # is happy (unlike the older ld -r + objcopy fold, which trips i686's
+        # linkonce thunks) and the same recipe works on ELF, Mach-O (leading-`_`
+        # strip + `S`-type data symbols) and cosmo APE. Shared static libs
+        # (libacl.a, libexfat.a) are NOT renamed — called identically by every
+        # program, no collisions — so they stay one copy, passed via `linkExtra`.
+        #
+        # Generalized from the per-package mc.nix used by acl/psmisc/dosfstools/
+        # exfatprogs (bc/e2fsprogs keep bespoke variants: bc is procps-class —
+        # its shared number.o calls back into per-program rt_error — so it can't
+        # share lib objects). See docs/multicall.md.
+        cppRenameMulticall =
+          { pkgs                    # build-host pkgs (writeText, withAliases)
+          , basePkg                 # pkgsStatic.<pkg> (or cosmo/mingw pkg) to override
+          , primary                 # bin/<primary> is the real binary (== package name)
+          , programs                # [ { name; buildDir ? makeSubdir; objs = [ "rel/obj.o" … ]; } ]
+          , aliases ? [ ]           # [ { name; target; } ]  extra dispatch names (symlink only)
+          , makeSubdir ? "."        # dir whose Makefile defines $(LINK) + the lib vars
+          , linkExtra ? ""          # shared static libs / automake lib vars for the final link
+          , extraInstall ? ""       # raw shell appended to installPhase (man pages)
+          , isTargetDarwin ? false  # Mach-O: strip leading `_`, include `S`-type symbols
+          , isCosmo ? false         # Windows APE: no applet symlinks; explicit alias list
+          , isWindows ? false       # mingw PE: bin/<pkg>.exe, embedded aliases (no symlinks)
+          }:
+          let
+            san = name: nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ] name;
+            # Windows (mingw or cosmo) ships one .exe with the applet names
+            # embedded as aliases — no in-store symlinks. mingw x86_64 keeps the
+            # --start-group/-lgcc (no Mach-O/APE constraints; libgcc is present);
+            # only darwin+cosmo drop it.
+            isWin = isCosmo || isWindows;
+            exe = nixpkgs.lib.optionalString isWin ".exe";
+            # The cosmo cross stdenv's apelink fixup hook converts an ELF in
+            # $out/bin to an APE and renames it `<name>.exe` — but ONLY if it
+            # isn't already `.exe`. So for cosmo we install the staged binary
+            # WITHOUT the extension and let the hook add it; mingw has no such
+            # hook, so we name it `.exe` ourselves. Native keeps the bare name.
+            installExe = nixpkgs.lib.optionalString isWindows ".exe";
+            installName = "${primary}${installExe}";
+            outName = "${primary}${exe}";
+            noGroup = isTargetDarwin || isCosmo;
+            groupOpen = if noGroup then "" else "-Wl,--start-group";
+            groupClose = if noGroup then "" else "-Wl,--end-group";
+            libgcc = if noGroup then "" else "-lgcc";
+
+            appletLines =
+              (map (p: "${p.name}\t${san p.name}") programs)
+              ++ (map (a: "${a.name}\t${san a.target}") aliases);
+
+            # Phase A: discover defined globals per program (canonical names,
+            # before any recompile) and emit the rename header.
+            renameHeader = p: ''
+              {
+                echo "/* multicall rename header: ${p.name} */"
+                echo "#define main ${san p.name}_main"
+                $NM --defined-only -g ${nixpkgs.lib.concatStringsSep " " p.objs} 2>/dev/null \
+                  | awk -v t="${san p.name}" -v strip=${if isTargetDarwin then "1" else "0"} '
+                      $2 ~ /^[TBDRWVCS]$/ {
+                        sym = $3
+                        if (strip && sym ~ /^_/) sym = substr(sym, 2)
+                        if (sym ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && sym != "main" && !seen[sym]++)
+                          print "#define " sym " " t "__" sym
+                      }'
+              } > multicall/${san p.name}.rename.h
+            '';
+
+            # Phase B: rm the program's objects, recompile them with the rename
+            # header `-include`d (reusing automake's exact per-target flags via
+            # `make`), then copy the freshly-renamed .o into multicall/obj_<p>/
+            # before the next program's rebuild can clobber a shared source path.
+            rebuild = p:
+              let
+                dir = p.buildDir or makeSubdir;
+                prefix = if dir == "." then "" else "${dir}/";
+                targets = map (o: nixpkgs.lib.removePrefix prefix o) p.objs;
+              in ''
+                rm -f ${nixpkgs.lib.concatStringsSep " " p.objs}
+                make -C ${dir} -j''${NIX_BUILD_CORES:-1} ${nixpkgs.lib.concatStringsSep " " targets} \
+                  NIX_CFLAGS_COMPILE="$_orig_NIX_CFLAGS_COMPILE -include $PWD/multicall/${san p.name}.rename.h"
+                mkdir -p multicall/obj_${san p.name}
+                ${nixpkgs.lib.concatMapStringsSep "\n      "
+                    (o: ''cp "${o}" "multicall/obj_${san p.name}/$(echo '${o}' | tr / _)"'')
+                    p.objs}
+              '';
+
+            multicallMk = pkgs.writeText "unpin-multicall.mk" ''
+              MULTI_OUT ?= $(top_builddir)/multicall/${primary}
+              .PHONY: multicall-link
+              multicall-link: $(MULTI_OUT)
+              $(MULTI_OUT): $(top_builddir)/multicall/dispatcher.o
+              	$(LINK) $(top_builddir)/multicall/dispatcher.o $(top_builddir)/multicall/obj_*/*.o \
+              		${groupOpen} ${linkExtra} $(LIBS) ${libgcc} ${groupClose}
+            '';
+
+            binSymlinks =
+              (map (p: p.name) (nixpkgs.lib.filter (p: p.name != primary) programs))
+              ++ (map (a: a.name) aliases);
+
+            multicall = basePkg.overrideAttrs (old: {
+              pname = "${old.pname or "pkg"}-multi";
+              doCheck = false;
+              outputs = [ "out" ];
+
+              postBuild = (old.postBuild or "") + ''
+                set -e
+                mkdir -p multicall
+                _orig_NIX_CFLAGS_COMPILE=''${NIX_CFLAGS_COMPILE:-}
+
+                # Phase A: discovery
+                ${nixpkgs.lib.concatMapStringsSep "\n" renameHeader programs}
+                # Phase B: recompile + isolate
+                ${nixpkgs.lib.concatMapStringsSep "\n" rebuild programs}
+
+                printf '${nixpkgs.lib.concatStringsSep "\\n" appletLines}\n' > multicall/applets.list
+              ${multicallTableDispatcherC { name = primary; defaultApplet = null; }}
+                $CC -O2 -c -o multicall/dispatcher.o multicall/dispatcher.c
+
+                install -m644 ${multicallMk} ${makeSubdir}/unpin-multicall.mk
+                make -C ${makeSubdir} -f Makefile -f unpin-multicall.mk multicall-link
+              '';
+
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/bin"
+                install -m755 "multicall/${primary}" "$out/bin/${installName}"
+                ${nixpkgs.lib.optionalString (!isWin)
+                    (nixpkgs.lib.concatMapStringsSep "\n      " (n: ''ln -s "${primary}" "$out/bin/${n}"'') binSymlinks)}
+                ${extraInstall}
+                runHook postInstall
+              '';
+
+              postFixup = (old.postFixup or "") + ''
+                rm -rf "$out/nix-support"
+              '';
+            });
+          in
+          withAliases pkgs
+            ({ primary = outName; }
+             // (if isWin
+                 then { aliases = map (p: p.name) programs ++ map (a: a.name) aliases; }
+                 else { aliasesFromSymlinksIn = "bin"; }))
+            multicall;
+
         # Why not overlays for per-package fixes? `appendOverlays` invalidates
         # `pkgsBuildHost.stdenv` → cascade rebuild of compiler-rt-libc-static, ninja,
         # python3 in pkgsStatic-darwin (none cached; Hydra only builds pkgsStatic-linux).
