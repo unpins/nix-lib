@@ -1380,11 +1380,20 @@ CBODY
               '';
 
             multicallMk = pkgs.writeText "unpin-multicall.mk" ''
+              # Recursive-automake Makefiles define top_builddir per subdir
+              # (e.g. exfatprogs' mkfs/Makefile → `..`); flat ones (mtools) leave
+              # it unset, which would make the paths below absolute (`/multicall`).
+              # `?=` defaults it to the make -C dir without overriding a real one.
+              top_builddir ?= .
               MULTI_OUT ?= $(top_builddir)/multicall/${primary}
               .PHONY: multicall-link
               multicall-link: $(MULTI_OUT)
               $(MULTI_OUT): $(top_builddir)/multicall/dispatcher.o
-              	$(LINK) $(top_builddir)/multicall/dispatcher.o $(top_builddir)/multicall/obj_*/*.o \
+              	# Explicit `-o`: automake's $(LINK) bakes in `-o $@`, but flat
+              	# Makefiles (mtools) define LINK without it and add `-o $@`
+              	# per-rule, so name the output here. A duplicate `-o` (automake)
+              	# is harmless — the last one wins, same value.
+              	$(LINK) -o $(MULTI_OUT) $(top_builddir)/multicall/dispatcher.o $(top_builddir)/multicall/obj_*/*.o \
               		${groupOpen} ${linkExtra} $(LIBS) ${libgcc} ${groupClose}
             '';
 
