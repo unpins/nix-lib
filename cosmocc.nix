@@ -170,6 +170,13 @@ let
     wrap() {
       cat > "$out/bin/$1" <<EOF
     #!/bin/sh
+    # Short-circuit a bare --version anywhere in the argv to the real tool.
+    # meson's compiler probe runs e.g. \`cc <flags> --version\`; cosmocc's cc
+    # only honours --version as the FIRST arg, otherwise it tries to compile and
+    # errors "no input files". Real gcc accepts it positionally, so match that.
+    for a in "\$@"; do
+      [ "\$a" = --version ] && exec "${cosmocc}/bin/$2" --version
+    done
     exec "${cosmocc}/bin/$2" "\$@"
     EOF
       chmod +x "$out/bin/$1"
@@ -180,7 +187,22 @@ let
     wrap c++ ${archPrefix}-unknown-cosmo-c++
     cat > $out/bin/cpp <<EOF
     #!/bin/sh
-    exec "${cosmocc}/bin/${archPrefix}-unknown-cosmo-cc" -E "\$@"
+    # cosmocc's "cc -E" does not default to stdin when no input file is given
+    # (real gcc/cpp does) -- it errors "no input files". autoconf/meson cpp
+    # probes pipe source on stdin with no file arg; detect that no-file case and
+    # append "-" so the preprocessor reads stdin.
+    has_input=
+    for a in "\$@"; do
+      case "\$a" in
+        -) has_input=1 ;;
+        -*) ;;
+        *) [ -f "\$a" ] && has_input=1 ;;
+      esac
+    done
+    if [ -n "\$has_input" ]; then
+      exec "${cosmocc}/bin/${archPrefix}-unknown-cosmo-cc" -E "\$@"
+    fi
+    exec "${cosmocc}/bin/${archPrefix}-unknown-cosmo-cc" -E "\$@" -
     EOF
     chmod +x $out/bin/cpp
   '';
