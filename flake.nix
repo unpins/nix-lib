@@ -24,6 +24,250 @@
         isLinuxSys = system: nixpkgs.lib.hasSuffix "-linux" system;
         isDarwinSys = system: nixpkgs.lib.hasSuffix "-darwin" system;
 
+        # =================================================================
+        # unpin-stdenv (route A): a bespoke stdenv over the standalone
+        # `unpin-llvm` multicall toolchain — clang/lld + an on-demand,
+        # variant-aware musl/libc++ sysroot, no nixpkgs cc-wrapper. Lifted
+        # verbatim from the playground spike (playground/unpin-stdenv).
+        #
+        # The `toolchain` derivation (the `unpin-llvm` package exposing
+        # `bin/llvm`) is passed in by the CONSUMER, NOT taken as a nix-lib
+        # flake input: nix-lib is fetched as `github:unpins/nix-lib`, and
+        # `unpin-llvm` is not yet published, so a hard input here would make
+        # nix-lib unresolvable for the whole catalog. Parameterising it keeps
+        # nix-lib's closure {nixpkgs} only — every catalog package that does
+        # NOT call these functions is completely unaffected. A consumer wires
+        # `inputs.unpinLlvm` itself and passes
+        # `toolchain = unpinLlvm.packages.<system>.default`.
+        #
+        # § keystone: a pre-baked, read-only sysroot per target. Linking (not
+        # -c) triggers the on-demand build of libc/CRTs (and, when `cxx`,
+        # libc++/libc++abi/libunwind); the resulting RO store-path is the
+        # lock/write-free cache for every package built against this target.
+        # Bake BOTH the non-PIC and PIC variant of each half: the cache is
+        # variant-aware (-fPIC ⇒ a distinct entry), and many build systems
+        # force -fPIC into CFLAGS even for a static target (zlib's configure:
+        # `CFLAGS="${CFLAGS--O3} -fPIC"`). Without the PIC variant pre-baked,
+        # such a build misses the RO sysroot, the toolchain tries to populate
+        # the read-only store cache, the link fails, and configure silently
+        # mis-detects. `native` gates the sanity run (cross can't run on the
+        # builder); `cxx` gates the C++ half.
+        unpinSysroot = { pkgs, toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system, triple, optClass ? "-O2", native ? false, cxx ? false }:
+          pkgs.runCommand "unpin-sysroot-${triple}" { } ''
+            export HOME=$TMPDIR
+            export XDG_CACHE_HOME=$out/cache
+            printf 'int main(void){return 0;}\n' > hello.c
+            for pic in "" "-fPIC"; do
+              ${toolchain}/bin/llvm clang -target ${triple} ${optClass} $pic hello.c -o hc
+              ${nixpkgs.lib.optionalString native "./hc"}
+            done
+            ${nixpkgs.lib.optionalString cxx ''
+              printf '#include <iostream>\nint main(){std::cout<<"";return 0;}\n' > hello.cpp
+              for pic in "" "-fPIC"; do
+                ${toolchain}/bin/llvm clang++ -target ${triple} ${optClass} $pic hello.cpp -o hcpp
+                ${nixpkgs.lib.optionalString native "./hcpp"}
+              done
+            ''}
+            echo "baked variants for ${triple}:"; find $out/cache/unpin-llvm -name .complete \
+              | sed "s|$out/cache/unpin-llvm/||"
+          '';
+
+        # § unpinToolchain: the vendored `unpin-llvm` build (nix-lib/toolchain),
+        # built from nix-lib's OWN pinned nixpkgs for the given build system — so
+        # the toolchain's LLVM version is locked together with nix-lib (the
+        # "versioned together" property). Lazy: only forced when a consumer calls
+        # mkUnpinStdenv. Used as the default `toolchain` below so consumers don't
+        # have to wire `unpin-llvm` themselves.
+        # origPkgs replicates exactly what mkStandaloneFlake's `nixpkgsFor` hands a
+        # package's `build` under the catalog defaults (optimize.gc = true,
+        # ssp = true, opt = null) — i.e. the gc-sections overlay scoped to the
+        # `llvm` package's chain. The toolchain build pulls pkgsStatic.{zlib,zstd}
+        # (which are in that scope) as buildInputs, so this is what makes the
+        # vendored toolchain byte-identical to the catalog `unpin-llvm` it was
+        # validated as (same .drv → same already-built output, no rebuild).
+        unpinToolchain = system:
+          import ./toolchain {
+            origPkgs = mkPkgsGC { inherit system; ssp = true; opt = null; pkgName = "llvm"; };
+            inherit unpinPackTool;
+          };
+
+        # § mkUnpinStdenv (route A: bespoke, no cc-wrapper). Wrappers inject
+        # -target/optClass/-flto after "$@"; the setup-hook exports
+        # CC/CXX/AR/… + XDG_CACHE_HOME pointing at the RO sysroot. Returns
+        # `{ sysroot, unpinCC, cc, mkDerivation }` where mkDerivation is
+        # stdenvNoCC + this toolchain.
+        #
+        # stackSize: musl's default THREAD stack is 128 KB (it reads the ELF
+        # PT_GNU_STACK memsz); glibc's is 8 MB. Software developed on glibc
+        # routinely assumes that — a 137 KB single stack frame in ffmpeg's
+        # ffv1 encoder, deep recursion, large on-stack buffers in a pthread.
+        # So we bake the glibc-parity 8 MB as the DEFAULT for every package:
+        # it's address-space only (lazily paged → no RAM cost), invisible to
+        # thread-free packages, and kills a whole class of glibc→musl porting
+        # crashes. Override per package via `stackSize` (null/false disables).
+        # The flag is link-only: a guard strips it from compile-only calls
+        # (-c/-S/-E/-M) so a configure probe under -Werror doesn't read the
+        # clang -Wunused-command-line-argument as "flag unsupported".
+        mkUnpinStdenv =
+          { pkgs, toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
+          , target, lto ? "full", optClass ? "-O2"
+          , native ? false, cxx ? false, stackSize ? "8388608" }:
+          let
+            sysroot = unpinSysroot { inherit pkgs toolchain; triple = target; inherit optClass native cxx; };
+            ltoFlag =
+              if lto == "thin" then "-flto=thin"
+              else if lto == "full" || lto == true then "-flto"
+              else "";
+            stackFlag =
+              if stackSize == null || stackSize == false then ""
+              else "-Wl,-z,stack-size=${toString stackSize}";
+            mkCC = name: face: pkgs.writeShellScript name ''
+              ldextra=${nixpkgs.lib.escapeShellArg stackFlag}
+              for a in "$@"; do case "$a" in -c|-S|-E|-M|-MM) ldextra=""; break;; esac; done
+              exec ${toolchain}/bin/llvm ${face} -target ${target} "$@" ${optClass} ${ltoFlag} $ldextra
+            '';
+            ccW = mkCC "unpin-cc" "clang";
+            cxxW = mkCC "unpin-cxx" "clang++";
+            unpinCC = pkgs.runCommand "unpin-cc-${target}" { } ''
+              mkdir -p $out/bin $out/nix-support
+              ln -s ${ccW}  $out/bin/cc
+              ln -s ${ccW}  $out/bin/clang
+              ln -s ${cxxW} $out/bin/c++
+              ln -s ${cxxW} $out/bin/clang++
+              for f in llvm-ar llvm-ranlib llvm-nm llvm-objcopy llvm-strip ld.lld; do
+                ln -s ${toolchain}/bin/llvm $out/bin/$f
+              done
+              ln -s llvm-ar      $out/bin/ar
+              ln -s llvm-ranlib  $out/bin/ranlib
+              ln -s llvm-nm      $out/bin/nm
+              ln -s llvm-strip   $out/bin/strip
+              ln -s llvm-objcopy $out/bin/objcopy
+              cat > $out/nix-support/setup-hook <<EOF
+              export CC=$out/bin/cc
+              export CXX=$out/bin/c++
+              export AR=$out/bin/llvm-ar
+              export RANLIB=$out/bin/llvm-ranlib
+              export NM=$out/bin/llvm-nm
+              export STRIP=$out/bin/llvm-strip
+              export LD=$out/bin/ld.lld
+              export XDG_CACHE_HOME=${sysroot}/cache
+              EOF
+            '';
+          in
+          {
+            inherit sysroot unpinCC;
+            cc = unpinCC;
+            mkDerivation = args: pkgs.stdenvNoCC.mkDerivation (args // {
+              nativeBuildInputs = (args.nativeBuildInputs or [ ]) ++ [ unpinCC ];
+              dontStrip = args.dontStrip or true;
+              dontPatchELF = args.dontPatchELF or true;
+            });
+          };
+
+        # § unpinAdapterStdenv (route B: a drop-in nixpkgs stdenv over unpin-llvm).
+        # Where mkUnpinStdenv (route A) demands a hand-written recipe (CC/CXX +
+        # configure+make, like the playground mkLz4/mkJq), this wraps the same
+        # `llvm` toolchain in a real nixpkgs cc-wrapper so an UNMODIFIED nixpkgs
+        # recipe builds through it: `pkgs.pkgsStatic.<name>.override { stdenv =
+        # unpinAdapterStdenv {...}; }`. Modelled on cosmocc.nix's stdenv wiring.
+        #
+        # Three things make it work (each a trap learned the hard way):
+        #  1. passthru.isGNU = true (NOT isClang) on the unwrapped cc — otherwise
+        #     the nixpkgs clang wrapper injects `--gcc-toolchain=…` + gcc -B/-L,
+        #     poisoning clang's self-contained VFS sysroot. isGNU + libc = null
+        #     (in both wrapCCWith and wrapBintoolsWith) keeps the wrapper from
+        #     adding ANY libc/gcc-for-libs flags: unpin-llvm brings its own
+        #     compiler-rt/libc++/musl. Same trick cosmocc uses.
+        #  2. The shims append ${optClass} after "$@" (route-A parity) so every
+        #     invocation hits the SAME on-demand sysroot variant the seed warms.
+        #  3. A WRITABLE, build-local XDG_CACHE_HOME seeded from the RO pre-baked
+        #     sysroot. unpin-llvm's sysroot is keyed by a per-flag variant hash;
+        #     a generic recipe uses flag combos the RO bake didn't cover, and
+        #     writing into the /nix/store RO path fails ("mkdir … failed" → link
+        #     silently falls back to a broken dynamic musl). The seed makes known
+        #     variants hit warm; any new variant builds on demand in the copy.
+        #
+        # lto: when true, the cc/c++ shims also append `-flto`, so every object
+        # the recipe compiles is LLVM BITCODE (not ELF). This is the prerequisite
+        # for the bitcode-LTO multicall module emitter (multicallModuleHookLTO):
+        # llvm-link/opt operate on bitcode, and a whole-program-LTO mega-link
+        # folds the modules. Off by default (the engine's normal path stays -O2
+        # ELF, which the objcopy-based multicallModuleHook needs). -flto is safe
+        # on both compile and link; the cpp (-E) shim deliberately omits it
+        # (clang warns "argument unused" under -E, which a -Werror configure
+        # probe would read as unsupported). Mixing bitcode app objects with the
+        # ELF musl libc.a from the RO sysroot is the standard LTO-app/non-LTO-libc
+        # case — clang LTO-compiles the bitcode, then links libc.a normally.
+        unpinAdapterStdenv =
+          { pkgs, toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
+          , target, optClass ? "-O2", cxx ? true, native ? false, lto ? false }:
+          let
+            sysroot = unpinSysroot { inherit pkgs toolchain; triple = target; inherit optClass native cxx; };
+            ltoArg = if lto then " -flto" else "";
+            ccUnwrapped = pkgs.runCommand "unpin-cc-unwrapped-${target}"
+              { passthru = { isGNU = true; version = "21.1.8"; }; } ''
+              mkdir -p $out/bin
+              mk() {
+                cat > "$out/bin/$1" <<EOF
+              #!/bin/sh
+              exec ${toolchain}/bin/llvm $2 -target ${target} "\$@" ${optClass}${ltoArg}
+              EOF
+                chmod +x "$out/bin/$1"
+              }
+              mk clang clang ; mk cc clang ; mk gcc clang
+              mk clang++ clang++ ; mk c++ clang++ ; mk g++ clang++
+              cat > $out/bin/cpp <<EOF
+              #!/bin/sh
+              exec ${toolchain}/bin/llvm clang -E -target ${target} "\$@"
+              EOF
+              chmod +x $out/bin/cpp
+            '';
+            bintoolsUnwrapped = pkgs.runCommand "unpin-bintools-unwrapped-${target}"
+              { passthru = { isGNU = true; targetPrefix = ""; }; } ''
+              mkdir -p $out/bin
+              mkt() {
+                cat > "$out/bin/$1" <<EOF
+              #!/bin/sh
+              exec ${toolchain}/bin/llvm $2 "\$@"
+              EOF
+                chmod +x "$out/bin/$1"
+              }
+              mkt ar llvm-ar ; mkt ranlib llvm-ranlib ; mkt nm llvm-nm
+              mkt strip llvm-strip ; mkt objcopy llvm-objcopy ; mkt objdump llvm-objdump
+              mkt ld ld.lld ; mkt ld.lld ld.lld
+            '';
+            bintools = pkgs.wrapBintoolsWith { bintools = bintoolsUnwrapped; libc = null; };
+            cc = pkgs.wrapCCWith { inherit bintools; cc = ccUnwrapped; libc = null; extraPackages = [ ]; };
+            seedHook = pkgs.makeSetupHook
+              { name = "unpin-seed-sysroot-cache"; substitutions = { sysrootCache = "${sysroot}/cache"; }; }
+              (pkgs.writeText "unpin-seed-sysroot-cache.sh" ''
+                unpinSeedSysrootCache() {
+                  if [ -z "''${_unpinCacheSeeded:-}" ]; then
+                    export XDG_CACHE_HOME="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-cache"
+                    mkdir -p "$XDG_CACHE_HOME"
+                    if [ -d "@sysrootCache@/unpin-llvm" ]; then
+                      cp -r "@sysrootCache@/unpin-llvm" "$XDG_CACHE_HOME/" 2>/dev/null || true
+                      chmod -R u+w "$XDG_CACHE_HOME"
+                    fi
+                    _unpinCacheSeeded=1
+                  fi
+                }
+                preConfigureHooks+=(unpinSeedSysrootCache)
+                preBuildHooks+=(unpinSeedSysrootCache)
+              '');
+          in
+          # dontPatchELF: static-musl has no interp/RPATH for patchelf to touch.
+          # hardeningDisable=all: match route-A's minimal flag set (clang accepts
+          # the hardening flags, but fortify needs libc support musl only partly
+          # provides). NOTE no dontStrip — unlike cosmocc's APE (apelink needs the
+          # symtab), unpin-llvm's static-musl ELF strips fine and should, so
+          # strippedOrJoined's final strip applies.
+          pkgs.stdenvAdapters.addAttrsToDerivation
+            { dontPatchELF = true; hardeningDisable = [ "all" ]; }
+            ((pkgs.overrideCC pkgs.pkgsStatic.stdenv cc).override (old: {
+              extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ]) ++ [ seedHook ];
+            }));
+
         # Append `flags` (string or list) to NIX_CFLAGS_COMPILE.
         #
         # `__structuredAttrs = true` drvs (bash, findutils, grep, dash, …)
@@ -1285,6 +1529,161 @@ ${fallbackC}
 CBODY
       } > multicall/dispatcher.c'';
 
+        # ── Multicall MODULE artifact (the `.a`-generation scheme) ──────────
+        # Add a `module` output to a package's NORMAL build carrying a
+        # self-describing multicall module: `module.a` (the package's own
+        # objects, with `main`→`unpin__<pkg>__<prog>_main` and every other
+        # defined global namespaced `unpin__<pkg>__<prog>__<sym>`) plus the
+        # package's PRIVATE bundled archives (gnulib) with their callbacks INTO
+        # the program rewritten to the namespaced names. Produced purely by
+        # post-processing — `objcopy --redefine-syms` over the objects the build
+        # ALREADY compiled — so no recompile and no second build: it rides the
+        # same builder as the shipped binary (overrideAttrs composes in place,
+        # so the .o tree is still present in postBuild even under withAliases).
+        #
+        # The manifest (applets / depArchives / requires) is a Nix value the
+        # caller assembles around this — see mkStandaloneFlake's `multicall`
+        # arg, which attaches it as `passthru.multicallModule`. The mega-builder
+        # (mkMegaMulticall) links N such modules into one busybox-style binary.
+        #
+        # Distinguishes a PRIVATE bundled lib (gnulib: `internalArchives` —
+        # callbacks namespaced, own defs untouched so they stay dedupable across
+        # packages) from a CLEAN external dep (pcre2/zlib: `depArchives` in the
+        # manifest — never touched, deduped by member at mega-link). Linux
+        # native only for now (ELF symbol shapes + objcopy redef map). See
+        # docs/multicall.md and the mega-multicall plan.
+        multicallModuleHook =
+          { package                 # "grep" — namespace component
+          , programs                # [ { name; objs = [ "src/x.o" ]; } ]
+          , internalArchives ? [ ]  # builddir-relative private .a (gnulib)
+          , isTargetDarwin ? false
+          }: drv:
+          let
+            san = n: nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ] n;
+            pfxOf = p: "unpin__${san package}__${san p.name}";
+            emitRedef = p: ''
+              {
+                echo "main ${pfxOf p}_main"
+                $NM --defined-only -g ${nixpkgs.lib.concatStringsSep " " p.objs} 2>/dev/null \
+                  | awk -v t="${pfxOf p}" -v strip=${if isTargetDarwin then "1" else "0"} '
+                      $2 ~ /^[TBDRWVCS]$/ {
+                        sym = $3
+                        if (strip && sym ~ /^_/) sym = substr(sym, 2)
+                        if (sym ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && sym != "main" && !seen[sym]++)
+                          print sym " " t "__" sym
+                      }'
+              } > multicall/${san p.name}.redef
+            '';
+            # Per-program: rename the program's own objects with its own map.
+            renameObjs = p: ''
+              ${nixpkgs.lib.concatMapStringsSep "\n"
+                  (o: ''$OBJCOPY --redefine-syms=multicall/${san p.name}.redef "${o}" "multicall/objs/${san p.name}_$(echo '${o}' | tr / _)"'')
+                  p.objs}
+            '';
+          in
+          drv.overrideAttrs (old: {
+            outputs = (old.outputs or [ "out" ]) ++ [ "module" ];
+            postBuild = (old.postBuild or "") + ''
+              set -e
+              mkdir -p multicall/objs
+              ${nixpkgs.lib.concatMapStringsSep "\n" emitRedef programs}
+              ${nixpkgs.lib.concatMapStringsSep "\n" renameObjs programs}
+              mkdir -p "$module/lib"
+              $AR rcs "$module/lib/module.a" multicall/objs/*.o
+              # Union map for the private bundled archives: rewrites their
+              # callbacks into the program (gnulib dfa.o -> dfaerror, …) to the
+              # namespaced names. gnulib's OWN defs aren't in the map -> untouched.
+              cat multicall/*.redef > multicall/all.redef
+              ${nixpkgs.lib.concatMapStringsSep "\n"
+                  (a: ''
+                    cp "${a}" "$module/lib/$(basename ${a})"
+                    chmod +w "$module/lib/$(basename ${a})"
+                    $OBJCOPY --redefine-syms=multicall/all.redef "$module/lib/$(basename ${a})"
+                  '')
+                  internalArchives}
+            '';
+          });
+
+        # Bitcode-LTO variant of multicallModuleHook for engine = "unpin-llvm".
+        # The adapter (lto = true) compiled every object as LLVM BITCODE, so the
+        # ELF-only objcopy --redefine-syms of multicallModuleHook can't apply
+        # (llvm-objcopy refuses bitcode). Instead, per program:
+        #
+        #   1. a tiny trampoline `unpin__<pkg>__<prog>_main` calls the program's
+        #      `main` (no recompile of the program — the trampoline is the only
+        #      thing compiled here; the program's bitcode objects are used as-is);
+        #   2. a REAL linker (`ld.lld -r --lto-emit-llvm`, NOT llvm-link) folds
+        #      the program's bitcode objects + the trampoline + the PRIVATE
+        #      internalArchives (gnulib) into one bitcode module — lld's
+        #      on-demand archive pull (first-def-wins dedup + back-ref
+        #      resolution) is what llvm-link's whole-load/single-pass can't do;
+        #      see the detailed note on `perProgram` below for why;
+        #   3. `opt -passes=internalize` keeping ONLY the trampoline entry
+        #      localizes everything else — the real `main` (NOT auto-preserved by
+        #      LLVM 21's new-PM InternalizePass, unlike legacy -internalize) and
+        #      every shared/callback global — to internal linkage, so two
+        #      programs' same-named statics can't collide at the mega-link.
+        #
+        # The per-program internalized modules are llvm-link'd into one
+        # module.bc; llvm-link auto-renames colliding internals (main → main.1,
+        # …) while the external entries stay distinct. CLEAN external depArchives
+        # (pcre2/zlib) are NOT folded — they stay external in the manifest,
+        # deduped by member at the mega-link (which links with -flto -fuse-ld=lld
+        # for whole-program LTO across all modules). Linux-native only.
+        #
+        # Needs llvm-link + opt, which the vendored multicall `llvm` carries
+        # (toolchain Patch 4); they're passed as `llvm` = "${toolchain}/bin/llvm".
+        multicallModuleHookLTO =
+          { package                 # "grep" — namespace component
+          , programs                # [ { name; objs = [ "src/x.o" ]; } ]
+          , internalArchives ? [ ]  # builddir-relative private .a (gnulib, bitcode)
+          , llvm                    # "${toolchain}/bin/llvm" (has llvm-link + opt)
+          }: drv:
+          let
+            san = n: nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ] n;
+            entryOf = p: "unpin__${san package}__${san p.name}_main";
+            spaceSep = nixpkgs.lib.concatStringsSep " ";
+            # Fold the program's bitcode objects + trampoline + the PRIVATE
+            # archives into one module with a REAL linker (ld.lld -r), not
+            # llvm-link. llvm-link has no proper archive semantics: it either
+            # whole-loads every archive (duplicate strong defs when a shared
+            # helper is bundled into several members — coreutils' every
+            # libsinglebin_*.a carries its own blake2b-ref.o/cksum.o; gnulib
+            # lists backupfile twice → "symbol multiply defined") or, with
+            # --only-needed, does a single left-to-right pass that can't satisfy
+            # cross-archive back-references (basenc → base32's isubase32, df →
+            # gnulib c_iscntrl). lld pulls archive members on demand, takes the
+            # first definition and skips the rest (dedup), and resolves
+            # back-references by default (no --start-group needed) — exactly the
+            # native single-binary link. `-r` keeps it relocatable so libc/dep
+            # symbols stay undefined for the mega-link; `--lto-emit-llvm` writes
+            # the merged result as bitcode (inputs are bitcode) instead of
+            # codegen'ing it, so the cross-module LTO chain stays intact. The
+            # program objects are passed as objects (always included, never GC'd
+            # under -r). Then opt internalizes everything but the entry.
+            perProgram = p:
+              let linkBc = "multicall/link_${san p.name}.bc"; in
+              ''
+                printf 'extern int main(int,char**);\nint %s(int c,char**v){return main(c,v);}\n' \
+                  '${entryOf p}' > multicall/tramp_${san p.name}.c
+                $CC -flto -O2 -c multicall/tramp_${san p.name}.c -o multicall/tramp_${san p.name}.bc
+                ${llvm} ld.lld -r ${spaceSep p.objs} multicall/tramp_${san p.name}.bc ${spaceSep internalArchives} \
+                  --lto-emit-llvm -o ${linkBc}
+                ${llvm} opt -passes=internalize -internalize-public-api-list=${entryOf p} \
+                  ${linkBc} -o multicall/mod_${san p.name}.bc
+              '';
+          in
+          drv.overrideAttrs (old: {
+            outputs = (old.outputs or [ "out" ]) ++ [ "module" ];
+            postBuild = (old.postBuild or "") + ''
+              set -e
+              mkdir -p multicall "$module/lib"
+              ${nixpkgs.lib.concatMapStringsSep "\n" perProgram programs}
+              ${llvm} llvm-link ${spaceSep (map (p: "multicall/mod_${san p.name}.bc") programs)} \
+                -o "$module/lib/module.bc"
+            '';
+          });
+
         # Cross-platform multicall fold (cpp-rename / "X+Z" recipe). A package
         # that ships N sibling programs from one source tree (each its own
         # subdir Makefile, sharing a clean static lib with no callbacks into the
@@ -1446,6 +1845,105 @@ CBODY
                  else { aliasesFromSymlinksIn = "bin"; }))
             multicall;
 
+        # mkMegaMulticall: fold N package multicall MODULES (the
+        # passthru.multicallModule manifests mkStandaloneFlake attaches) into ONE
+        # busybox-style binary "unpinbox". Each manifest carries:
+        #   moduleFormat  "bitcode" (the -flto emitter) | "elf-archive" (objcopy)
+        #   moduleArchive  store path to module.bc / module.a
+        #   depArchives    external clean .a (pcre2, zlib) — passthru store paths
+        #   applets        [ { name; entry } ]  entry = unpin__<pkg>__<prog>_main
+        #   requires       { cxx; group; … }
+        #
+        # The dispatcher (multicallTableDispatcherC) routes argv[0]-basename or a
+        # leading `--unpin-program=NAME` to the matching entry. Bitcode modules
+        # link with `clang -flto -fuse-ld=lld` (whole-program LTO across every
+        # package); the module.bc files are plain objects (always pulled), the
+        # external depArchives are passed once, deduped by store path (the linker
+        # pulls only the members each module needs). The link runs through
+        # unpinAdapterStdenv so the on-demand musl sysroot (libc, libc++) is
+        # seeded and each entry's libc/pcre2 U-symbols resolve.
+        #
+        # Applet-name collisions across packages are a HARD error (the plan's
+        # recommended policy) — pass `nameOverrides = { old = new; }` to rename.
+        # `cppRenameMulticall` is the degenerate single-package fold; this is the
+        # cross-package one. See docs/multicall.md and the mega-multicall plan.
+        mkMegaMulticall =
+          { pkgs
+          , name ? "unpinbox"
+          , modules                  # [ multicallModule manifest, … ]
+          , nameOverrides ? { }      # { oldName = newName; } collision fixes
+          , defaultApplet ? null     # applet name to run bare (null = list)
+          , toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
+          , target ? pkgs.pkgsStatic.stdenv.hostPlatform.config
+          }:
+          let
+            renamedName = a: nameOverrides.${a.name} or a.name;
+            allApplets = nixpkgs.lib.concatMap
+              (m: map (a: { name = renamedName a; inherit (a) entry; }) m.applets)
+              modules;
+            names = map (a: a.name) allApplets;
+            dups = nixpkgs.lib.unique
+              (nixpkgs.lib.filter
+                (n: builtins.length (nixpkgs.lib.filter (x: x == n) names) > 1) names);
+            # The dispatcher emits `<san>_main` for each applet; entry already IS
+            # `<san>_main`, so san = entry minus the trailing "_main".
+            sanOf = a: nixpkgs.lib.removeSuffix "_main" a.entry;
+            appletLines = map (a: "${a.name}\t${sanOf a}") allApplets;
+            defaultSan =
+              if defaultApplet == null then null
+              else
+                let m = nixpkgs.lib.findFirst (a: a.name == defaultApplet) null allApplets;
+                in if m == null
+                   then throw "mkMegaMulticall: defaultApplet '${defaultApplet}' is not an applet of any module"
+                   else sanOf m;
+            anyBitcode = builtins.any (m: (m.moduleFormat or "elf-archive") == "bitcode") modules;
+            anyCxx = builtins.any (m: m.requires.cxx or false) modules;
+            anyGroup = builtins.any (m: m.requires.group or false) modules;
+            moduleArchives = map (m: m.moduleArchive) modules;
+            depArchives = nixpkgs.lib.unique
+              (nixpkgs.lib.concatMap (m: m.depArchives) modules);
+            face = if anyCxx then "$CXX" else "$CC";
+            groupOpen = nixpkgs.lib.optionalString anyGroup "-Wl,--start-group";
+            groupClose = nixpkgs.lib.optionalString anyGroup "-Wl,--end-group";
+            adapter = unpinAdapterStdenv {
+              inherit pkgs toolchain target;
+              native = true;
+              cxx = anyCxx;
+              lto = anyBitcode;
+            };
+          in
+          assert (dups == [ ]) ||
+            throw ("mkMegaMulticall: applet name collision across packages: "
+              + nixpkgs.lib.concatStringsSep ", " dups
+              + " — pass nameOverrides to rename");
+          withAliases pkgs { primary = name; aliases = names; }
+            (adapter.mkDerivation {
+              inherit name;
+              dontUnpack = true;
+              dontConfigure = true;
+              buildPhase = ''
+                runHook preBuild
+                mkdir -p multicall
+                printf '${nixpkgs.lib.concatStringsSep "\\n" appletLines}\n' > multicall/applets.list
+                ${multicallTableDispatcherC { inherit name; defaultApplet = defaultSan; }}
+                # -Wl,-s strips the symbol table at link (after LTO codegen bound
+                # the entries) — the entries are dead in the symtab once linked,
+                # so the shipped binary carries none. The UNPIN_META ZIP is
+                # embedded post-link by withAliases, so it survives the strip.
+                ${face} -fuse-ld=lld -Wl,-s -o ${name} \
+                  multicall/dispatcher.c \
+                  ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
+                  ${groupOpen} ${nixpkgs.lib.concatStringsSep " " depArchives} ${groupClose}
+                runHook postBuild
+              '';
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/bin"
+                install -m755 ${name} "$out/bin/${name}"
+                runHook postInstall
+              '';
+            });
+
         # Why not overlays for per-package fixes? `appendOverlays` invalidates
         # `pkgsBuildHost.stdenv` → cascade rebuild of compiler-rt-libc-static, ninja,
         # python3 in pkgsStatic-darwin (none cached; Hydra only builds pkgsStatic-linux).
@@ -1591,8 +2089,13 @@ CBODY
         # would otherwise land at `result-bin`/`result-man` and verify fails.
         strippedOrJoined = pkgs: name: drv:
           let
+            # A `module` output (multicall .a-generation, opt-in) is a sidecar,
+            # not a shipped runtime output: ignore it when deciding strip-vs-join
+            # and let it ride through the strip branch untouched. Identity for
+            # every package that doesn't carry one.
+            shipOutputs = builtins.filter (o: o != "module") (drv.outputs or [ "out" ]);
             out =
-              if (drv.outputs or [ "out" ]) == [ "out" ]
+              if shipOutputs == [ "out" ]
               then drv.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
               else packageWithMan pkgs name drv;
           in
@@ -1733,6 +2236,26 @@ CBODY
           # ffmpeg, python).
           , description ? null
           , optimize ? { }
+          # Opt a package into the multicall MODULE artifact (the .a-generation
+          # scheme). When set, the NATIVE-LINUX `packages.<sys>.default` build
+          # gains a `module` output (module.a + namespaced private archives,
+          # produced by post-processing the objects the build already compiled —
+          # no recompile) and a `passthru.multicallModule` manifest the
+          # mega-builder consumes. Shape:
+          #   multicall = {
+          #     programs = [ { name = "grep"; objs = [ "src/grep.o" … ];
+          #                    aliases = [ "egrep" "fgrep" ]; } ];
+          #     internalArchives = [ "lib/libgreputils.a" ];  # private (gnulib)
+          #     depArchives = [ "${pkgs.pkgsStatic.pcre2.out}/lib/libpcre2-8.a" ];
+          #     requires = { };   # cxx/group/frameworks/… overrides
+          #   }
+          # null = unchanged (every package that doesn't opt in is untouched;
+          # CI matrix and shipped binary bytes are unaffected by this option's
+          # existence). Linux native only for now — darwin/windows/cosmo and
+          # procps-class shared-callback packages are deferred. The `depArchives`
+          # closure is a passthru reference only (not linked into the shipped
+          # binary), so it doesn't bloat `packages.<sys>.default`.
+          , multicall ? null
           # Link the DNS fallback (__wrap_getaddrinfo) into the linux-static
           # artifact so it resolves names where /etc/resolv.conf is absent
           # (Android, minimal containers). OPT-IN: set `dnsFallback = true` only
@@ -1747,6 +2270,26 @@ CBODY
           # its decompressor into a SIGSEGV (`bzip2 --help`). Hence opt-in, not
           # catalog-wide. No-op on darwin/windows. See withDnsFallback.
           , dnsFallback ? false
+          # engine: which toolchain builds the NATIVE-LINUX artifact.
+          #   "default"    → nixpkgs' static-musl stdenv (gcc/clang via cc-wrapper),
+          #                  the catalog default — unchanged for every package.
+          #   "unpin-llvm" → build the SAME unmodified nixpkgs recipe through the
+          #                  vendored unpin-llvm toolchain via unpinAdapterStdenv
+          #                  (pkgsStatic.<pkgsAttr>.override { stdenv = …; }). Only
+          #                  the native-linux path is rerouted; cross-linux,
+          #                  darwin and windows keep their existing toolchains
+          #                  (a deliberate follow-up — unpin-llvm has those
+          #                  backends but the cross wiring isn't done yet). When
+          #                  `build` is consumer-supplied, mkStandaloneFlake can't
+          #                  swap the stdenv inside that opaque closure — so it
+          #                  exposes the engine stdenv as `pkgs.unpinEngineStdenv`
+          #                  (null off-engine) and the closure opts in with
+          #                  `base.override { stdenv = pkgs.unpinEngineStdenv or
+          #                  pkgs.pkgsStatic.stdenv; }`. Composes with neither lto nor gc (the
+          #                  adapter replaces the stdenv those overlays wrap, so
+          #                  they'd be silent no-ops); nixpkgsFor falls back to
+          #                  plain nixpkgs under this engine.
+          , engine ? "default"
           }:
           let
             optimize_ = { lto = false; opt = null; ssp = true; gc = true; } // optimize;
@@ -1758,7 +2301,12 @@ CBODY
             # includes function/data-sections + --gc-sections, so it subsumes
             # gc; when both are set, lto wins and gc is a no-op.
             nixpkgsFor = forAllNative (system:
-              if lto && isLinuxSys system
+              # unpin-llvm replaces the whole stdenv (overrideCC), so the gc/lto
+              # overlays — which rewrite the nixpkgs cc-wrapper stdenv — would be
+              # silent no-ops under it. Use plain nixpkgs to avoid the wasted eval
+              # and the false impression they're active.
+              if engine == "unpin-llvm" then import nixpkgs { inherit system; }
+              else if lto && isLinuxSys system
               then mkPkgsLTO { inherit system; opt = ltoOpt; inherit ssp; pkgName = pkgsAttr; }
               else if gc && isLinuxSys system
               then mkPkgsGC { inherit system ssp opt; pkgName = pkgsAttr; }
@@ -1791,12 +2339,74 @@ CBODY
               if description == null then drv
               else drv // { meta = (drv.meta or { }) // { description = description; }; };
 
-            rawBuild =
-              if build != null then build
-              else nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
+            defaultRawBuild = nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
+            # The unpin-llvm engine works by injecting our toolchain as the recipe's
+            # `stdenv`. For the DEFAULT recipe we override it here. But a package with
+            # a custom `build` is an opaque `pkgs -> drv` closure mkStandaloneFlake
+            # can't reach into to swap the stdenv — so the engine would be silently
+            # ignored (the `build != null` branch wins). To close that gap we expose
+            # the engine stdenv to the closure as `pkgs.unpinEngineStdenv` (null when
+            # the engine is off / off-Linux), and the custom build opts in with
+            #   base.override { stdenv = pkgs.unpinEngineStdenv or pkgs.pkgsStatic.stdenv; }
+            # linux-static host only (the adapter targets musl); darwin native passes
+            # through untouched. When the engine is off, `pkgs` is handed through
+            # unchanged, so every existing package is byte-identical (no pkgs mutation).
+            # A bitcode-LTO multicall module (engine = "unpin-llvm" + multicall)
+            # needs every object compiled as bitcode, so the adapter gets
+            # lto = true ONLY then. Engine-only packages (no multicall) keep the
+            # -O2 ELF path unchanged. (Off-engine, engineStdenvFor isn't used.)
+            wantBitcodeModule = engine == "unpin-llvm" && multicall != null;
+            engineStdenvFor = pkgs: unpinAdapterStdenv {
+              inherit pkgs;
+              target = pkgs.pkgsStatic.stdenv.hostPlatform.config;
+              native = true;
+              cxx = true;
+              lto = wantBitcodeModule;
+            };
+            rawBuild = pkgs:
+              let
+                useEngine = engine == "unpin-llvm" && pkgs.stdenv.hostPlatform.isLinux;
+                engStdenv = if useEngine then engineStdenvFor pkgs else null;
+              in
+              if build != null
+              then build (if useEngine then pkgs // { unpinEngineStdenv = engStdenv; } else pkgs)
+              else if useEngine
+              then (defaultRawBuild pkgs).override { stdenv = engStdenv; }
+              else defaultRawBuild pkgs;
             stripped = pkgs:
               let
-                core = withDarwinIconv pkgs (dropSharedLibs (filterEnableStaticOnDarwin (applyOptSsp (rawBuild pkgs))));
+                # multicall MODULE opt-in: native-linux only. The hook adds a
+                # `module` output by post-processing the objects the build
+                # already compiled (no recompile), riding the same builder as
+                # the shipped binary. No-op when `multicall == null` or off-Linux.
+                sanMc = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
+                wantModule = multicall != null && pkgs.stdenv.hostPlatform.isLinux;
+                # engine = "unpin-llvm" builds with -flto → bitcode objects → the
+                # objcopy redef map can't apply; use the bitcode-LTO emitter
+                # (llvm-link + opt -internalize). engine = "default" (gcc/clang
+                # ELF) keeps the objcopy hook.
+                useBitcodeModule = wantModule && engine == "unpin-llvm";
+                rawHooked =
+                  if useBitcodeModule
+                  then multicallModuleHookLTO
+                    {
+                      package = name;
+                      inherit (multicall) programs;
+                      internalArchives = multicall.internalArchives or [ ];
+                      llvm = "${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm";
+                    }
+                    (rawBuild pkgs)
+                  else if wantModule
+                  then multicallModuleHook
+                    {
+                      package = name;
+                      inherit (multicall) programs;
+                      internalArchives = multicall.internalArchives or [ ];
+                      isTargetDarwin = false;
+                    }
+                    (rawBuild pkgs)
+                  else rawBuild pkgs;
+                core = withDarwinIconv pkgs (dropSharedLibs (filterEnableStaticOnDarwin (applyOptSsp rawHooked)));
                 # C catalog keeps the fallback linux-only for now; the darwin-C
                 # and windows-cosmo paths are a deliberate follow-up (the Rust
                 # tools opt into darwin/windows by calling withDnsFallback directly).
@@ -1807,12 +2417,54 @@ CBODY
                 # collapses multi-output drvs into a symlinkJoin. Skipped when
                 # the consumer's own withUnpinEmbed call already included man
                 # (passthru.unpinEmbedsMan) — one pack, not two.
-                withMaybeMan =
+                withMaybeMan0 =
                   if embedMan && !(base.unpinEmbedsMan or false)
                   then withMan pkgs { primary = binName; } base
                   else base;
+                # When a `module` output rides along, force the SAME final strip
+                # selection (`[bin out]`) that strippedOrJoined / packageWithMan
+                # apply downstream. That makes their internal strip override a
+                # no-op (identical .drv), so the `module` output we reference for
+                # the manifest is the very build the shipped binary comes from —
+                # no second build — and survives even the symlinkJoin branch
+                # (multi-output packages like grep, which has an `info` output).
+                # Shipped bytes are unchanged: [bin out] is exactly what those
+                # helpers already set.
+                withMaybeMan =
+                  if wantModule
+                  then withMaybeMan0.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
+                  else withMaybeMan0;
+                result = withLicense (withDescription (strippedOrJoined pkgs name withMaybeMan));
+                # The manifest the mega-builder consumes. `moduleArchive`/the
+                # gnulib `depArchives` reference the `module` output of the same
+                # built drv (built once, same builder); the external `depArchives`
+                # are verbatim store paths (passthru reference, NOT linked into
+                # the shipped binary).
+                multicallManifest = {
+                  package = name;
+                  # Bitcode path: ONE module.bc with the internalArchives folded
+                  # IN (llvm-link). ELF/objcopy path: module.a + the renamed
+                  # private archives sit alongside as separate depArchives.
+                  moduleFormat = if useBitcodeModule then "bitcode" else "elf-archive";
+                  moduleArchive =
+                    if useBitcodeModule
+                    then "${withMaybeMan.module}/lib/module.bc"
+                    else "${withMaybeMan.module}/lib/module.a";
+                  depArchives =
+                    (if useBitcodeModule then [ ]
+                     else map (a: "${withMaybeMan.module}/lib/${baseNameOf a}") (multicall.internalArchives or [ ]))
+                    ++ (let d = multicall.depArchives or [ ];
+                        in if builtins.isFunction d then d pkgs else d);
+                  applets = nixpkgs.lib.concatMap
+                    (p:
+                      let entry = "unpin__${sanMc name}__${sanMc p.name}_main"; in
+                      [{ name = p.name; inherit entry; }]
+                      ++ map (al: { name = al; inherit entry; }) (p.aliases or [ ]))
+                    multicall.programs;
+                  requires = { cxx = false; group = true; } // (multicall.requires or { });
+                };
               in
-              withLicense (withDescription (strippedOrJoined pkgs name withMaybeMan));
+              if wantModule then result // { multicallModule = multicallManifest; } else result;
 
             # Windows runs on x86_64-linux runners. `allowUnsupportedSystem` because
             # most nixpkgs `meta.platforms` exclude mingw / cosmo → cross-built drv
