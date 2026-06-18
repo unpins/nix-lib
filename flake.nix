@@ -2279,16 +2279,14 @@ CBODY
           #                  the native-linux path is rerouted; cross-linux,
           #                  darwin and windows keep their existing toolchains
           #                  (a deliberate follow-up — unpin-llvm has those
-          #                  backends but the cross wiring isn't done yet). When
-          #                  `build` is consumer-supplied, mkStandaloneFlake can't
-          #                  swap the stdenv inside that opaque closure — so it
-          #                  exposes the engine stdenv as `pkgs.unpinEngineStdenv`
-          #                  (null off-engine) and the closure opts in with
-          #                  `base.override { stdenv = pkgs.unpinEngineStdenv or
-          #                  pkgs.pkgsStatic.stdenv; }`. Composes with neither lto nor gc (the
-          #                  adapter replaces the stdenv those overlays wrap, so
-          #                  they'd be silent no-ops); nixpkgsFor falls back to
-          #                  plain nixpkgs under this engine.
+          #                  backends but the cross wiring isn't done yet). The
+          #                  swap is transparent: a consumer-supplied `build`
+          #                  receives a `pkgs` whose pkgsStatic.<pkgsAttr> is
+          #                  already on the engine stdenv, so the recipe needs no
+          #                  engine plumbing (see rawBuild). Composes with neither
+          #                  lto nor gc (the adapter replaces the stdenv those
+          #                  overlays wrap, so they'd be silent no-ops); nixpkgsFor
+          #                  falls back to plain nixpkgs under this engine.
           , engine ? "default"
           }:
           let
@@ -2340,21 +2338,19 @@ CBODY
               else drv // { meta = (drv.meta or { }) // { description = description; }; };
 
             defaultRawBuild = nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
-            # The unpin-llvm engine works by injecting our toolchain as the recipe's
-            # `stdenv`. For the DEFAULT recipe we override it here. But a package with
-            # a custom `build` is an opaque `pkgs -> drv` closure mkStandaloneFlake
-            # can't reach into to swap the stdenv — so the engine would be silently
-            # ignored (the `build != null` branch wins). To close that gap we expose
-            # the engine stdenv to the closure as `pkgs.unpinEngineStdenv` (null when
-            # the engine is off / off-Linux), and the custom build opts in with
-            #   base.override { stdenv = pkgs.unpinEngineStdenv or pkgs.pkgsStatic.stdenv; }
-            # linux-static host only (the adapter targets musl); darwin native passes
-            # through untouched. When the engine is off, `pkgs` is handed through
-            # unchanged, so every existing package is byte-identical (no pkgs mutation).
-            # A bitcode-LTO multicall module (engine = "unpin-llvm" + multicall)
-            # needs every object compiled as bitcode, so the adapter gets
-            # lto = true ONLY then. Engine-only packages (no multicall) keep the
-            # -O2 ELF path unchanged. (Off-engine, engineStdenvFor isn't used.)
+            # The unpin-llvm engine swaps the recipe's `stdenv` for our toolchain
+            # adapter. For the DEFAULT recipe we override it directly. For a package
+            # with a CUSTOM `build` (an opaque pkgs -> drv closure we can't reach
+            # into) we instead hand the closure a `pkgs` whose pkgsStatic.<pkgsAttr>
+            # is ALREADY built with the engine stdenv — so the recipe reads exactly
+            # as off-engine (`pkgs.pkgsStatic.gnugrep.overrideAttrs …`), no engine
+            # plumbing per package; just set `engine = "unpin-llvm"`. The shallow
+            # `//` swaps only that one top package, leaving its deps and the rest of
+            # pkgsStatic normal (external depArchives stay plain ELF). linux-static
+            # host only; darwin/cross/off-engine get `pkgs` untouched, so every
+            # existing package is byte-identical. A bitcode-LTO multicall module
+            # (engine + multicall) needs every object as bitcode, so the adapter
+            # gets lto = true ONLY then; engine-only packages keep the -O2 ELF path.
             wantBitcodeModule = engine == "unpin-llvm" && multicall != null;
             engineStdenvFor = pkgs: unpinAdapterStdenv {
               inherit pkgs;
@@ -2367,9 +2363,14 @@ CBODY
               let
                 useEngine = engine == "unpin-llvm" && pkgs.stdenv.hostPlatform.isLinux;
                 engStdenv = if useEngine then engineStdenvFor pkgs else null;
+                enginePkgs = pkgs // {
+                  pkgsStatic = pkgs.pkgsStatic // {
+                    ${pkgsAttr} = pkgs.pkgsStatic.${pkgsAttr}.override { stdenv = engStdenv; };
+                  };
+                };
               in
               if build != null
-              then build (if useEngine then pkgs // { unpinEngineStdenv = engStdenv; } else pkgs)
+              then build (if useEngine then enginePkgs else pkgs)
               else if useEngine
               then (defaultRawBuild pkgs).override { stdenv = engStdenv; }
               else defaultRawBuild pkgs;
