@@ -224,9 +224,16 @@
               [ "$link" = 1 ] || exit 0
               [ -n "$out" ] || exit 0
               case "$out" in *.o|*.lo|*.so|*.so.*|*.os) exit 0 ;; esac
-              nobj=0; objs=""; locala=""; storea=""
+              nobj=0; objs=""; locala=""; storea=""; ldirs=""; lnames=""; prev=""
               for a in "$@"; do
+                # separated forms: -L <dir>, -l <name>
+                case "$prev" in
+                  -L) ldirs="$ldirs $a" ;;
+                  -l) lnames="$lnames $a" ;;
+                esac
                 case "$a" in
+                  -L?*) ldirs="$ldirs ''${a#-L}" ;;
+                  -l?*) lnames="$lnames ''${a#-l}" ;;
                   *.o|*.lo)
                     case "$a" in /*) p="$a" ;; *) p="$(pwd)/$a" ;; esac
                     nobj=$((nobj+1)); objs="$objs$p
@@ -240,7 +247,30 @@
               " ;;
                     esac ;;
                 esac
+                prev="$a"
               done
+              # Resolve `-L<dir> -l<name>` to a static lib<name>.a (autotools
+              # packages — bash — pass their bundled internal libs this way, not
+              # as positional `.a`). First match per name, ld search order;
+              # build-tree dir => LOCALA (fold into the module), /nix/store =>
+              # STOREA. Names with no `.a` in any -L dir (libc/-ldl/-lm) resolve
+              # to a shared lib or the sysroot and are correctly skipped.
+              set -f
+              for nm in $lnames; do
+                for d in $ldirs; do
+                  cand="$d/lib$nm.a"
+                  [ -f "$cand" ] || continue
+                  case "$cand" in /*) p="$cand" ;; *) p="$(pwd)/$cand" ;; esac
+                  case "$p" in
+                    /nix/store/*) storea="$storea$p
+              " ;;
+                    *) locala="$locala$p
+              " ;;
+                  esac
+                  break
+                done
+              done
+              set +f
               [ "$nobj" -ge 1 ] || exit 0
               b="$(basename "$out")"
               {
@@ -289,8 +319,14 @@
               mkt strip llvm-strip ; mkt objcopy llvm-objcopy ; mkt objdump llvm-objdump
               mkt ld ld.lld ; mkt ld.lld ld.lld
             '';
-            bintools = pkgs.wrapBintoolsWith { bintools = bintoolsUnwrapped; libc = null; };
-            cc = pkgs.wrapCCWith { inherit bintools; cc = ccUnwrapped; libc = null; extraPackages = [ ]; };
+            # Wrap from pkgsStatic so the wrapper's suffixSalt matches the musl
+            # target. Wrapping from the gnu `pkgs` salts it `…-gnu`, and a
+            # package that honours `--host=…-musl` strictly (bash) then can't
+            # find the wrapper and falls back to bare `gcc` → static `-lc`
+            # missing. The lenient autoconf majority (coreutils/grep/sed) didn't
+            # care, but musl is the correct salt either way.
+            bintools = pkgs.pkgsStatic.wrapBintoolsWith { bintools = bintoolsUnwrapped; libc = null; };
+            cc = pkgs.pkgsStatic.wrapCCWith { inherit bintools; cc = ccUnwrapped; libc = null; extraPackages = [ ]; };
             seedHook = pkgs.makeSetupHook
               { name = "unpin-seed-sysroot-cache"; substitutions = { sysrootCache = "${sysroot}/cache"; }; }
               (pkgs.writeText "unpin-seed-sysroot-cache.sh" ''
