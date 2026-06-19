@@ -200,16 +200,69 @@
         # case — clang LTO-compiles the bitcode, then links libc.a normally.
         unpinAdapterStdenv =
           { pkgs, toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
-          , target, optClass ? "-O2", cxx ? true, native ? false, lto ? false }:
+          , target, optClass ? "-O2", cxx ? true, native ? false, lto ? false
+          , captureLinks ? false }:
           let
             sysroot = unpinSysroot { inherit pkgs toolchain; triple = target; inherit optClass native cxx; };
             ltoArg = if lto then " -flto" else "";
+            # Records each executable link to a per-output sidecar (objs + .a,
+            # split local vs /nix/store) — the source the multicall hook reads
+            # back for a program's objs/internalArchives. Inputs are resolved to
+            # absolute paths so the sidecar stays valid in the later postBuild.
+            captureScript = ''
+              #!/bin/sh
+              [ -n "''${UNPIN_LINK_DIR:-}" ] || exit 0
+              mkdir -p "$UNPIN_LINK_DIR" 2>/dev/null || exit 0
+              out=""; link=1; prev=""
+              for a in "$@"; do
+                case "$prev" in -o) out="$a" ;; esac
+                case "$a" in
+                  -c|-E|-S|-shared|-r|--relocatable|-i) link=0 ;;
+                esac
+                prev="$a"
+              done
+              [ "$link" = 1 ] || exit 0
+              [ -n "$out" ] || exit 0
+              case "$out" in *.o|*.lo|*.so|*.so.*|*.os) exit 0 ;; esac
+              nobj=0; objs=""; locala=""; storea=""
+              for a in "$@"; do
+                case "$a" in
+                  *.o|*.lo)
+                    case "$a" in /*) p="$a" ;; *) p="$(pwd)/$a" ;; esac
+                    nobj=$((nobj+1)); objs="$objs$p
+              " ;;
+                  *.a)
+                    case "$a" in /*) p="$a" ;; *) p="$(pwd)/$a" ;; esac
+                    case "$p" in
+                      /nix/store/*) storea="$storea$p
+              " ;;
+                      *) locala="$locala$p
+              " ;;
+                    esac ;;
+                esac
+              done
+              [ "$nobj" -ge 1 ] || exit 0
+              b="$(basename "$out")"
+              {
+                echo "CWD $(pwd)"
+                printf '%s' "$objs"   | while IFS= read -r x; do [ -n "$x" ] && echo "OBJ $x"; done
+                printf '%s' "$locala" | while IFS= read -r x; do [ -n "$x" ] && echo "LOCALA $x"; done
+                printf '%s' "$storea" | while IFS= read -r x; do [ -n "$x" ] && echo "STOREA $x"; done
+              } > "$UNPIN_LINK_DIR/$b.link"
+              exit 0
+            '';
+            captureCall = nixpkgs.lib.optionalString captureLinks
+              "[ -n \"\\$UNPIN_CAPTURE_LINKS\" ] && \"$out/libexec/unpin-capture\" \"\\$@\"";
             ccUnwrapped = pkgs.runCommand "unpin-cc-unwrapped-${target}"
-              { passthru = { isGNU = true; version = "21.1.8"; }; } ''
-              mkdir -p $out/bin
+              { passthru = { isGNU = true; version = "21.1.8"; };
+                inherit captureScript; } ''
+              mkdir -p $out/bin $out/libexec
+              printf '%s' "$captureScript" > $out/libexec/unpin-capture
+              chmod +x $out/libexec/unpin-capture
               mk() {
                 cat > "$out/bin/$1" <<EOF
               #!/bin/sh
+              ${captureCall}
               exec ${toolchain}/bin/llvm $2 -target ${target} "\$@" ${optClass}${ltoArg}
               EOF
                 chmod +x "$out/bin/$1"
@@ -255,6 +308,11 @@
                 preConfigureHooks+=(unpinSeedSysrootCache)
                 preBuildHooks+=(unpinSeedSysrootCache)
               '');
+            captureHook = pkgs.makeSetupHook { name = "unpin-capture-links"; }
+              (pkgs.writeText "unpin-capture-links.sh" ''
+                export UNPIN_CAPTURE_LINKS=1
+                export UNPIN_LINK_DIR="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-links"
+              '');
           in
           # dontPatchELF: static-musl has no interp/RPATH for patchelf to touch.
           # hardeningDisable=all: match route-A's minimal flag set (clang accepts
@@ -265,7 +323,8 @@
           pkgs.stdenvAdapters.addAttrsToDerivation
             { dontPatchELF = true; hardeningDisable = [ "all" ]; }
             ((pkgs.overrideCC pkgs.pkgsStatic.stdenv cc).override (old: {
-              extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ]) ++ [ seedHook ];
+              extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ]) ++ [ seedHook ]
+                ++ nixpkgs.lib.optional captureLinks captureHook;
             }));
 
         # Append `flags` (string or list) to NIX_CFLAGS_COMPILE.
@@ -1651,6 +1710,9 @@ CBODY
           , programs                # [ { name; objs = [ "src/x.o" ]; } ]
           , internalArchives ? [ ]  # builddir-relative private .a (gnulib, bitcode)
           , llvm                    # "${toolchain}/bin/llvm" (has llvm-link + opt)
+          , inferLinkInputs ? false # read objs + local .a from the capture sidecar
+                                    # ($UNPIN_LINK_DIR/<prog>.link) instead of the
+                                    # hand-listed objs/internalArchives
           }: drv:
           let
             san = n: nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ] n;
@@ -1675,7 +1737,25 @@ CBODY
             # program objects are passed as objects (always included, never GC'd
             # under -r). Then opt internalizes everything but the entry.
             perProgram = p:
-              let linkBc = "multicall/link_${san p.name}.bc"; in
+              let
+                linkBc = "multicall/link_${san p.name}.bc";
+                infer = inferLinkInputs && (p.objs or null) == null;
+                # dedup LOCALA: a gnulib archive double-listed for circular refs
+                # folds to one — lld -r resolves back-references without it.
+                inferSetup = ''
+                  __side="$UNPIN_LINK_DIR/${p.name}.link"
+                  [ -f "$__side" ] || { echo "multicallModuleHookLTO: no link sidecar for ${p.name} ($__side)" >&2; exit 1; }
+                  __objs=$(awk '$1=="OBJ"{print $2}' "$__side")
+                  __arch=$(awk '$1=="LOCALA"{print $2}' "$__side" | awk '!seen[$0]++')
+                  [ -n "$__objs" ] || { echo "multicallModuleHookLTO: sidecar for ${p.name} has no objects" >&2; exit 1; }
+                '';
+                linkLine =
+                  if infer
+                  then ''${llvm} ld.lld -r $__objs multicall/tramp_${san p.name}.bc $__arch \
+                  --lto-emit-llvm -o ${linkBc}''
+                  else ''${llvm} ld.lld -r ${spaceSep (p.objs or [ ])} multicall/tramp_${san p.name}.bc ${spaceSep internalArchives} \
+                  --lto-emit-llvm -o ${linkBc}'';
+              in
               ''
                 # 3-arg trampoline: forwards argc/argv/env so a 3-arg main (bash:
                 # main(argc,argv,env), reads env from the 3rd arg) gets its
@@ -1687,8 +1767,8 @@ CBODY
                 printf 'extern int main(int,char**,char**);\nint %s(int c,char**v,char**e){return main(c,v,e);}\n' \
                   '${entryOf p}' > multicall/tramp_${san p.name}.c
                 $CC -flto -O2 -c multicall/tramp_${san p.name}.c -o multicall/tramp_${san p.name}.bc
-                ${llvm} ld.lld -r ${spaceSep p.objs} multicall/tramp_${san p.name}.bc ${spaceSep internalArchives} \
-                  --lto-emit-llvm -o ${linkBc}
+                ${nixpkgs.lib.optionalString infer inferSetup}
+                ${linkLine}
                 ${llvm} opt -passes=internalize -internalize-public-api-list=${entryOf p} \
                   ${linkBc} -o multicall/mod_${san p.name}.bc
               '';
@@ -1698,6 +1778,11 @@ CBODY
             postBuild = (old.postBuild or "") + ''
               set -e
               mkdir -p multicall "$module/lib"
+              # surface the capture sidecars for inspection
+              if [ -d "''${UNPIN_LINK_DIR:-/nonexistent}" ]; then
+                mkdir -p "$module/links"
+                cp "$UNPIN_LINK_DIR"/*.link "$module/links/" 2>/dev/null || true
+              fi
               ${nixpkgs.lib.concatMapStringsSep "\n" perProgram programs}
               ${llvm} llvm-link ${spaceSep (map (p: "multicall/mod_${san p.name}.bc") programs)} \
                 -o "$module/lib/module.bc"
@@ -1958,6 +2043,35 @@ CBODY
                  else { aliasesFromSymlinksIn = "bin"; }))
             multicall;
 
+        # The external static archives a multicall build links, derived from the
+        # build derivation itself instead of being hand-named per package. We
+        # walk the TRANSITIVE propagated-input closure (+ direct buildInputs) and
+        # return their store-path DIRECTORIES — pure strings, NO
+        # import-from-derivation: we never readDir at eval time, so evaluating a
+        # package flake does not force building its deps. The mega builder globs
+        # `<dir>/lib/*.a` at BUILD time (the deps are real build inputs there).
+        # libc/cc are implicit stdenv deps and never appear in this closure, so
+        # there is nothing to exclude; unreferenced archives are inert under
+        # archive-link semantics (the link wraps them in --start-group). Reads
+        # buildInputs off the FINAL build drv, so a recipe's `.override` that adds
+        # deps (coreutils' acl/attr) is reflected.
+        multicallExternalDepDirs = drv:
+          let
+            isDrv = d: d != null && builtins.isAttrs d && (d ? outPath);
+            roots = builtins.filter isDrv
+              ((drv.buildInputs or [ ]) ++ (drv.propagatedBuildInputs or [ ]));
+            closure = builtins.genericClosure {
+              startSet = map (d: { key = d.outPath; val = d; }) roots;
+              operator = item: map (d: { key = d.outPath; val = d; })
+                (builtins.filter isDrv (item.val.propagatedBuildInputs or [ ]));
+            };
+            # Emit EVERY output of each dep: the static `.a` may sit in `out`,
+            # `lib`, or `dev` depending on the package's output split (pcre2's
+            # default output is `dev`, but libpcre2-8.a lives in `out`). The
+            # build-time glob picks whichever dir actually has lib/*.a.
+            outsOf = d: map (o: "${d.${o}}") (d.outputs or [ "out" ]);
+          in nixpkgs.lib.unique (builtins.concatMap (item: outsOf item.val) closure);
+
         # mkMegaMulticall: fold N package multicall MODULES (the
         # passthru.multicallModule manifests mkStandaloneFlake attaches) into ONE
         # busybox-style binary "unpinbox". Each manifest carries:
@@ -2018,9 +2132,32 @@ CBODY
             moduleArchives = map (m: m.moduleArchive) modules;
             depArchives = nixpkgs.lib.unique
               (nixpkgs.lib.concatMap (m: m.depArchives) modules);
+            # Auto-derived external dep dirs (per-module input closure). The
+            # builder globs <dir>/lib/*.a at build time and skips libc-family
+            # archives (the engine/cosmo provides libc — a deep closure that
+            # surfaces musl's libc.a must not clash with it).
+            depInputDirs = nixpkgs.lib.unique
+              (nixpkgs.lib.concatMap (m: m.depInputDirs or [ ]) modules);
+            # Shell prelude (shared by both builders) that fills a `autodeps`
+            # array from depInputDirs, filtering the libc split archives.
+            autoDepsPrelude = ''
+              autodeps=()
+              for d in ${nixpkgs.lib.concatStringsSep " " depInputDirs}; do
+                for a in "$d"/lib/*.a; do
+                  [ -e "$a" ] || continue
+                  case "$(basename "$a")" in
+                    libc.a|libm.a|libpthread.a|librt.a|libdl.a|libresolv.a|libutil.a|libcrypt.a|libxnet.a|libnsl.a) continue ;;
+                  esac
+                  autodeps+=("$a")
+                done
+              done
+            '';
             face = if anyCxx then "$CXX" else "$CC";
-            groupOpen = nixpkgs.lib.optionalString anyGroup "-Wl,--start-group";
-            groupClose = nixpkgs.lib.optionalString anyGroup "-Wl,--end-group";
+            # A group is needed when there is more than one archive to back-ref
+            # across — explicit depArchives OR auto-derived dirs both count.
+            needGroup = anyGroup || depArchives != [ ] || depInputDirs != [ ];
+            groupOpen = nixpkgs.lib.optionalString needGroup "-Wl,--start-group";
+            groupClose = nixpkgs.lib.optionalString needGroup "-Wl,--end-group";
             adapter = unpinAdapterStdenv {
               inherit pkgs toolchain target;
               native = true;
@@ -2039,14 +2176,16 @@ CBODY
                 mkdir -p multicall
                 printf '${nixpkgs.lib.concatStringsSep "\\n" appletLines}\n' > multicall/applets.list
                 ${multicallTableDispatcherC { inherit name; defaultApplet = defaultSan; }}
+                ${autoDepsPrelude}
                 # -Wl,-s strips the symbol table at link (after LTO codegen bound
                 # the entries) — the entries are dead in the symtab once linked,
                 # so the shipped binary carries none. The UNPIN_META ZIP is
                 # embedded post-link by withAliases, so it survives the strip.
+                # Explicit depArchives + auto-derived (autodeps) ride in one group.
                 ${face} -fuse-ld=lld -Wl,-s -o ${name} \
                   multicall/dispatcher.c \
                   ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
-                  ${groupOpen} ${nixpkgs.lib.concatStringsSep " " depArchives} ${groupClose}
+                  ${groupOpen} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose}
                 runHook postBuild
               '';
               installPhase = ''
@@ -2067,8 +2206,6 @@ CBODY
             cosmoModuleLink = nixpkgs.lib.concatMapStringsSep " \\\n          "
               (m: ''"${m.moduleObjs}"/*.o $(grp "${m.appletDir}") $(grp "${m.gnulibDir}")'')
               modules;
-            cosmoDepGroup = nixpkgs.lib.optionalString (depArchives != [ ])
-              "-Wl,--start-group ${nixpkgs.lib.concatStringsSep " " depArchives} -Wl,--end-group";
             megaCosmoDrv = cosmo.mkDerivation {
               inherit name;
               dontUnpack = true;
@@ -2083,9 +2220,14 @@ CBODY
                 grp() { local f had=0 out="-Wl,--start-group"
                         for f in "$1"/*.a; do [ -e "$f" ] || continue; had=1; out="$out $f"; done
                         [ "$had" = 1 ] && printf -- '%s -Wl,--end-group ' "$out"; }
+                ${autoDepsPrelude}
+                # explicit depArchives + auto-derived (autodeps) in one group
+                alldeps=( ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" )
+                depgrp=()
+                [ "''${#alldeps[@]}" -gt 0 ] && depgrp=( -Wl,--start-group "''${alldeps[@]}" -Wl,--end-group )
                 ${face} -O2 -o ${name} multicall/dispatcher.c \
                   ${cosmoModuleLink} \
-                  ${cosmoDepGroup}
+                  "''${depgrp[@]}"
                 ${cosmoApelink} -o ${name}.ape ${name}
                 ${cosmoApelink} -V ${cosmoVbits} -o ${name}.exe ${name}
                 runHook postBuild
@@ -2546,6 +2688,7 @@ CBODY
               native = true;
               cxx = true;
               lto = wantBitcodeModule;
+              captureLinks = wantBitcodeModule;
             };
             rawBuild = pkgs:
               let
@@ -2582,6 +2725,7 @@ CBODY
                       package = name;
                       inherit (multicall) programs;
                       internalArchives = multicall.internalArchives or [ ];
+                      inferLinkInputs = multicall.inferLinkInputs or false;
                       llvm = "${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm";
                     }
                     (rawBuild pkgs)
@@ -2651,6 +2795,11 @@ CBODY
                       ++ map (al: { name = al; inherit entry; }) (p.aliases or [ ]))
                     multicall.programs;
                   requires = { cxx = false; group = true; } // (multicall.requires or { });
+                  # Auto-derived external dep DIRS (pure store paths, no IFD); the
+                  # mega builder globs <dir>/lib/*.a at build time. Replaces the
+                  # need to hand-name `depArchives` (which stays as an additive
+                  # override for archives not in the build's input closure).
+                  depInputDirs = multicallExternalDepDirs withMaybeMan;
                 };
               in
               if wantModule then result // { multicallModule = multicallManifest; } else result;
@@ -2802,6 +2951,9 @@ CBODY
                 depArchives =
                   let d = multicallCosmo.depArchives or [ ];
                   in if builtins.isFunction d then d windowsPkgs else d;
+                # Auto-derived from the cosmo cross build's input closure
+                # (e.g. bash → cosmo readline/ncurses); globbed at build time.
+                depInputDirs = multicallExternalDepDirs windowsTrimmed;
                 applets =
                   [{ name = multicallCosmo.program; inherit entry; }]
                   ++ map (al: { name = al; inherit entry; }) (multicallCosmo.aliases or [ ]);
