@@ -1394,7 +1394,7 @@ int main(int argc, char **argv) {
        argv[0] identity (ls --unpin-program=rm runs ls, never rm). */
     if (!is_canon)
         for (const struct applet *a = applets; a->name; a++)
-            if (strcmp(base, a->name) == 0) return a->fn(argc, argv);
+            if (strcmp(base, a->name) == 0) return a->fn(argc, argv, environ);
     /* Multitool path: the canonical name "${name}" or a renamed copy (a path,
        or CI's smoke.exe). Select the applet explicitly with the first argument
        --unpin-program=NAME. The ${flagGuard} guard keeps self-detect aliases
@@ -1414,7 +1414,7 @@ int main(int argc, char **argv) {
        style) runs that applet on a bare invocation. */
     if (is_canon)
         for (const struct applet *a = applets; a->name; a++)
-            if (strcmp(base, a->name) == 0) return a->fn(argc, argv);
+            if (strcmp(base, a->name) == 0) return a->fn(argc, argv, environ);
 ${fallbackC}
 }
 CBODY
@@ -1446,6 +1446,18 @@ CBODY
         # `<defaultApplet>_main` must exist): a bare invocation runs it instead of
         # printing usage. procps-ng uses `src_ps_pscommand` so `procps-ng
         # --version` and a renamed binary route to ps. See docs/multicall.md.
+        #
+        # Applet entries are called as `fn(argc, argv, environ)` — the THREE-arg
+        # main form. Some programs (notably bash) declare `main(argc,argv,env)`
+        # and read the environment from the THIRD main argument, NOT the environ
+        # global; a 2-arg call leaves that parameter holding a garbage register
+        # → SIGSEGV at startup. Passing environ is ABI-safe for the common 2-arg
+        # mains (coreutils, grep, …) — they simply ignore the extra register.
+        # The cosmo path links the renamed main DIRECTLY, so the 3rd arg reaches
+        # it. The bitcode-LTO path interposes a trampoline per program; that
+        # trampoline is ALSO 3-arg and forwards all three (see
+        # multicallModuleHookLTO) — a 2-arg trampoline would drop environ and the
+        # 3rd-arg-main would receive NULL (verified: it does, deterministically).
         multicallTableDispatcherC = { name, defaultApplet ? null }:
           let
             fallbackC =
@@ -1460,18 +1472,19 @@ CBODY
     fprintf(stderr, "\n");
     return 1;''
               else ''    (void)list_programs;  /* defaultApplet replaces the listing fallback */
-    return ${defaultApplet}_main(argc, argv);'';
+    return ${defaultApplet}_main(argc, argv, environ);'';
           in
           ''
       {
         echo '#include <string.h>'
         echo '#include <stdio.h>'
         echo '#include <strings.h>'
+        echo 'extern char **environ;'
         while IFS="$(printf '\t')" read -r tool san; do
           [ -n "$tool" ] || continue
-          echo "int ''${san}_main(int, char **);"
+          echo "int ''${san}_main(int, char **, char **);"
         done < multicall/applets.list
-        echo 'struct applet { const char *name; int (*fn)(int, char **); };'
+        echo 'struct applet { const char *name; int (*fn)(int, char **, char **); };'
         echo 'static const struct applet applets[] = {'
         while IFS="$(printf '\t')" read -r tool san; do
           [ -n "$tool" ] || continue
@@ -1507,7 +1520,7 @@ int main(int argc, char **argv) {
        deliberately NOT honored here, locking an alias to its argv[0] identity. */
     if (!is_canon)
         for (const struct applet *a = applets; a->name; a++)
-            if (strcmp(base, a->name) == 0) return a->fn(argc, argv);
+            if (strcmp(base, a->name) == 0) return a->fn(argc, argv, environ);
     /* Multitool path: the canonical name "${name}" or a renamed copy. Select
        the applet explicitly with the first argument --unpin-program=NAME. */
     if (argc >= 2 && strncmp(argv[1], "--unpin-program=", 16) == 0) {
@@ -1515,7 +1528,7 @@ int main(int argc, char **argv) {
         for (const struct applet *a = applets; a->name; a++)
             if (strcmp(sel, a->name) == 0) {
                 argv[1] = (char *)sel;   /* applet's argv[0]=NAME, args follow */
-                return a->fn(argc - 1, argv + 1);
+                return a->fn(argc - 1, argv + 1, environ);
             }
         fprintf(stderr, "${name}: no program '%s'\n", sel);
         return 1;
@@ -1523,7 +1536,7 @@ int main(int argc, char **argv) {
     /* The canonical name when it is itself an applet runs that applet bare. */
     if (is_canon)
         for (const struct applet *a = applets; a->name; a++)
-            if (strcmp(base, a->name) == 0) return a->fn(argc, argv);
+            if (strcmp(base, a->name) == 0) return a->fn(argc, argv, environ);
 ${fallbackC}
 }
 CBODY
@@ -1664,7 +1677,14 @@ CBODY
             perProgram = p:
               let linkBc = "multicall/link_${san p.name}.bc"; in
               ''
-                printf 'extern int main(int,char**);\nint %s(int c,char**v){return main(c,v);}\n' \
+                # 3-arg trampoline: forwards argc/argv/env so a 3-arg main (bash:
+                # main(argc,argv,env), reads env from the 3rd arg) gets its
+                # environment. 2-arg mains (grep/sed/coreutils) declare main with
+                # 2 params — calling main(c,v,e) passes one extra arg the callee
+                # ignores (ABI-safe; LTO resolves the type mismatch via bitcast,
+                # same as the dispatcher→entry call). A 2-arg trampoline instead
+                # dropped env → a 3-arg main received NULL (verified) → SIGSEGV.
+                printf 'extern int main(int,char**,char**);\nint %s(int c,char**v,char**e){return main(c,v,e);}\n' \
                   '${entryOf p}' > multicall/tramp_${san p.name}.c
                 $CC -flto -O2 -c multicall/tramp_${san p.name}.c -o multicall/tramp_${san p.name}.bc
                 ${llvm} ld.lld -r ${spaceSep p.objs} multicall/tramp_${san p.name}.bc ${spaceSep internalArchives} \
@@ -1681,6 +1701,99 @@ CBODY
               ${nixpkgs.lib.concatMapStringsSep "\n" perProgram programs}
               ${llvm} llvm-link ${spaceSep (map (p: "multicall/mod_${san p.name}.bc") programs)} \
                 -o "$module/lib/module.bc"
+            '';
+          });
+
+        # Cosmo (APE) multicall MODULE emitter for engine = "cosmocc". The
+        # bitcode/LTO emitter can't be used — ld.lld won't link cosmo objects
+        # (the IFUNC/IPLT wall, see the cosmo-PE spike) — so the cosmo mega-link
+        # is a NATIVE link through cosmocc + ld.bfd + apelink, and the module
+        # carries plain renamed ELF objects/archives (cosmo objects are ELF
+        # before apelink, so `objcopy --redefine-syms` applies directly).
+        #
+        # FULL per-package namespacing (stronger than multicallModuleHook's
+        # per-program scheme): every DEFINED global across the program objects
+        # AND the package's own archives is renamed `unpin__<pkg>__<sym>`
+        # (`main` → `unpin__<pkg>__<prog>_main`). The same map is applied to the
+        # objects and to BOTH archive buckets, so a package's internal
+        # references follow the rename and stay resolved, while libc's undefined
+        # symbols are untouched — making every package hermetic and
+        # cross-package symbol collisions impossible (no reliance on archive
+        # member dedup, which the cosmo native link can't guarantee across
+        # packages — cf. the "blake2 multiply defined" failure in the LTO path).
+        #
+        # Three staged buckets preserve the package's NATIVE link order at the
+        # mega-link (mkMegaMulticall's cosmo branch links them in this order):
+        #   objs/    program objects — linked DIRECT (always pulled), so a
+        #            program object that strongly overrides an archive symbol
+        #            (coreutils csplit.o's own xalloc_die) wins before any
+        #            archive is scanned;
+        #   applet/  per-applet archives — scanned (in a --start-group) BEFORE
+        #            gnulib, so the override is satisfied from the applet object,
+        #            not gnulib's default (which would then collide);
+        #   gnulib/  the private bundled archive(s) — scanned AFTER applets.
+        # Single-program packages (coreutils single-binary, bash, dash) only.
+        multicallModuleHookCosmo =
+          { package                  # "bash" — namespace component
+          , program                  # single program; entry = unpin__<pkg>__<prog>_main
+          , programObjs              # builddir-relative .o (DIRECT at mega-link)
+          , appletArchives ? [ ]     # builddir-relative .a, scanned BEFORE gnulib
+          , gnulibArchives ? [ ]     # builddir-relative .a (gnulib), scanned AFTER
+          }: drv:
+          let
+            san = n: nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ] n;
+            pfx = "unpin__${san package}__";
+            entry = "${pfx}${san program}_main";
+            sp = nixpkgs.lib.concatStringsSep " ";
+          in
+          drv.overrideAttrs (old: {
+            outputs = (old.outputs or [ "out" ]) ++ [ "module" ];
+            postBuild = (old.postBuild or "") + ''
+              set -e
+              mkdir -p multicall "$module/objs" "$module/applet" "$module/gnulib"
+              progobjs="${sp programObjs}"
+              ag="${sp appletArchives}"; gg="${sp gnulibArchives}"
+              # nullglob-safe: a bare `ls` with no args lists the cwd, so only
+              # run it when the glob list is non-empty.
+              applet=$([ -n "$ag" ] && ls $ag 2>/dev/null || true)
+              gnulib=$([ -n "$gg" ] && ls $gg 2>/dev/null || true)
+              # One redef map over EVERY defined global (objs + both archive
+              # buckets): main → the entry, every other global → unpin__<pkg>__.
+              {
+                echo "main ${entry}"
+                $NM --defined-only -g $progobjs $applet $gnulib 2>/dev/null \
+                  | awk -v p="${pfx}" '
+                      $2 ~ /^[TBDRWVCSiu]$/ {
+                        sym = $3
+                        if (sym ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && sym != "main" && !seen[sym]++)
+                          print sym " " p sym
+                      }'
+              } > multicall/${san package}.redef
+              rename_into() { # $1=destdir ; reads a file list on stdin
+                local n=0 a d
+                while read -r a; do
+                  [ -n "$a" ] || continue
+                  d="$1/$(printf '%03d' $n)-$(basename "$a")"
+                  cp "$a" "$d"; chmod +w "$d"
+                  $OBJCOPY --redefine-syms=multicall/${san package}.redef "$d"; n=$((n+1))
+                done
+              }
+              n=0
+              for o in $progobjs; do
+                $OBJCOPY --redefine-syms=multicall/${san package}.redef "$o" \
+                  "$module/objs/$(printf '%03d' $n)-$(basename "$o")"; n=$((n+1))
+              done
+              printf '%s\n' $applet | rename_into "$module/applet"
+              printf '%s\n' $gnulib | rename_into "$module/gnulib"
+              # Self-check that `main` got renamed to the entry. Capture nm into
+              # a variable and glob-match it — a `nm | grep -Fq` pipe makes grep
+              # exit early, SIGPIPEs nm, and `set -o pipefail` (active in stdenv
+              # phases) then fails the pipeline even though the symbol IS present.
+              __unpin_syms=$($NM --defined-only -g "$module"/objs/*.o 2>/dev/null || true)
+              case "$__unpin_syms" in
+                *"${entry}"*) : ;;
+                *) echo "multicallModuleHookCosmo: entry ${entry} missing after rename" >&2; exit 1 ;;
+              esac
             '';
           });
 
@@ -1897,6 +2010,9 @@ CBODY
                    then throw "mkMegaMulticall: defaultApplet '${defaultApplet}' is not an applet of any module"
                    else sanOf m;
             anyBitcode = builtins.any (m: (m.moduleFormat or "elf-archive") == "bitcode") modules;
+            # engine = "cosmocc": modules emitted by multicallModuleHookCosmo,
+            # linked NATIVELY through cosmocc + apelink (no lld, no adapter).
+            cosmoMode = builtins.any (m: (m.moduleFormat or "elf-archive") == "cosmo-elf") modules;
             anyCxx = builtins.any (m: m.requires.cxx or false) modules;
             anyGroup = builtins.any (m: m.requires.group or false) modules;
             moduleArchives = map (m: m.moduleArchive) modules;
@@ -1911,13 +2027,10 @@ CBODY
               cxx = anyCxx;
               lto = anyBitcode;
             };
-          in
-          assert (dups == [ ]) ||
-            throw ("mkMegaMulticall: applet name collision across packages: "
-              + nixpkgs.lib.concatStringsSep ", " dups
-              + " — pass nameOverrides to rename");
-          withAliases pkgs { primary = name; aliases = names; }
-            (adapter.mkDerivation {
+
+            # ── Bitcode/ELF path (engine default | unpin-llvm): one ELF via the
+            # unpin-llvm adapter, whole-program LTO across modules with lld. ──
+            megaElfDrv = adapter.mkDerivation {
               inherit name;
               dontUnpack = true;
               dontConfigure = true;
@@ -1942,7 +2055,60 @@ CBODY
                 install -m755 ${name} "$out/bin/${name}"
                 runHook postInstall
               '';
-            });
+            };
+
+            # ── Cosmo path (engine cosmocc): native cosmocc link in each
+            # package's NATIVE order (objs DIRECT, then applet group, then
+            # gnulib group), then apelink to a fat APE (every OS, runs locally)
+            # and a thin Windows PE32+. cosmo objects can't go through lld. ──
+            cosmo = cosmoStdenv pkgs;
+            cosmoApelink = "${cosmo.cosmocc}/bin/apelink";
+            cosmoVbits = toString cosmo.platformBits.windows;
+            cosmoModuleLink = nixpkgs.lib.concatMapStringsSep " \\\n          "
+              (m: ''"${m.moduleObjs}"/*.o $(grp "${m.appletDir}") $(grp "${m.gnulibDir}")'')
+              modules;
+            cosmoDepGroup = nixpkgs.lib.optionalString (depArchives != [ ])
+              "-Wl,--start-group ${nixpkgs.lib.concatStringsSep " " depArchives} -Wl,--end-group";
+            megaCosmoDrv = cosmo.mkDerivation {
+              inherit name;
+              dontUnpack = true;
+              dontConfigure = true;
+              buildPhase = ''
+                runHook preBuild
+                mkdir -p multicall
+                printf '${nixpkgs.lib.concatStringsSep "\\n" appletLines}\n' > multicall/applets.list
+                ${multicallTableDispatcherC { inherit name; defaultApplet = defaultSan; }}
+                # nullglob-safe per-bucket group: a bucket dir with no archives
+                # (e.g. bash has no applet archives) contributes nothing.
+                grp() { local f had=0 out="-Wl,--start-group"
+                        for f in "$1"/*.a; do [ -e "$f" ] || continue; had=1; out="$out $f"; done
+                        [ "$had" = 1 ] && printf -- '%s -Wl,--end-group ' "$out"; }
+                ${face} -O2 -o ${name} multicall/dispatcher.c \
+                  ${cosmoModuleLink} \
+                  ${cosmoDepGroup}
+                ${cosmoApelink} -o ${name}.ape ${name}
+                ${cosmoApelink} -V ${cosmoVbits} -o ${name}.exe ${name}
+                runHook postBuild
+              '';
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/bin"
+                install -m755 ${name}.ape "$out/bin/${name}.ape"
+                install -m755 ${name}.exe "$out/bin/${name}.exe"
+                runHook postInstall
+              '';
+            };
+          in
+          assert (dups == [ ]) ||
+            throw ("mkMegaMulticall: applet name collision across packages: "
+              + nixpkgs.lib.concatStringsSep ", " dups
+              + " — pass nameOverrides to rename");
+          # withAliases embeds UNPIN_META into the primary binary; for cosmo it
+          # resolves `${name}` → `${name}.exe` (withUnpinEmbed's .exe fallback),
+          # so the shipped Windows artifact carries the alias set. The fat
+          # `.ape` rides alongside for local cross-OS testing.
+          withAliases pkgs { primary = name; aliases = names; }
+            (if cosmoMode then megaCosmoDrv else megaElfDrv);
 
         # Why not overlays for per-package fixes? `appendOverlays` invalidates
         # `pkgsBuildHost.stdenv` → cascade rebuild of compiler-rt-libc-static, ninja,
@@ -2256,6 +2422,28 @@ CBODY
           # closure is a passthru reference only (not linked into the shipped
           # binary), so it doesn't bloat `packages.<sys>.default`.
           , multicall ? null
+          # Cosmo counterpart of `multicall`: opt a package into the cosmo
+          # (APE) multicall MODULE, emitted from the COSMO CROSS build (the
+          # `windows-x86_64` artifact) instead of the native-linux one. cosmocc
+          # objects are ELF before apelink, so multicallModuleHookCosmo's objcopy
+          # `--redefine-syms` applies directly — no lld (the cosmo IFUNC/IPLT
+          # wall) and no -flto. When set (and the package builds for cosmo), the
+          # cosmo build gains a `module` output (renamed objs/ + applet/ + gnulib/
+          # in native link order) and a `passthru.cosmoMulticallModule` manifest
+          # the mega-builder's cosmoMode consumes. Shape (single-program only —
+          # coreutils single-binary, bash, dash):
+          #   multicallCosmo = {
+          #     program = "coreutils";                  # entry = unpin__<name>__<program>_main
+          #     programObjs = [ "src/coreutils-coreutils.o" ];  # DIRECT at mega-link
+          #     appletArchives = [ "src/libsinglebin_*.a" … ];  # scanned BEFORE gnulib
+          #     gnulibArchives = [ "lib/libcoreutils.a" ];      # scanned AFTER applets
+          #     aliases = [ "[" "cat" … ];              # every applet routes to entry
+          #     depArchives = [ "${pkgs.readline}/lib/libreadline.a" … ];  # external .a
+          #     requires = { };                         # cxx override (default false)
+          #   }
+          # null = unchanged. Independent of `multicall`/`engine` (those drive the
+          # native-linux artifact); a package can carry both, neither, or just one.
+          , multicallCosmo ? null
           # Link the DNS fallback (__wrap_getaddrinfo) into the linux-static
           # artifact so it resolves names where /etc/resolv.conf is absent
           # (Android, minimal containers). OPT-IN: set `dnsFallback = true` only
@@ -2535,6 +2723,26 @@ CBODY
               if windowsBuild != null then windowsBuild
               else if windowsCosmo then (pkgs: (cosmoStaticCross pkgs).${pkgsAttr})
               else (pkgs: (mingwStaticCross pkgs).${pkgsAttr});
+            # Cosmo multicall MODULE opt-in (symmetric to the linux `multicall`
+            # path in `stripped`). When `multicallCosmo` is set, post-process the
+            # cosmo cross build with multicallModuleHookCosmo to add a `module`
+            # output (renamed ELF objs — cosmo objects are ELF before apelink),
+            # then emit `passthru.cosmoMulticallModule` from the same build the
+            # `windows-x86_64` artifact ships (no second build). mingw is never a
+            # cosmo module source; the hook is only applied on the cosmo path.
+            sanMcW = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
+            wantCosmoModule = multicallCosmo != null && (windowsCosmo || windowsBuild != null);
+            windowsRawHooked = pkgs:
+              if wantCosmoModule
+              then multicallModuleHookCosmo
+                {
+                  package = name;
+                  inherit (multicallCosmo) program programObjs;
+                  appletArchives = multicallCosmo.appletArchives or [ ];
+                  gnulibArchives = multicallCosmo.gnulibArchives or [ ];
+                }
+                (windowsRawBuild pkgs)
+              else windowsRawBuild pkgs;
             # Man source for the windows/cosmo binary. The mingw/cosmo cross
             # build ships no man, so embed the (OS-independent, version-locked)
             # pages from the regular x86_64-linux build of the same attr. Pick
@@ -2554,7 +2762,7 @@ CBODY
             winManGraft =
               let p = winManNixpkgs.${pkgsAttr} or null;
               in if p == null then null else (p.man or p.out or p);
-            windowsBase = dropSharedLibs (applyOptSsp (windowsRawBuild windowsPkgs));
+            windowsBase = dropSharedLibs (applyOptSsp (windowsRawHooked windowsPkgs));
             windowsWithMan =
               # Skip when the consumer's windowsBuild already embedded man via
               # its own withUnpinEmbed call (passthru.unpinEmbedsMan).
@@ -2567,8 +2775,42 @@ CBODY
               } windowsBase;
             # Trim cosmo's unused `.symtab.amd64` (no-op on mingw). Runs after
             # withMan so the man block is already embedded.
-            windowsTrimmed = withCosmoStrip windowsPkgs { primary = binName; } windowsWithMan;
-            windowsPkg = withLicense (strippedOrJoined windowsPkgs name windowsTrimmed);
+            windowsTrimmed0 = withCosmoStrip windowsPkgs { primary = binName; } windowsWithMan;
+            # When a `module` output rides along, force the SAME final strip
+            # selection (`[bin out]`) strippedOrJoined applies on the strip
+            # branch (cosmo ships single-output `out`, so it takes that branch
+            # and keeps `module` untouched — see strippedOrJoined's shipOutputs).
+            # This makes that internal strip override a no-op identical .drv, so
+            # `windowsTrimmed.module` is the very build the shipped binary comes
+            # from — no second cosmo build. Same trick as the linux path.
+            windowsTrimmed =
+              if wantCosmoModule
+              then windowsTrimmed0.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
+              else windowsTrimmed0;
+            windowsPkg0 = withLicense (strippedOrJoined windowsPkgs name windowsTrimmed);
+            # The manifest the mega-builder's cosmoMode consumes. The module
+            # buckets reference the `module` output of the same built drv; the
+            # external `depArchives` are verbatim store paths (passthru reference,
+            # NOT linked into the shipped `windows-x86_64` binary).
+            cosmoMulticallManifest =
+              let entry = "unpin__${sanMcW name}__${sanMcW multicallCosmo.program}_main";
+              in {
+                moduleFormat = "cosmo-elf";
+                moduleObjs = "${windowsTrimmed.module}/objs";
+                appletDir = "${windowsTrimmed.module}/applet";
+                gnulibDir = "${windowsTrimmed.module}/gnulib";
+                depArchives =
+                  let d = multicallCosmo.depArchives or [ ];
+                  in if builtins.isFunction d then d windowsPkgs else d;
+                applets =
+                  [{ name = multicallCosmo.program; inherit entry; }]
+                  ++ map (al: { name = al; inherit entry; }) (multicallCosmo.aliases or [ ]);
+                requires = { cxx = false; } // (multicallCosmo.requires or { });
+              };
+            windowsPkg =
+              if wantCosmoModule
+              then windowsPkg0 // { cosmoMulticallModule = cosmoMulticallManifest; }
+              else windowsPkg0;
 
             # `linuxOnly` drops every Darwin attr from `packages.<sys>` so
             # action-build's auto-discovered matrix doesn't include darwin
