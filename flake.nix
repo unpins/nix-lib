@@ -2692,7 +2692,13 @@ CBODY
             };
             rawBuild = pkgs:
               let
-                useEngine = engine == "unpin-llvm" && pkgs.stdenv.hostPlatform.isLinux;
+                # Native-linux only: a cross build under the engine would run the
+                # target's build tools (coreutils/date) on the build host — fine
+                # for a host-executable target (i686 on x86_64) but "Exec format
+                # error" for a foreign one (ppc64le/riscv64). Cross ships on the
+                # default engine.
+                useEngine = engine == "unpin-llvm" && pkgs.stdenv.hostPlatform.isLinux
+                  && pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
                 engStdenv = if useEngine then engineStdenvFor pkgs else null;
                 enginePkgs = pkgs // {
                   pkgsStatic = pkgs.pkgsStatic // {
@@ -2712,7 +2718,11 @@ CBODY
                 # already compiled (no recompile), riding the same builder as
                 # the shipped binary. No-op when `multicall == null` or off-Linux.
                 sanMc = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
-                wantModule = multicall != null && pkgs.stdenv.hostPlatform.isLinux;
+                # Native-linux only — the bitcode module needs the engine's
+                # -flto objects (cross ships off-engine, plain ELF) and the mega
+                # only folds native modules.
+                wantModule = multicall != null && pkgs.stdenv.hostPlatform.isLinux
+                  && pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
                 # engine = "unpin-llvm" builds with -flto → bitcode objects → the
                 # objcopy redef map can't apply; use the bitcode-LTO emitter
                 # (llvm-link + opt -internalize). engine = "default" (gcc/clang
