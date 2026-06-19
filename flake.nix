@@ -874,12 +874,16 @@
           if !(host.isDarwin or false) then drv
           else drv.overrideAttrs (old: {
             buildInputs = [ pkgs.pkgsStatic.libiconv ] ++ (old.buildInputs or [ ]);
-            NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " -liconv";
             preBuild = (old.preBuild or "")
               + nixpkgs.lib.optionalString cross ''
                 export NIX_LDFLAGS_${buildSalt}="''${NIX_LDFLAGS_${buildSalt}:-} -L${nixpkgs.lib.getLib pkgs.buildPackages.libiconv}/lib"
               '';
-          });
+          # structuredAttrs drvs (coreutils-full) keep NIX_LDFLAGS in `env`;
+          # setting it top-level too is a hard collision. Route to env there,
+          # keep the top-level append everywhere else (byte-identical).
+          } // (if old ? env && old.env ? NIX_LDFLAGS
+                then { env = old.env // { NIX_LDFLAGS = old.env.NIX_LDFLAGS + " -liconv"; }; }
+                else { NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " -liconv"; }));
 
         # Embed a package's multi-call alias list into `$out/bin/<primary>` as a
         # `unpin/aliases` entry of the binary's embedded ZIP, so unpin's
