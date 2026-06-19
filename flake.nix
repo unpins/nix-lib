@@ -2200,7 +2200,11 @@ CBODY
             groupClose = nixpkgs.lib.optionalString needGroup "-Wl,--end-group";
             adapter = unpinAdapterStdenv {
               inherit pkgs toolchain target;
-              native = true;
+              # Cross mega: when pkgs is a cross set the link runs through the
+              # cross stdenv (lld cross-links the per-arch modules); only the
+              # sysroot sanity run is gated off. toolchain stays the build-host
+              # one (buildPlatform.system) — clang -target emits the host arch.
+              native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
               cxx = anyCxx;
               lto = anyBitcode;
             };
@@ -2725,20 +2729,25 @@ CBODY
             engineStdenvFor = pkgs: unpinAdapterStdenv {
               inherit pkgs;
               target = pkgs.pkgsStatic.stdenv.hostPlatform.config;
-              native = true;
+              # `native` only gates the sysroot's sanity RUN (a foreign binary
+              # can't exec on the build host). For a cross pkgs (pkgsCross.*)
+              # the wrapped stdenv stays a REAL cross stdenv — clang just swaps
+              # `-target` — so configure runs in cross mode (AC_RUN_IFELSE off,
+              # build tools are build-host arch); no "exec format error".
+              native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
               cxx = true;
               lto = wantBitcodeModule;
               captureLinks = wantBitcodeModule;
             };
             rawBuild = pkgs:
               let
-                # Native-linux only: a cross build under the engine would run the
-                # target's build tools (coreutils/date) on the build host — fine
-                # for a host-executable target (i686 on x86_64) but "Exec format
-                # error" for a foreign one (ppc64le/riscv64). Cross ships on the
-                # default engine.
-                useEngine = engine == "unpin-llvm" && pkgs.stdenv.hostPlatform.isLinux
-                  && pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
+                # Linux (native OR cross). The one LLVM toolchain cross-emits
+                # every target via `clang -target`; `engineStdenvFor` wraps the
+                # REAL cross stdenv (pkgsCross.*) so configure behaves as a
+                # genuine cross — no qemu, no "exec format error". Only packages
+                # that opt into `engine = "unpin-llvm"` are touched; everything
+                # else keeps gcc cross byte-identical.
+                useEngine = engine == "unpin-llvm" && pkgs.stdenv.hostPlatform.isLinux;
                 engStdenv = if useEngine then engineStdenvFor pkgs else null;
                 enginePkgs = pkgs // {
                   pkgsStatic = pkgs.pkgsStatic // {
@@ -2758,11 +2767,11 @@ CBODY
                 # already compiled (no recompile), riding the same builder as
                 # the shipped binary. No-op when `multicall == null` or off-Linux.
                 sanMc = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
-                # Native-linux only — the bitcode module needs the engine's
-                # -flto objects (cross ships off-engine, plain ELF) and the mega
-                # only folds native modules.
-                wantModule = multicall != null && pkgs.stdenv.hostPlatform.isLinux
-                  && pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
+                # Linux (native OR cross). The bitcode module rides the engine's
+                # -flto objects; with the engine now cross-capable, each cross
+                # arch emits its own module (same triple as the shipped binary)
+                # for the per-arch mega to fold.
+                wantModule = multicall != null && pkgs.stdenv.hostPlatform.isLinux;
                 # engine = "unpin-llvm" builds with -flto → bitcode objects → the
                 # objcopy redef map can't apply; use the bitcode-LTO emitter
                 # (llvm-link + opt -internalize). engine = "default" (gcc/clang
