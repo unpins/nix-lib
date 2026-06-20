@@ -325,8 +325,28 @@
             # find the wrapper and falls back to bare `gcc` → static `-lc`
             # missing. The lenient autoconf majority (coreutils/grep/sed) didn't
             # care, but musl is the correct salt either way.
-            bintools = pkgs.pkgsStatic.wrapBintoolsWith { bintools = bintoolsUnwrapped; libc = null; };
-            cc = pkgs.pkgsStatic.wrapCCWith { inherit bintools; cc = ccUnwrapped; libc = null; extraPackages = [ ]; };
+            # …but `pkgsStatic` also defaults the wrappers' helper EXECUTABLES —
+            # `coreutils` (the `date`/`mktemp` build phases run), `gnugrep` (the
+            # wrapper scripts' grep), and `expand-response-params` (every `ld`
+            # invocation runs `expandResponseParams "$@"`) — to the TARGET static
+            # build. On a CROSS those are FOREIGN binaries; build phases exec
+            # them and get `cannot execute binary file: Exec format error` (seen
+            # in CI for grep/sed/coreutils on ppc64le/riscv64; masked locally
+            # only by a qemu binfmt handler — `date` trips first, but a large
+            # link would trip expand-response-params too). Pin all three to the
+            # build platform on a cross: no foreign helper enters the closure, so
+            # nothing can exec one — a genuine cross, no qemu. Native
+            # (build == host) is left untouched (target == build, runs on the
+            # host) so every published native package stays byte-identical.
+            crossHelpers = nixpkgs.lib.optionalAttrs
+              (pkgs.stdenv.buildPlatform.config != pkgs.stdenv.hostPlatform.config)
+              {
+                coreutils = pkgs.buildPackages.coreutils;
+                gnugrep = pkgs.buildPackages.gnugrep;
+                expand-response-params = pkgs.buildPackages.expand-response-params;
+              };
+            bintools = pkgs.pkgsStatic.wrapBintoolsWith ({ bintools = bintoolsUnwrapped; libc = null; } // crossHelpers);
+            cc = pkgs.pkgsStatic.wrapCCWith ({ inherit bintools; cc = ccUnwrapped; libc = null; extraPackages = [ ]; } // crossHelpers);
             seedHook = pkgs.makeSetupHook
               { name = "unpin-seed-sysroot-cache"; substitutions = { sysrootCache = "${sysroot}/cache"; }; }
               (pkgs.writeText "unpin-seed-sysroot-cache.sh" ''
