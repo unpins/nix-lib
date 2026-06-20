@@ -305,48 +305,83 @@
               EOF
               chmod +x $out/bin/cpp
             '';
+            # Target-PREFIXED tool names (`${target}-ar`, …). nixpkgs' cross
+            # bintools-wrapper sources its tools as `$ldPath/${targetPrefix}ar`
+            # etc., so a genuine cross (which `pkgsStatic.buildPackages.wrap…`
+            # produces — see the wrapper block below) only finds them when they
+            # carry the target prefix. Unprefixed tools left RANLIB empty under a
+            # cross wrapper. The cc-wrapper, by contrast, sources UNPREFIXED
+            # `clang`, so `ccUnwrapped` stays unprefixed.
             bintoolsUnwrapped = pkgs.runCommand "unpin-bintools-unwrapped-${target}"
-              { passthru = { isGNU = true; targetPrefix = ""; }; } ''
+              { passthru = { isGNU = true; targetPrefix = "${target}-"; }; } ''
               mkdir -p $out/bin
               mkt() {
-                cat > "$out/bin/$1" <<EOF
+                cat > "$out/bin/${target}-$1" <<EOF
               #!/bin/sh
               exec ${toolchain}/bin/llvm $2 "\$@"
               EOF
-                chmod +x "$out/bin/$1"
+                chmod +x "$out/bin/${target}-$1"
               }
               mkt ar llvm-ar ; mkt ranlib llvm-ranlib ; mkt nm llvm-nm
               mkt strip llvm-strip ; mkt objcopy llvm-objcopy ; mkt objdump llvm-objdump
               mkt ld ld.lld ; mkt ld.lld ld.lld
             '';
-            # Wrap from pkgsStatic so the wrapper's suffixSalt matches the musl
-            # target. Wrapping from the gnu `pkgs` salts it `…-gnu`, and a
-            # package that honours `--host=…-musl` strictly (bash) then can't
-            # find the wrapper and falls back to bare `gcc` → static `-lc`
-            # missing. The lenient autoconf majority (coreutils/grep/sed) didn't
-            # care, but musl is the correct salt either way.
-            # …but `pkgsStatic` also defaults the wrappers' helper EXECUTABLES —
-            # `coreutils` (the `date`/`mktemp` build phases run), `gnugrep` (the
-            # wrapper scripts' grep), and `expand-response-params` (every `ld`
-            # invocation runs `expandResponseParams "$@"`) — to the TARGET static
-            # build. On a CROSS those are FOREIGN binaries; build phases exec
-            # them and get `cannot execute binary file: Exec format error` (seen
-            # in CI for grep/sed/coreutils on ppc64le/riscv64; masked locally
-            # only by a qemu binfmt handler — `date` trips first, but a large
-            # link would trip expand-response-params too). Pin all three to the
-            # build platform on a cross: no foreign helper enters the closure, so
-            # nothing can exec one — a genuine cross, no qemu. Native
-            # (build == host) is left untouched (target == build, runs on the
-            # host) so every published native package stays byte-identical.
-            crossHelpers = nixpkgs.lib.optionalAttrs
-              (pkgs.stdenv.buildPlatform.config != pkgs.stdenv.hostPlatform.config)
-              {
-                coreutils = pkgs.buildPackages.coreutils;
-                gnugrep = pkgs.buildPackages.gnugrep;
-                expand-response-params = pkgs.buildPackages.expand-response-params;
-              };
-            bintools = pkgs.pkgsStatic.wrapBintoolsWith ({ bintools = bintoolsUnwrapped; libc = null; } // crossHelpers);
-            cc = pkgs.pkgsStatic.wrapCCWith ({ inherit bintools; cc = ccUnwrapped; libc = null; extraPackages = [ ]; } // crossHelpers);
+            # Wrap from `pkgsStatic.buildPackages`, NOT `pkgsStatic` directly —
+            # i.e. build the cc/bintools wrapper exactly the way nixpkgs builds
+            # the wrapper for ANY cross stdenv, instead of enumerating helpers.
+            #
+            # A cc/bintools wrapper is a BUILD-platform derivation: its helper
+            # executables — `coreutils` (`date`/`mktemp` in build phases),
+            # `gnugrep` (the wrapper scripts' grep), `expand-response-params`
+            # (run by every `ld` as `expandResponseParams "$@"`), and any future
+            # ones — run on the build host. But a *spliced* package coerces to
+            # its hostTarget value by default, so `pkgsStatic.wrapCCWith` (the
+            # host/target set) defaults every helper to the static TARGET build.
+            # `pkgsStatic` is itself always a gnu→musl cross, so even the native
+            # case picks up musl-static helpers; on a real cross (ppc64le/
+            # riscv64) they become FOREIGN binaries the build then execs →
+            # `cannot execute binary file: Exec format error` (the grep/sed/
+            # coreutils CI failures; masked locally only by a qemu binfmt
+            # handler). The previous fix enumerated the three helpers and pinned
+            # them to `buildPackages` by hand — a list to maintain as nixpkgs
+            # adds wrapper helpers.
+            #
+            # `pkgsStatic.buildPackages.wrap…With` is the wrapper as a genuine
+            # build-platform derivation: callPackage's splice resolves EVERY
+            # helper to the build platform automatically — no per-tool list, no
+            # foreign binary in the closure, no qemu. This is what nixpkgs' own
+            # cross stdenv does. Two details make it work for our hand-rolled
+            # toolchain: the salt still comes from `targetPlatform.config` = the
+            # musl host (identical to the host-set wrapper, so bash's strict
+            # `--host=…-musl` lookup still resolves), and the wrapper now runs in
+            # genuine cross mode (host=build gnu, target=musl), which sources
+            # PREFIXED bintools — hence `bintoolsUnwrapped`'s `${target}-` names
+            # above. The cc-wrapper sources unprefixed `clang`, so `ccUnwrapped`
+            # stays unprefixed.
+            staticBuild = pkgs.pkgsStatic.buildPackages;
+            # A genuine-cross wrapper names every tool `${target}-…` and emits NO
+            # unprefixed alias (cross tools are prefixed-only). Our single LLVM
+            # driver is target-agnostic, so consumers expect the bare names too:
+            # the stdenv sets `CC=${target}-cc`, but bash pins `CC=${cc}/bin/cc`
+            # by abspath and stray Makefiles call bare `gcc`/`ar`. Re-add an
+            # unprefixed alias for every `${target}-` tool — restoring exactly the
+            # tool set the old native-mode wrapper exposed (bash's CC_FOR_BUILD
+            # pin already disambiguates the bare-`gcc` shadow on a real cross),
+            # without disturbing the build-platform helper splice above.
+            unprefixAliases = ''
+              for f in "$out"/bin/${target}-*; do
+                [ -e "$f" ] || continue
+                b=''${f##*/}; u=''${b#${target}-}
+                [ -e "$out/bin/$u" ] || ln -s "$b" "$out/bin/$u"
+              done
+            '';
+            bintools = staticBuild.wrapBintoolsWith {
+              bintools = bintoolsUnwrapped; libc = null; extraBuildCommands = unprefixAliases;
+            };
+            cc = staticBuild.wrapCCWith {
+              inherit bintools; cc = ccUnwrapped; libc = null; extraPackages = [ ];
+              extraBuildCommands = unprefixAliases;
+            };
             seedHook = pkgs.makeSetupHook
               { name = "unpin-seed-sysroot-cache"; substitutions = { sysrootCache = "${sysroot}/cache"; }; }
               (pkgs.writeText "unpin-seed-sysroot-cache.sh" ''
