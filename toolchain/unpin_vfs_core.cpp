@@ -27,6 +27,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h> // _NSGetExecutablePath — macOS has no /proc/self/exe
+#endif
+
 // The only zstd entry points the reader needs (no-dict, one-shot decode).
 // Forward-declared rather than via <zstd.h> so this TU builds with no extra
 // include path — zig already links libzstd into the binary, so these resolve at
@@ -195,12 +199,28 @@ fail:
     return 0;
 }
 
+// Open our own executable image for mmap. Linux exposes it as /proc/self/exe;
+// macOS has no /proc, so resolve the path via the dyld API. _NSGetExecutablePath
+// may hand back a non-canonical path (unresolved symlinks / ".."), which open()
+// accepts fine — we only need the bytes, not a canonical name.
+int open_self_exe() {
+#ifdef __APPLE__
+    char buf[4096];
+    uint32_t bufsize = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &bufsize) != 0)
+        return -1; // path longer than the buffer — give up (VFS stays disabled)
+    return open(buf, O_RDONLY | O_CLOEXEC);
+#else
+    return open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+#endif
+}
+
 void do_init() {
 #ifdef UNPIN_VFS_TEST_MAIN
     if (g_test_mode)
         return; // the harness already installed an image via test_init_path
 #endif
-    int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+    int fd = open_self_exe();
     if (fd < 0)
         return;
     struct stat st;

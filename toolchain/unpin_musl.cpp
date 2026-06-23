@@ -45,6 +45,11 @@
 #include <unistd.h>
 #include <vector>
 
+#ifdef __APPLE__
+#include <cstdint>
+#include <mach-o/dyld.h> // _NSGetExecutablePath — macOS has no /proc/self/exe
+#endif
+
 using namespace llvm;
 
 namespace {
@@ -119,12 +124,28 @@ bool copyVfsFile(const char *rel, const std::string &dest) {
 }
 
 std::string selfExe() {
+#ifdef __APPLE__
+  // macOS has no /proc/self/exe. Resolve our own image path via the dyld API,
+  // then canonicalize it (the path is used to re-exec self as clang and to
+  // symlink self as ld64.lld, so it must be a real, openable path — not the
+  // Linux magic path). _NSGetExecutablePath can return an un-canonical path
+  // (symlinks/".."); real_path cleans it, with the raw path as a fallback.
+  char buf[4096];
+  uint32_t bufsize = sizeof(buf);
+  if (_NSGetExecutablePath(buf, &bufsize) != 0)
+    return ""; // path > buffer — caller's sysroot/re-exec will fail loudly
+  SmallString<256> Real;
+  if (sys::fs::real_path(buf, Real))
+    return std::string(buf); // real_path errored — raw path is still openable
+  return std::string(Real);
+#else
   // The reader/VFS already proves /proc/self/exe is the binary; reuse it as
   // the re-exec target. Resolve the symlink so a stable path is used.
   SmallString<256> Buf;
   if (sys::fs::real_path("/proc/self/exe", Buf))
     return "/proc/self/exe"; // fall back to the magic path
   return std::string(Buf);
+#endif
 }
 
 std::string cacheBase() {

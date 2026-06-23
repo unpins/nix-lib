@@ -30,6 +30,7 @@
           # platform-independent, so take it from the non-static set.
           monorepoSrc = origPkgs.llvmPackages_21.libllvm.monorepoSrc;
           hostCfg = pkgs.stdenv.hostPlatform.config; # x86_64-unknown-linux-musl
+          isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
 
           # The embedded musl libc tree (M2 payload), sourced reproducibly from
           # the pinned nixpkgs — the same store paths the warm-tree de-risk used:
@@ -380,9 +381,16 @@ static cl::SubCommand LinkSub(LinkSubName, "Link LLVM bitcode/IR modules");' \
             "-DLLVM_TARGETS_TO_BUILD=X86;AArch64;ARM;PowerPC;RISCV"
             "-DLLVM_HOST_TRIPLE=${hostCfg}"
             "-DLLVM_DEFAULT_TARGET_TRIPLE=${hostCfg}"
-            # static-musl (mirrors nixpkgs' isStatic branch)
+          ]
+          # Static link (mirrors nixpkgs' isStatic branch). Skipped on darwin:
+          # there's no static libSystem, and LLVM_BUILD_STATIC=ON appends `-static`,
+          # which ld64 rejects → every link probe fails. Darwin still links
+          # libc++/zlib/zstd from pkgsStatic .a's (only libSystem dynamic), the same
+          # model the catalog darwin megas ship.
+          ++ pkgs.lib.optionals (!isDarwin) [
             "-DLLVM_ENABLE_PIC=OFF"
             "-DLLVM_BUILD_STATIC=ON"
+          ] ++ [
             "-DCMAKE_SKIP_INSTALL_RPATH=ON"
             "-DLLVM_ENABLE_LIBXML2=OFF"
             "-DLLVM_ENABLE_TERMINFO=OFF"
@@ -585,6 +593,6 @@ static cl::SubCommand LinkSub(LinkSubName, "Link LLVM bitcode/IR modules");' \
           meta = {
             description = "LLVM C/C++ suite (clang, lld, llvm-tools) as a single self-contained binary";
             license = origPkgs.lib.licenses.ncsa; # placeholder; real: Apache-2.0 WITH LLVM-exception
-            platforms = origPkgs.lib.platforms.linux;
+            platforms = origPkgs.lib.platforms.linux ++ origPkgs.lib.platforms.darwin;
           };
         }).overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
