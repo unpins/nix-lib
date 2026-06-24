@@ -3195,11 +3195,14 @@ CBODY
                 # already compiled (no recompile), riding the same builder as
                 # the shipped binary. No-op when `multicall == null` or off-Linux.
                 sanMc = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
-                # Linux (native OR cross). The bitcode module rides the engine's
-                # -flto objects; with the engine now cross-capable, each cross
-                # arch emits its own module (same triple as the shipped binary)
-                # for the per-arch mega to fold.
-                wantModule = multicall != null && pkgs.stdenv.hostPlatform.isLinux;
+                # The bitcode module rides the engine's -flto objects. Linux:
+                # always (native or cross). Darwin: only when the package opts
+                # into the darwin mega (multicall.darwin) — the module is then
+                # emitted NATIVELY on a darwin host (default + within-darwin
+                # cross), never cross-built from linux (darwin builds on darwin).
+                wantModule = multicall != null
+                  && (pkgs.stdenv.hostPlatform.isLinux
+                      || (pkgs.stdenv.hostPlatform.isDarwin && (multicall.darwin or false)));
                 # engine = "unpin-llvm" builds with -flto → bitcode objects → the
                 # objcopy redef map can't apply; use the bitcode-LTO emitter
                 # (llvm-link + opt -internalize). engine = "default" (gcc/clang
@@ -3819,16 +3822,6 @@ CBODY
               }
               // nixpkgs.lib.optionalAttrs (windowsEnabled && system == "x86_64-linux") {
                 "windows-x86_64" = windowsPkg;
-              }
-              // nixpkgs.lib.optionalAttrs (wantDarwinModule && system == "x86_64-linux") {
-                # Engine darwin module-carrying builds, cross-compiled on the
-                # x86_64-linux runner (like windows-x86_64) for BOTH darwin arches.
-                # Each carries `passthru.darwinMulticallModule` the unpinbox folds
-                # into a darwin mega. Distinct from the NATIVE per-package darwin
-                # build (`packages.{x86_64,aarch64}-darwin.default`, built on a Mac
-                # runner) — different system key, no collision.
-                "darwin-x86_64" = mkDarwinArch "x86_64-darwin";
-                "darwin-aarch64" = mkDarwinArch "aarch64-darwin";
               });
 
             apps = forAllNative (system:
