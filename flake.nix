@@ -513,10 +513,19 @@
             # one ever appeared — would still win and these never shadow anything).
             # Without them every gnulib-heavy darwin build dies on `'libc.h' not
             # found`. Darwin-only; the shim is empty elsewhere.
+            # ncurses' tinfo/lib_baudrate.c `#include`s <sys/ttydev.h> on __APPLE__
+            # for the small USE_OLD_TTY baud indices; recent apple-sdk dropped that
+            # legacy header. Any ncurses COMPILED in the engine sandbox (readline's
+            # for bash, the embedded-fallback for bc/dash, every tier-1 TUI) dies
+            # 'sys/ttydev.h not found' — the stock SDK build only escapes it via the
+            # cache. Apple's verbatim copy goes in here, not on the ncurses recipe:
+            # it's a sysroot gap (same class as libc.h/nlist.h), so one -idirafter
+            # stub fixes every consumer without re-hashing apple-sdk.
             darwinHeaderStubs = pkgs.runCommand "unpin-darwin-hdr-stubs" { } ''
-              mkdir -p $out/include
+              mkdir -p $out/include/sys
               printf '#ifndef _UNPIN_LIBC_H\n#define _UNPIN_LIBC_H\n#include <unistd.h>\n#include <stdlib.h>\n#endif\n' > $out/include/libc.h
               printf '#ifndef _UNPIN_NLIST_H\n#define _UNPIN_NLIST_H\n#include <mach-o/nlist.h>\n#endif\n' > $out/include/nlist.h
+              cp ${./darwin-ttydev.h} $out/include/sys/ttydev.h
             '';
             darwinStubFlag =
               nixpkgs.lib.optionalString isDarwinTarget " -idirafter ${darwinHeaderStubs}/include";
@@ -1156,12 +1165,7 @@
         # compiled-in `/nix/store/.../share/terminfo` doesn't exist on
         # the user's machine and there's no system convention to fall
         # back on; the only source of truth becomes the baked array.
-        # `--disable-database` makes lib_baudrate.c take the USE_OLD_TTY path on
-        # __APPLE__, which needs <sys/ttydev.h> — dropped by recent apple-sdk.
-        # native-overlay/ncurses.nix restores it (darwin-gated), applied ONLY to
-        # this fallback ncurses: overriding the set-wide ncurses would re-hash
-        # apple-sdk (it embeds ncurses headers) and the whole darwin bootstrap.
-        embedFallbackTerminfoOnly = ncurses: (nativeFixes.ncurses ncurses).overrideAttrs (oa: {
+        embedFallbackTerminfoOnly = ncurses: ncurses.overrideAttrs (oa: {
           postPatch = (oa.postPatch or "") + ''
             cat ${./extra-terminfo.src} >> misc/terminfo.src
           '';
