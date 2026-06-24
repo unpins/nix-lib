@@ -1134,7 +1134,12 @@
         # compiled-in `/nix/store/.../share/terminfo` doesn't exist on
         # the user's machine and there's no system convention to fall
         # back on; the only source of truth becomes the baked array.
-        embedFallbackTerminfoOnly = ncurses: ncurses.overrideAttrs (oa: {
+        # `--disable-database` makes lib_baudrate.c take the USE_OLD_TTY path on
+        # __APPLE__, which needs <sys/ttydev.h> — dropped by recent apple-sdk.
+        # native-overlay/ncurses.nix restores it (darwin-gated), applied ONLY to
+        # this fallback ncurses: overriding the set-wide ncurses would re-hash
+        # apple-sdk (it embeds ncurses headers) and the whole darwin bootstrap.
+        embedFallbackTerminfoOnly = ncurses: (nativeFixes.ncurses ncurses).overrideAttrs (oa: {
           postPatch = (oa.postPatch or "") + ''
             cat ${./extra-terminfo.src} >> misc/terminfo.src
           '';
@@ -3046,17 +3051,26 @@ CBODY
             # to rewire yet. Darwin/cross fall back to stock pkgs. LTO already
             # includes function/data-sections + --gc-sections, so it subsumes
             # gc; when both are set, lto wins and gc is a no-op.
+            # Plain nixpkgs import. Darwin dep fixes (e.g. ncurses) are NOT wired
+            # here as `overlays` — an overlay on the nixpkgs IMPORT joins the
+            # stdenv-bootstrap fixpoint and re-hashes the whole darwin base
+            # closure (a fresh bootstrap LLVM, uncached → full rebuild). A fix
+            # needed only by a leaf wrapper goes there instead — e.g. the ncurses
+            # <sys/ttydev.h> fix rides inside `embedFallbackTerminfoOnly`, scoped
+            # to the fallback ncurses so the set-wide ncurses (and apple-sdk,
+            # which embeds its headers) stay byte-identical and cached.
+            importNixpkgs = system: import nixpkgs { inherit system; };
             nixpkgsFor = forAllNative (system:
               # unpin-llvm replaces the whole stdenv (overrideCC), so the gc/lto
               # overlays — which rewrite the nixpkgs cc-wrapper stdenv — would be
               # silent no-ops under it. Use plain nixpkgs to avoid the wasted eval
               # and the false impression they're active.
-              if engine == "unpin-llvm" then import nixpkgs { inherit system; }
+              if engine == "unpin-llvm" then importNixpkgs system
               else if lto && isLinuxSys system
               then mkPkgsLTO { inherit system; opt = ltoOpt; inherit ssp; pkgName = pkgsAttr; }
               else if gc && isLinuxSys system
               then mkPkgsGC { inherit system ssp opt; pkgName = pkgsAttr; }
-              else import nixpkgs { inherit system; });
+              else importNixpkgs system);
 
             # Apply opt/ssp knobs to a built drv. No-op when both at
             # default (opt = null + ssp = true) so cache.nixos.org hits
