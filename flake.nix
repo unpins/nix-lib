@@ -1249,6 +1249,40 @@
                 then { env = old.env // { NIX_LDFLAGS = old.env.NIX_LDFLAGS + " -liconv"; }; }
                 else { NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " -liconv"; }));
 
+        # Build a darwin package against the packaged macOS SDK instead of the
+        # engine's minimal embedded sysroot, for platform code that needs real SDK
+        # headers/frameworks the on-demand sysroot doesn't carry (htop: net/*,
+        # mach/*, IOKit, CoreFoundation; future tier-1 TUIs likewise). The engine
+        # cc is plain clang, so `-isysroot <sdk>` (headers) + `-F <sdk>/…/Frameworks`
+        # (framework search) is all it takes — the package's own build adds the
+        # matching `-framework` flags. CRUCIAL: `-isysroot` rides the COMPILE only;
+        # at the LINK it would override the engine's own libSystem sysroot and break
+        # it ("C compiler cannot create executables"), so the link gets just `-F`.
+        # The resulting binary links the named frameworks + libSystem (allowed by
+        # the darwin allow-list), not libSystem-only. No-op off darwin.
+        withDarwinSdk = pkgs: drv:
+          if !(pkgs.stdenv.hostPlatform.isDarwin or false) then drv
+          else
+            let
+              sdk = pkgs.apple-sdk.sdkroot;
+              cflags = " -isysroot ${sdk}";
+              ldflags = " -F ${sdk}/System/Library/Frameworks";
+            in
+            drv.overrideAttrs (old:
+              # structuredAttrs drvs keep NIX_* in `env`; setting them top-level too
+              # is a hard collision (see withDarwinIconv). Route to env there.
+              if old ? env && (old.env ? NIX_CFLAGS_COMPILE || old.env ? NIX_LDFLAGS)
+              then {
+                env = old.env // {
+                  NIX_CFLAGS_COMPILE = (old.env.NIX_CFLAGS_COMPILE or "") + cflags;
+                  NIX_LDFLAGS = (old.env.NIX_LDFLAGS or "") + ldflags;
+                };
+              }
+              else {
+                NIX_CFLAGS_COMPILE = (old.NIX_CFLAGS_COMPILE or "") + cflags;
+                NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + ldflags;
+              });
+
         # Embed a package's multi-call alias list into `$out/bin/<primary>` as a
         # `unpin/aliases` entry of the binary's embedded ZIP, so unpin's
         # installer can spawn argv[0]-dispatch links (xz → xzcat/unxz/lzma…) at
