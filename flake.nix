@@ -520,6 +520,21 @@
             '';
             darwinStubFlag =
               nixpkgs.lib.optionalString isDarwinTarget " -idirafter ${darwinHeaderStubs}/include";
+            # macOS folds libm/libpthread/libdl/librt/libutil/libresolv into
+            # libSystem; a real SDK ships them as reexport stubs so `-lm` &c.
+            # resolve. The engine's minimal sysroot has only libSystem.tbd, so a
+            # package whose configure adds `-lm` (file's libmagic) fails to link
+            # IN THE SANDBOX (no host SDK to fall back on). Empty archives on the
+            # search path fix it: `-lm` finds libm.a, pulls no objects, and the
+            # math symbols resolve from libSystem. An empty ar archive is exactly
+            # the 8-byte `!<arch>\n` header (zero members), so write it directly —
+            # no `ar` in the bare runCommand stdenv, and it's arch-independent.
+            darwinStubLibs = pkgs.runCommand "unpin-darwin-stub-libs" { } ''
+              mkdir -p $out/lib
+              for L in m pthread dl rt util resolv; do
+                printf '!<arch>\n' > $out/lib/lib$L.a
+              done
+            '';
             winImportLibs = pkgs.runCommand "unpin-win-implibs-${target}" { } ''
               mkdir -p $out/lib
               for L in bcrypt ws2_32 userenv secur32 crypt32 shlwapi; do
@@ -556,6 +571,13 @@
                 # file's own LIBS, but the mega-link only knows depArchives, so add
                 # it here too (no-op for packages that don't reference it).
                 echo "-lbcrypt -lws2_32 -luserenv -lsecur32 -lcrypt32 -lshlwapi" >> $out/nix-support/cc-ldflags
+              ''
+              + nixpkgs.lib.optionalString isDarwinTarget ''
+                # Empty libm/libpthread/… on the search path so a package's own
+                # `-lm` (file) resolves in the sandbox; symbols come from
+                # libSystem. Just the -L (available), NOT force-linked — packages
+                # that reference none are unaffected. See darwinStubLibs.
+                echo "-L${darwinStubLibs}/lib" >> $out/nix-support/cc-ldflags
               '';
             bintools = staticBuild.wrapBintoolsWith ({
               bintools = bintoolsUnwrapped; libc = null; extraBuildCommands = unprefixAliases;
