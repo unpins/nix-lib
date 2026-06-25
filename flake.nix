@@ -1615,7 +1615,7 @@ CBODY
           , programs                # [ { name; objs = [ "src/x.o" ]; } ]
           , internalArchives ? [ ]  # builddir-relative private .a (gnulib, bitcode)
           , llvm                    # "${toolchain}/bin/llvm" (has llvm-link + opt)
-          , inferLinkInputs ? false # read objs + local .a from the capture sidecar
+          , inferLinkInputs ? true  # read objs + local .a from the capture sidecar
                                     # ($UNPIN_LINK_DIR/<prog>.link) instead of the
                                     # hand-listed objs/internalArchives
           , stripDllexport ? false  # mingw: strip __declspec(dllexport) before
@@ -2758,7 +2758,7 @@ CBODY
                       package = name;
                       inherit (multicall) programs;
                       internalArchives = multicall.internalArchives or [ ];
-                      inferLinkInputs = multicall.inferLinkInputs or false;
+                      inferLinkInputs = multicall.inferLinkInputs or true;
                       llvm = "${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm";
                     }
                     (rawBuild pkgs)
@@ -3008,7 +3008,7 @@ CBODY
                   package = name;
                   inherit (multicall) programs;
                   internalArchives = multicall.internalArchives or [ ];
-                  inferLinkInputs = multicall.inferLinkInputs or false;
+                  inferLinkInputs = multicall.inferLinkInputs or true;
                   llvm = "${unpinToolchain windowsPkgs.stdenv.buildPlatform.system}/bin/llvm";
                   # mingw API is __declspec(dllexport); strip so internalize folds
                   # the module to one external (see hook's stripStep).
