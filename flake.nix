@@ -2741,13 +2741,13 @@ CBODY
                 # already compiled (no recompile), riding the same builder as
                 # the shipped binary. No-op when `multicall == null` or off-Linux.
                 sanMc = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
-                # The bitcode module rides the engine's -flto objects. Linux:
-                # always. Darwin: only when the package opts into the darwin mega
-                # (multicall.darwin), emitted NATIVELY on a darwin host (never
-                # cross-built from linux).
+                # The bitcode module rides the engine's -flto objects. Linux and
+                # darwin both default-on (the darwin standalone already builds
+                # regardless); a package sets multicall.darwin = false to opt out.
+                # Emitted NATIVELY on a darwin host, never cross-built from linux.
                 wantModule = multicall != null
                   && (pkgs.stdenv.hostPlatform.isLinux
-                      || (pkgs.stdenv.hostPlatform.isDarwin && (multicall.darwin or false)));
+                      || (pkgs.stdenv.hostPlatform.isDarwin && (multicall.darwin or true)));
                 # engine = "unpin-llvm" → bitcode objects → use the bitcode-LTO
                 # emitter (llvm-link + opt -internalize); "default" keeps objcopy.
                 useBitcodeModule = wantModule && engine == "unpin-llvm";
