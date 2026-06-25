@@ -1,28 +1,19 @@
-# pkgsStatic.srt: swap OpenSSL → mbedtls (`-DUSE_ENCLIB=mbedtls`).
-# Why mbedtls not OpenSSL: see docs/crypto-backend.md. Four fixes:
+# pkgsStatic.srt: swap OpenSSL → mbedtls (rationale: docs/crypto-backend.md).
+# Four fixes:
 #
-# 1. `buildInputs`: filter openssl, add mbedtls. Filter rather than
-#    replace so platform additions survive (mingw-overlay adds
-#    `windows.pthreads`).
+# 1. `buildInputs`: filter openssl, add mbedtls. Filter (not replace) so
+#    platform additions survive (mingw-overlay adds `windows.pthreads`).
 #
-# 2. `propagatedBuildInputs`: same filter+add. pkgsStatic auto-
-#    promotes upstream `buildInputs` into propagated, so openssl
-#    survives there too unless we handle both.
+# 2. `propagatedBuildInputs`: same — pkgsStatic auto-promotes `buildInputs`
+#    into propagated, so openssl survives there too.
 #
-# 3. cmakeFlags: `-DUSE_ENCLIB=mbedtls -DENABLE_APPS=OFF`. The
-#    latter skips srt-live-transmit/srt-file-transmit/srt-tunnel
-#    CLI binaries that ffmpeg doesn't consume.
+# 3. cmakeFlags: `-DENABLE_APPS=OFF` skips CLI binaries ffmpeg doesn't use.
 #
-# 4. `srt.pc Libs.private` sed: srt's CMake bakes absolute
-#    `/nix/store/.../lib{mbedtls,stdc++}.a` paths. ffmpeg's
-#    `check_pkg_config` (and any `pkg-config --static` consumer)
-#    routes absolute-path args to ldflags — *before* the test
-#    object — where `-Wl,--as-needed` drops them (nothing references
-#    them yet); then `-lsrt` pulls unresolvable mbedtls / libstdc++
-#    (srt is C++) refs. Rewrite both to `-l` form so the cc-wrapper
-#    appends them at the tail, after the object. libstdc++ only
-#    surfaced on aarch64 — x86_64's libsrt.a happened to need fewer
-#    of these C++ symbols — but the `-l` form is correct everywhere.
+# 4. `Libs.private` sed: CMake bakes absolute `lib{mbedtls,stdc++}.a` paths;
+#    `pkg-config --static` consumers route absolute args to ldflags *before*
+#    the test object where `--as-needed` drops them → unresolvable refs.
+#    Rewrite to `-l` form so cc-wrapper appends at the tail. (libstdc++ only
+#    surfaced on aarch64, but `-l` is correct everywhere.)
 { lib }:
 pkgs:
 let

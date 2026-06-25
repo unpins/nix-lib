@@ -1,71 +1,47 @@
-# pkgsStatic.librsvg, three cross-platform fixes:
+# pkgsStatic.librsvg, cross-platform fixes:
 #
-# 1. `+ libunwind` (non-mingw). librsvg's meson runs
-#    `rustc --print=native-static-libs` which emits `-lunwind` for
-#    musl targets, then calls `cc.find_library('unwind', static: true)`.
-#    Dynamic builds resolve `_Unwind_*` via libgcc_s at runtime —
-#    pkgsStatic forces the static probe. GCC libunwind 1.8.x suffices.
-#    On mingw, Rust uses SEH and libunwind doesn't build (POSIX
-#    ucontext.h); the mingw-overlay handles that path separately.
+# 1. `+ libunwind` (non-mingw). librsvg's meson probes
+#    `cc.find_library('unwind', static)` because rustc reports `-lunwind` for
+#    musl; pkgsStatic forces the static probe (dynamic resolves via libgcc_s).
+#    On mingw Rust uses SEH and libunwind doesn't build (POSIX ucontext.h);
+#    the mingw-overlay handles that separately.
 #
-# 2. Propagate pango. librsvg-2.0.pc declares
-#    `Requires.private: pangocairo`; consumers using
-#    `pkg-config --static librsvg-2.0` (ffmpeg) abort with
-#    "Package 'pangocairo' not found" without it. See
+# 2. Propagate pango. librsvg-2.0.pc's `Requires.private: pangocairo` else
+#    `pkg-config --static librsvg-2.0` (ffmpeg) aborts. See
 #    [[requires-private-static-cross]].
 #
-# 3. `__clear_cache` (non-x86 Linux). rustc links the `rsvg-convert` bin
-#    with `-nodefaultlibs`, pulling only `compiler_builtins` — which has no
-#    `__clear_cache` on the non-x86 ISAs. libffi's executable closures
-#    (`ffi_prep_closure_loc`) and pcre2's JIT (`sljit`), both C objects
-#    dragged in via glib, reference it, so the link fails. Append `-lgcc`
-#    to the cargo target rustflags; it lands after the rlib group, so the
-#    archive resolves the pending refs. x86 never trips this
-#    (`__clear_cache` is a no-op there).
+# 3. `__clear_cache` (non-x86 Linux). rustc links rsvg-convert with
+#    `-nodefaultlibs`, so only compiler_builtins — which lacks `__clear_cache`
+#    on non-x86 ISAs — is available, but libffi closures and pcre2's JIT
+#    (via glib) reference it. Append `-lgcc` to the cargo rustflags; it lands
+#    after the rlib group and resolves the refs. No-op on x86.
 #
-# 3b. `-lshell32` (mingw). nixos-26.05's glib 2.88.1 grew win32 shell
-#    integration in gio (gwin32appinfo.c / gwin32mount.c /
-#    gwin32notificationbackend.c / glocalfile.c), whose objects are archived
-#    into librsvg's rlib and reference shell32 APIs (`SHFileOperationW`,
-#    `CommandLineToArgvW`, `SHGetKnownFolderPath`, `Shell_NotifyIconW`,
-#    `SHGetDesktopFolder`, `SHBindToParent`, `SHParseDisplayName`,
-#    `SHCreateShellItemArrayFromIDLists`). gio-2.0.pc's Libs.private never
-#    listed `-lshell32`, so the rsvg-convert link dies with `undefined
-#    reference to __imp_SH*`. Same rustflags channel as #3 — append
-#    `-lshell32` to the cargo link. See [[feedback_mingw_libs_private_winapis]].
+# 3b. `-lshell32` (mingw). glib 2.88.1's win32 gio objects (archived into
+#    librsvg's rlib) reference shell32 APIs (`SHFileOperationW`,
+#    `CommandLineToArgvW`, …) that gio-2.0.pc's Libs.private never listed, so
+#    the link dies on `__imp_SH*`. Same rustflags channel as #3. See
+#    [[feedback_mingw_libs_private_winapis]].
 #
-# 4. doCheck restricted to x86_64-linux. nixpkgs gates librsvg's test suite
-#    on `!isDarwin && !isi686`, so it still runs on aarch64/riscv64/armv7l.
-#    There the doctest link hits the same `__clear_cache` gap (rustdoc reads
-#    RUSTDOCFLAGS, which the fix #3 rustflags sed doesn't reach) and the
-#    suite wants a fontconfig runtime the sandbox lacks. The tests exercise
-#    upstream librsvg, not our static repackage, so keep them only on the
-#    one arch where they pass clean.
+# 4. doCheck restricted to x86_64-linux. nixpkgs runs the suite on
+#    aarch64/riscv64/armv7l too, where the doctest link hits the same
+#    `__clear_cache` gap (rustdoc reads RUSTDOCFLAGS, which #3's sed misses)
+#    and wants a fontconfig runtime the sandbox lacks. The tests exercise
+#    upstream librsvg, not our repackage.
 #
-# 5. `gcc_s` static shim (riscv64). Unlike other musl targets (which report
-#    `unwind`, satisfied by fix #1), rustc's `--print=native-static-libs`
-#    reports `gcc_s` on riscv64-musl, and meson.build:374 probes
-#    `cc.find_library('gcc_s', static)`. Static musl ships no `libgcc_s.a`
-#    (that's the shared unwinder); the static `_Unwind_*` live in
-#    `libgcc_eh.a`. Symlink `libgcc_s.a -> libgcc_eh.a` onto the link path so
-#    both the meson probe and the final rustc link resolve.
+# 5. `gcc_s` static shim (riscv64). rustc reports `gcc_s` (not `unwind`) on
+#    riscv64-musl, so meson.build:374 probes `cc.find_library('gcc_s')`.
+#    Static musl ships no libgcc_s.a (the static `_Unwind_*` live in
+#    libgcc_eh.a), so symlink `libgcc_s.a -> libgcc_eh.a` onto the link path.
 #
 # 6. Strip the over-reported unwinder lib from librsvg-2.0.pc Libs.private
-#    (ppc64le + riscv64). rustc's `--print=native-static-libs` appends an
-#    unwinder that a static-musl `--static` consumer (ffmpeg) can't satisfy:
-#      - ppc64le: `-lunwind`. Linking libunwind.a pulls its ppc64 unwinder
-#        (`_Unwind_Backtrace`/`Resume`/`RaiseException`), which calls
-#        `getcontext`/`setcontext` — musl never implemented ucontext for
-#        powerpc64, so the link dies on undefined `getcontext`. (With
-#        `-Wl,--export-dynamic`, DCE can't drop those objects.)
-#      - riscv64: `-lgcc_s` (fix #5's territory). Static musl ships no
-#        `libgcc_s.a` (it's the shared unwinder), so the consumer link
-#        fails with `cannot find -lgcc_s`.
-#    librsvg.a itself only needs `_Unwind_Resume`, a standard symbol
-#    libgcc_eh provides (pulled implicitly by the cc static link), so
-#    dropping either token is safe — consumers still resolve the unwind
-#    refs. x86 musl ships ucontext and isn't affected; gate to the two
-#    arches that over-report. Each sed is a no-op when its token is absent.
+#    (ppc64le + riscv64). rustc appends an unwinder a static-musl `--static`
+#    consumer (ffmpeg) can't satisfy:
+#      - ppc64le: `-lunwind` pulls libunwind's ppc64 unwinder, which calls
+#        `getcontext`/`setcontext` — musl has no ucontext for powerpc64.
+#      - riscv64: `-lgcc_s`, which static musl doesn't ship (see #5).
+#    librsvg.a itself only needs `_Unwind_Resume` (libgcc_eh provides it,
+#    pulled by the cc static link), so dropping either token is safe. x86 musl
+#    has ucontext and isn't affected. Each sed is a no-op when absent.
 { lib }:
 pkgs:
 let

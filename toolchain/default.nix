@@ -2,22 +2,10 @@
 # as ONE self-contained static-musl multicall binary, with an on-demand,
 # variant-aware musl/libc++ sysroot embedded as an in-binary VFS.
 #
-# VENDORED INTO nix-lib (was playground/llvm, its own flake). It folds in with
-# ZERO new flake inputs: the LLVM monorepo source is
-# `origPkgs.llvmPackages_21.libllvm.monorepoSrc` (from nixpkgs, already nix-lib's
-# only input); the recipe (unpin_*.cpp/.h, *_sources.inc, cxx_config_site*.h) is
-# committed alongside this file; the VFS packer is nix-lib's own
-# `lib.unpinPackTool` (the old `unpins-lib` self-reference — a circular dep — is
-# gone). So the toolchain is VERSIONED TOGETHER with nix-lib: its LLVM tracks
-# nix-lib's nixpkgs pin and the recipe rides in the same commit.
-#
-# The build BODY below is verbatim from the playground flake's `build = origPkgs:`
-# (byte-identical .drv ⇒ reuses the already-built/validated catalog output). The
-# only deltas: (1) it's a function of {origPkgs, unpinPackTool} instead of using
-# mkStandaloneFlake; (2) the inline packer is `unpinPackTool origPkgs`; (3) the
-# final mkDerivation is wrapped in the `stripAllList = [bin out]` overrideAttrs
-# that mkStandaloneFlake's strippedOrJoined is the sole thing it would add to a
-# single-`out` build (license/description/meta carry-overs aren't in the hash).
+# Versioned together with nix-lib (zero new flake inputs): LLVM monorepo source
+# is `origPkgs.llvmPackages_21.libllvm.monorepoSrc`, the recipe (unpin_*.cpp/.h,
+# *_sources.inc, cxx_config_site*.h) is committed alongside this file, and the
+# VFS packer is nix-lib's own `lib.unpinPackTool`.
 #
 # Build LOCALLY only (static LLVM 21 is a >120 G / multi-hour uncached build).
 # Lazy: nothing forces this unless a consumer calls `lib.mkUnpinStdenv`.
@@ -26,37 +14,27 @@
           pkgs = origPkgs.pkgsStatic;
           version = "21.1.8";
           major = pkgs.lib.versions.major version; # "21"
-          # Full unpruned llvm-project tree (clang + lld + llvm + …). Source is
-          # platform-independent, so take it from the non-static set.
+          # Platform-independent source, so take it from the non-static set.
           monorepoSrc = origPkgs.llvmPackages_21.libllvm.monorepoSrc;
           hostCfg = pkgs.stdenv.hostPlatform.config; # x86_64-unknown-linux-musl
           isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
 
-          # The embedded musl libc tree (M2 payload), sourced reproducibly from
-          # the pinned nixpkgs — the same store paths the warm-tree de-risk used:
+          # The embedded musl libc tree (M2 payload):
           #   * zig 0.16's lib/libc = the GENERATED per-arch musl headers
           #     (alltypes.h/syscall.h/version.h in include/<triple>) + the Linux
-          #     kernel UAPI headers (<karch>-linux-any/any-linux-any) — the hard-
-          #     to-regenerate parts. zig is otherwise a recipe reference only.
-          #   * M4 C++ runtime (libc++/libc++abi/libunwind) + the llvm-libc shim
-          #     come from the monorepo (version-matched); zig is the recipe only.
+          #     kernel UAPI headers — the hard-to-regenerate parts.
           #   * upstream musl 1.2.5 tarball = the COMPLETE committed musl tree
           #     (src/arch/crt/include/compat), overlaid UPSTREAM-WINS below so the
           #     on-demand libc is full (malloc/thread/… not just printf-class).
-          # Ship-time will re-sync to PURE upstream musl + generated headers; for
-          # the de-risk this zig-headers + upstream-sources tree is what the gate
-          # was proven against. buildLibc selects by replicating musl's Makefile.
+          # buildLibc selects by replicating musl's Makefile.
           zigLibc = "${origPkgs.zig_0_16.src}/lib/libc";
           muslTar = origPkgs.musl.src;
 
-          # Recipe/version stamp baked into the binary as UNPIN_CACHE_TAG and
-          # folded into the on-demand cache key (Variant in unpin_musl.cpp). It
-          # must change whenever anything that affects the built libc/libc++/
-          # builtins changes, so a new binary never reuses an old cached library
-          # — the "version-safe" property zig gets by digesting source content
-          # into its Cache.Manifest. We hash the recipe (driver + .inc files +
-          # config_site) plus the embedded source store paths (which encode
-          # their own content hashes), at recipe granularity.
+          # Recipe/version stamp baked in as UNPIN_CACHE_TAG and folded into the
+          # on-demand cache key (Variant in unpin_musl.cpp). Must change whenever
+          # anything affecting the built libc/libc++/builtins changes, so a new
+          # binary never reuses a stale cached library — hence hashing the recipe
+          # plus the embedded source store paths.
           cacheTag = builtins.substring 0 16 (builtins.hashString "sha256"
             (builtins.concatStringsSep ":" [
               version
@@ -73,9 +51,9 @@
               (toString muslTar)
             ]));
 
-          # Build-host-native packer (zstd-in-zip, ZIP method 93): nix-lib's own
-          # `lib.unpinPackTool`. Build-only; never linked in. Driven DIRECTLY (no
-          # dict) because our in-binary reader is one-shot ZSTD_decompress.
+          # Build-host-native packer (zstd-in-zip, ZIP method 93). Build-only;
+          # never linked in. Driven DIRECTLY (no dict) because our in-binary
+          # reader is one-shot ZSTD_decompress.
           packTool = unpinPackTool origPkgs;
         in
         (pkgs.stdenv.mkDerivation {
@@ -84,12 +62,8 @@
           src = monorepoSrc;
           sourceRoot = "${monorepoSrc.name}/llvm";
 
-          # M1: unpins in-binary VFS — clang half. Ported onto upstream
-          # clang/tools/driver from the zig spike (same LLVM 21.1.8). The 4
-          # sources are byte-identical to the validated zig versions (both the
-          # NUL-terminator and remove_dots gotchas already baked in); quoted
-          # #includes resolve because all four sit together in that dir. cwd here
-          # is the `llvm` sourceRoot, so clang is the sibling `../clang`.
+          # M1: unpins in-binary VFS — clang half. cwd is the `llvm` sourceRoot,
+          # so clang is the sibling `../clang`.
           postPatch = ''
             # Only the `llvm` sourceRoot is unpacked writable; the sibling
             # clang/ subtree keeps read-only store perms. Make the driver dir
@@ -363,9 +337,8 @@ static cl::SubCommand LinkSub(LinkSubName, "Link LLVM bitcode/IR modules");' \
             origPkgs.buildPackages.ninja
             origPkgs.buildPackages.python3
           ];
-          # Static deps only. zstd is needed at final link for the VFS reader in
-          # M1; harmless to link now. No libxml2 (static-link breakage upstream),
-          # no ncurses (terminfo off → keeps the closure clean), no libffi.
+          # Static deps only. zstd is needed at final link for the M1 VFS reader.
+          # No libxml2 (static-link breakage upstream), no ncurses, no libffi.
           buildInputs = [ pkgs.zlib pkgs.zstd ];
 
           cmakeBuildType = "Release";
@@ -375,18 +348,15 @@ static cl::SubCommand LinkSub(LinkSubName, "Link LLVM bitcode/IR modules");' \
             "-DLLVM_ENABLE_PROJECTS=clang;lld"
             "-DLLVM_TOOL_LLVM_DRIVER_BUILD=ON"
             # All catalog backends: X86 (x86_64+i686), AArch64, ARM (armv7l),
-            # PowerPC (ppc64le), RISCV (riscv64). The on-demand sysroot recipe
-            # (unpin_musl.cpp) + embedded header/UAPI sets below cover the matching
-            # musl triples.
+            # PowerPC (ppc64le), RISCV (riscv64).
             "-DLLVM_TARGETS_TO_BUILD=X86;AArch64;ARM;PowerPC;RISCV"
             "-DLLVM_HOST_TRIPLE=${hostCfg}"
             "-DLLVM_DEFAULT_TARGET_TRIPLE=${hostCfg}"
           ]
           # Static link (mirrors nixpkgs' isStatic branch). Skipped on darwin:
-          # there's no static libSystem, and LLVM_BUILD_STATIC=ON appends `-static`,
-          # which ld64 rejects → every link probe fails. Darwin still links
-          # libc++/zlib/zstd from pkgsStatic .a's (only libSystem dynamic), the same
-          # model the catalog darwin megas ship.
+          # no static libSystem, and LLVM_BUILD_STATIC=ON appends `-static` which
+          # ld64 rejects → every link probe fails. Darwin still links
+          # libc++/zlib/zstd from pkgsStatic .a's (only libSystem dynamic).
           ++ pkgs.lib.optionals (!isDarwin) [
             "-DLLVM_ENABLE_PIC=OFF"
             "-DLLVM_BUILD_STATIC=ON"
@@ -412,20 +382,17 @@ static cl::SubCommand LinkSub(LinkSubName, "Link LLVM bitcode/IR modules");' \
 
           hardeningDisable = [ "trivialautovarinit" "shadowstack" ];
 
-          # Build ONLY the multicall driver (`llvm-driver`, output binary `llvm`,
-          # with clang+lld+llvm tools folded in via GENERATE_DRIVER) plus the
-          # clang builtin/resource headers. The default `all` target also builds
-          # peripheral clang tools (c-index-test, clang-repl, …) that need a
-          # shared libclang — which doesn't exist in a PIC=OFF static build, so
-          # `all` fails at `-llibclang_static`. We ship none of them anyway.
+          # Build ONLY the multicall driver + clang resource headers. The default
+          # `all` target also builds peripheral clang tools needing a shared
+          # libclang, which doesn't exist in a PIC=OFF static build → `all` fails
+          # at `-llibclang_static`; we ship none of them anyway.
           ninjaFlags = [ "llvm-driver" "clang-resource-headers" ];
 
-          # The real driver binary is `bin/llvm` (dispatches on argv[0]); see the
-          # binName note above for why the on-disk name MUST stay `llvm`. The
+          # The driver binary is `bin/llvm` (dispatches on argv[0]). The
           # clang/clang++/ld.lld/llvm-* faces are embedded as `unpin/aliases` ZIP
-          # entries (NOT materialized in $out/bin — unpin recreates them as
-          # argv[0] symlinks at install). The resource dir stays on disk here;
-          # postFixup embeds it into the VFS and then deletes it.
+          # entries, not materialized in $out/bin — unpin recreates them as
+          # argv[0] symlinks at install. The resource dir stays on disk here;
+          # postFixup embeds it into the VFS and deletes it.
           installPhase = ''
             runHook preInstall
             mkdir -p "$out/bin" "$out/lib"
@@ -434,18 +401,13 @@ static cl::SubCommand LinkSub(LinkSubName, "Link LLVM bitcode/IR modules");' \
             runHook postInstall
           '';
 
-          # postFixup runs at the END of fixupPhase — AFTER stdenv strip
-          # (mkStandaloneFlake forces stripAllList), so the archive we append
-          # survives strip. Order: (1) nuke-refs the plain ELF (rewrites store
-          # hashes in place, same length); (2) stage the embedded tree — M1
-          # clang resource headers + M2 musl sources/headers + `unpin/aliases`;
-          # (3) pack it ALL into the binary's single EOF ZIP via one
-          # unpin-vfs-pack (NO --dict — see unpinPackTool note; --deflate for
-          # `unpin/aliases` so pre-zstd alias readers still decode it); (4) drop
-          # the on-disk resource dir so the in-binary VFS is the only source.
-          # Served paths: VROOT/clang-resource/include/… and VROOT/libc/… (VROOT
-          # = /__unpin_ziglib__); the M2 front adds `-resource-dir
-          # VROOT/clang-resource` and -I's into VROOT/libc/… .
+          # postFixup runs AFTER stdenv strip, so the ZIP we append survives.
+          # (1) nuke-refs the ELF (in place, same length); (2) stage the embedded
+          # tree (M1 resource headers + M2 musl + `unpin/aliases`); (3) pack it
+          # into the binary's single EOF ZIP (NO --dict; --deflate for
+          # `unpin/aliases` so pre-zstd readers decode it); (4) drop the on-disk
+          # resource dir so the VFS is the only source. VROOT = /__unpin_ziglib__;
+          # the M2 front adds -resource-dir VROOT/clang-resource and -I VROOT/libc.
           postFixup = ''
             chmod +w "$out/bin/llvm"
             ${origPkgs.buildPackages.nukeReferences}/bin/nuke-refs "$out/bin/llvm"

@@ -1,27 +1,20 @@
 # libvpx cross-mingw, four fixes:
 #
-# 1. `examplesSupport = false` override. ffmpeg consumes only
-#    libvpx.a, so the CLI examples (`vpxenc`, `vpxdec`) are dead
-#    weight here — disabling them keeps the lib build lean and lets
-#    us drop the `bin` output (otherwise fixupPhase errors on the
-#    empty `bin/`). (They DO link on mingw; `unpins/libvpx`
-#    re-enables them and folds the C++ webm/libyuv runtime static
-#    for a single .exe.)
+# 1. `examplesSupport = false`. ffmpeg consumes only libvpx.a, so the
+#    CLI examples are dead weight; dropping them also avoids the empty
+#    `bin/` fixupPhase error. (They DO link on mingw — `unpins/libvpx`
+#    re-enables them for a single .exe.)
 #
-# 2. Rewrite `--target=` configureFlag. nixpkgs derives the libvpx
-#    target as `<cpu>-${kernel.name}-gcc` = `x86_64-windows-gcc`,
-#    which libvpx's `all_platforms` doesn't recognise. The valid
-#    name is `x86_64-win64-gcc`. Also drop `--enable-shared`.
+# 2. Rewrite `--target=`. nixpkgs derives `x86_64-windows-gcc`, which
+#    libvpx's `all_platforms` doesn't recognise; valid is
+#    `x86_64-win64-gcc`. Also drop `--enable-shared`.
 #
-# 3. `export CROSS=<triple>-`. libvpx's configure resolves the
-#    target to bare `gcc`/`ld`/`ar` and prepends `${CROSS}`. Without
-#    CROSS, configure runs the BUILD-platform gcc and the link
-#    probe fails ("Toolchain is unable to link executables" — the
-#    build-gcc can't emit COFF for win64).
+# 3. `export CROSS=<triple>-`. configure prepends `${CROSS}` to bare
+#    `gcc`/`ld`/`ar`; without it, the BUILD gcc runs and the link
+#    probe fails (can't emit COFF for win64).
 #
-# 4. `+ windows.pthreads`. Upstream nixpkgs hard-codes
-#    `NIX_LDFLAGS = [ "-lpthread" ]` to placate the configure link
-#    probe; on mingw, winpthreads provides `libpthread.a`.
+# 4. `+ windows.pthreads`. nixpkgs hard-codes `NIX_LDFLAGS=-lpthread`
+#    for the configure probe; on mingw winpthreads provides it.
 { lib }:
 self: super:
 (super.libvpx.override {

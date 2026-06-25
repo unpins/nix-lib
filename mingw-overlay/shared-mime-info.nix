@@ -1,15 +1,9 @@
-# shared-mime-info on mingw: `src/meson.build` builds two test
-# executables — `test-subclassing` and `tree-magic` (declared
-# `install: false`, only consumed by `meson test`). Both link
-# `libintl.a` from gettext which needs `libiconv_open`/`libiconv`
-# from libiconv; nixpkgs' libiconv setup-hook fails to inject
-# `-liconv` here (libiconv only reaches us as a transitive
-# propagated input via glib), and setting `NIX_LDFLAGS += -liconv`
-# explicitly doesn't survive meson's link recipe either. Since
-# these binaries aren't installed and we run no tests, rewrite
-# `src/meson.build` to keep only the installed binary
-# (`update-mime-database.exe`, which links clean because
-# gettext's setup-hook injects `-lintl` for it).
+# shared-mime-info on mingw: `src/meson.build`'s two test executables
+# (`install: false`) link `libintl.a`, which needs `-liconv` that
+# neither the libiconv setup-hook nor explicit `NIX_LDFLAGS` injects
+# into meson's link recipe here. The tests aren't installed and we run
+# none, so rewrite `src/meson.build` to keep only update-mime-database
+# (which links clean — gettext's hook injects `-lintl` for it).
 { lib }:
 self: super:
 super.shared-mime-info.overrideAttrs (old: {

@@ -1,17 +1,7 @@
-# gdk-pixbuf on mingw: drop `makeWrapper` from nativeBuildInputs.
-#
-# nixpkgs' `makeShellWrapper` setup-hook resolves
-# `substitutions.shell = targetPackages.runtimeShell` eagerly at
-# eval time. When cross-building gdk-pixbuf for mingw, that pulls
-# bash-x86_64-w64-mingw32, which doesn't build cleanly (bash 5.3
-# config.h emits `#define uid_t int / gid_t int / clock_t long`
-# that conflict with mingw <sys/types.h>).
-#
-# Per gdk-pixbuf upstream's own comment, `gdk-pixbuf-thumbnailer is
-# not wrapped` — i.e. the only reason makeWrapper is in the inputs
-# at all is dead weight on cross-mingw. Drop it; nothing in the
-# final install gets a wrapper anyway, and our consumer
-# (`pkgsStatic.librsvg`) only needs the .pc + .a + headers.
+# gdk-pixbuf on mingw: drop `makeWrapper`. Its setup-hook eagerly resolves
+# `targetPackages.runtimeShell`, pulling bash-x86_64-w64-mingw32 which
+# doesn't build (config.h `uid_t`/`gid_t`/`clock_t` clash with mingw
+# <sys/types.h>). Nothing here gets wrapped anyway.
 { lib }:
 self: super:
 super.gdk-pixbuf.overrideAttrs (old: {

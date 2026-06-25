@@ -1,6 +1,4 @@
-# Cosmopolitan toolchain wiring.
-#
-# Migrated from the (now retired) cosmocc/ flake repo. Exposes:
+# Cosmopolitan toolchain wiring. Exposes:
 #   - cosmocc                : raw $out from cosmocc.zip
 #   - cosmoStdenv            : native stdenv with cc-wrapper around cosmocc
 #   - cosmoCCUnwrapped       : single-arch cc dir w/ shims (gcc/cc/g++/c++/cpp)
@@ -8,10 +6,7 @@
 #   - platformBits           : apelink -V <bits> per OS
 #   - mkCrossWiring          : helpers for pkgsCross.cosmo (cross-stdenv injection)
 #
-# `pkgs` is the build-side nixpkgs (linux-gnu). Consumers either use cosmoStdenv
-# directly (existing playground/{bash,coreutils,dash,links}) or feed mkCrossWiring
-# into config.replaceCrossStdenv (the path mkStandaloneFlake's `windowsPkgs` uses
-# to expose `pkgs.pkgsCross.cosmo`).
+# `pkgs` is the build-side nixpkgs (linux-gnu).
 { pkgs }:
 
 let
@@ -19,18 +14,17 @@ let
 
   version = "4.0.2";
 
-  # Upstream mmap.c at the cosmocc tag we ship — fetched separately so we
-  # can patch it without bundling 38 KB of cosmopolitan source in our repo.
-  # The patch fixes the wine hang where cosmo's pickaddr loops forever on
-  # STATUS_CONFLICTING_ADDRESSES; see cosmocc-wine-fix/.
+  # Upstream mmap.c, fetched separately so we can patch it without bundling
+  # cosmo source. Patch fixes the wine hang where cosmo's pickaddr loops
+  # forever on STATUS_CONFLICTING_ADDRESSES; see cosmocc-wine-fix/.
   cosmoMmapSrc = pkgs.fetchurl {
     url = "https://raw.githubusercontent.com/jart/cosmopolitan/${version}/libc/intrin/mmap.c";
     hash = "sha256-xHsnD5UZCwpmPOtgWklpbXzDCFY2aVaY0YUkpTpb54k=";
   };
 
-  # Upstream third_party/tz sources at the same tag. localtime.c gets the
-  # Windows system-timezone fix (see cosmocc-tz-fix/); the four headers are
-  # its quoted includes, which cosmocc.zip doesn't ship.
+  # Upstream third_party/tz sources. localtime.c gets the Windows
+  # system-timezone fix (see cosmocc-tz-fix/); the headers are its quoted
+  # includes, which cosmocc.zip doesn't ship.
   cosmoTzSrcs = builtins.mapAttrs
     (name: hash: pkgs.fetchurl {
       url = "https://raw.githubusercontent.com/jart/cosmopolitan/${version}/third_party/tz/${name}";
@@ -141,13 +135,10 @@ let
     else throw "cosmocc.nix: unsupported arch ${name}";
   hostArch = resolveArch pkgs.stdenv.hostPlatform.parsed.cpu.name;
 
-  # See docs/platforms/cosmocc.md "Toolchain wiring" traps for the why behind:
-  # - single-arch driver ($COSMOS env honoured)
-  # - shell shims (cosmocross arch-prefix check, APE bintools ENOEXEC)
-  #
-  # Parameterized by `archPrefix` so cross-arch wiring (e.g. x86_64-linux
-  # build host targeting aarch64-cosmo) can synthesize the right driver.
-  # The native `cosmoStdenv` below always uses `hostArch`.
+  # See docs/platforms/cosmocc.md "Toolchain wiring" traps for the why behind
+  # the single-arch driver and shell shims. Parameterized by `archPrefix` so
+  # cross-arch wiring can synthesize the right driver; native `cosmoStdenv`
+  # uses `hostArch`.
   mkCcUnwrapped = archPrefix: pkgs.runCommand "cosmocc-cc-${version}-${archPrefix}-unwrapped"
     {
       passthru = {
@@ -249,19 +240,12 @@ let
     }
     (pkgs.overrideCC pkgs.stdenv cosmoCC);
 
-  # Helpers used by config.replaceCrossStdenv (from windowsPkgs) to swap the
-  # cross-stdenv's compiler/bintools for the cosmocc ones, preserving the
-  # cross target prefix that the nixpkgs-generated wrappers already carry.
-  #
-  # The cosmocc bin/ ships unprefixed tools (gcc, ar, ld, …) plus the real
-  # binaries (x86_64-unknown-cosmo-cc, x86_64-linux-cosmo-ar, …). nixpkgs's
-  # cc-wrapper looks for `${ccPath}/${targetPrefix}gcc` and bintools-wrapper
-  # likewise — so we synthesize the target-prefixed names as symlinks back
-  # to the shims we already built.
-  #
-  # `targetArch` defaults to the build host's arch (cross-arch within cosmo
-  # is unusual: the cosmocc zip ships both x86_64 and aarch64 single-arch
-  # drivers, but emitting the wrong one for the target produces broken APEs).
+  # Helpers used by config.replaceCrossStdenv to swap the cross-stdenv's
+  # compiler/bintools for the cosmocc ones, preserving the cross target prefix.
+  # cosmocc bin/ ships unprefixed tools, but the wrappers look for
+  # `${ccPath}/${targetPrefix}gcc` — so synthesize target-prefixed symlinks
+  # back to the shims. `targetArch` defaults to the build host's arch (emitting
+  # the wrong single-arch driver for the target produces broken APEs).
   mkCrossWiring =
     { buildPackages
     , baseStdenv
@@ -314,20 +298,17 @@ let
       libc = null;
     };
 
-    # Setup hook that teaches every autotools package's config.sub about
-    # `cosmo-gnu`. Lives at build time inside the host package's source
-    # tree — no `gnu-config` derivation override, so xgcc/bootstrap stay
-    # cached. See ../cosmo-config-sub-hook.sh for the patch shape.
+    # Teaches every autotools package's config.sub about `cosmo-gnu` at build
+    # time, inside the host package's source tree — no `gnu-config` override,
+    # so xgcc/bootstrap stay cached. See ../cosmo-config-sub-hook.sh.
     configSubHook = buildPackages.makeSetupHook
       { name = "cosmo-config-sub-hook"; }
       ./cosmo-config-sub-hook.sh;
 
-    # Setup hook that auto-apelinks every cosmocc-emitted ELF in
-    # $out/bin to PE32+ `<name>.exe`. Runs in preFixupHooks so consumer
-    # postFixup + lib.withAliases UNPIN_META embed operate on the
-    # final `.exe`. Fail-loud: stripped binaries break the build
-    # (apelink needs .symtab) with a fix recipe in the error. See
-    # ../cosmo-apelink-hook.sh for the full contract.
+    # Auto-apelinks every cosmocc-emitted ELF in $out/bin to PE32+
+    # `<name>.exe`. Runs in preFixupHooks so consumer postFixup +
+    # lib.withAliases operate on the final `.exe`. Fail-loud on stripped
+    # binaries (apelink needs .symtab). See ../cosmo-apelink-hook.sh.
     apelinkHook = buildPackages.makeSetupHook
       {
         name = "cosmo-apelink-hook";
@@ -345,11 +326,9 @@ let
           extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ])
             ++ [ configSubHook apelinkHook ];
         });
-        # cosmocc is static-only (no .so). makeStaticLibraries injects
-        # `--disable-shared`/`--enable-static` (+ cmake/meson equivalents)
-        # into every mkDerivation. Applied here means it only affects the
-        # host-side cosmo stdenv — buildPackages stay glibc with default
-        # shared behaviour, no bootstrap cascade.
+        # cosmocc is static-only (no .so). Applying makeStaticLibraries here
+        # (not lower) keeps it on the host-side cosmo stdenv only —
+        # buildPackages stay glibc, no bootstrap cascade.
         staticified = buildPackages.stdenvAdapters.makeStaticLibraries withHook;
       in
       buildPackages.stdenvAdapters.addAttrsToDerivation

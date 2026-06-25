@@ -1,11 +1,8 @@
-# libcap's sole nativeBuildInput is `go`, pulled only to build its optional
-# Go bindings (the `GOLANG` knob); the static C library (libcap.a/libpsx.a)
-# never ships them. Left in, go is dead weight — and under the unpin engine cc
-# it actively breaks: go's cgo self-build introspects the object format it gets
-# back, but `-flto` hands it bitcode, so `go tool dist` dies with `cgo: cannot
-# parse gcc output as ELF`. go is unique among build tools here (the rest link
-# to runnable ELF and tolerate the engine). Strip the go input and pin
-# GOLANG=no so the engine link closure (coreutils → libcap) never builds it.
+# Drop libcap's `go` nativeBuildInput (only feeds the optional Go bindings,
+# unused by the static C lib). Under the unpin engine cc it actively breaks:
+# `-flto` hands go's cgo self-build bitcode and `go tool dist` dies with
+# `cgo: cannot parse gcc output as ELF`. Also pin GOLANG=no so the engine
+# link closure never rebuilds it.
 { lib }:
 scope:
 scope.libcap.overrideAttrs (oa: {

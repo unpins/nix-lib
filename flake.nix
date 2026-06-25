@@ -24,34 +24,22 @@
         isLinuxSys = system: nixpkgs.lib.hasSuffix "-linux" system;
         isDarwinSys = system: nixpkgs.lib.hasSuffix "-darwin" system;
 
-        # =================================================================
         # unpin-stdenv (route A): a bespoke stdenv over the standalone
-        # `unpin-llvm` multicall toolchain — clang/lld + an on-demand,
-        # variant-aware musl/libc++ sysroot, no nixpkgs cc-wrapper. Lifted
-        # verbatim from the playground spike (playground/unpin-stdenv).
+        # `unpin-llvm` multicall toolchain (clang/lld + an on-demand,
+        # variant-aware musl/libc++ sysroot, no nixpkgs cc-wrapper).
         #
-        # The `toolchain` derivation (the `unpin-llvm` package exposing
-        # `bin/llvm`) is passed in by the CONSUMER, NOT taken as a nix-lib
-        # flake input: nix-lib is fetched as `github:unpins/nix-lib`, and
-        # `unpin-llvm` is not yet published, so a hard input here would make
-        # nix-lib unresolvable for the whole catalog. Parameterising it keeps
-        # nix-lib's closure {nixpkgs} only — every catalog package that does
-        # NOT call these functions is completely unaffected. A consumer wires
-        # `inputs.unpinLlvm` itself and passes
-        # `toolchain = unpinLlvm.packages.<system>.default`.
+        # The `toolchain` derivation is passed in by the CONSUMER, not taken as a
+        # nix-lib flake input: `unpin-llvm` isn't published yet, so a hard input
+        # would make nix-lib unresolvable for the whole catalog. Parameterising
+        # keeps nix-lib's closure {nixpkgs} only.
         #
-        # § keystone: a pre-baked, read-only sysroot per target. Linking (not
-        # -c) triggers the on-demand build of libc/CRTs (and, when `cxx`,
-        # libc++/libc++abi/libunwind); the resulting RO store-path is the
-        # lock/write-free cache for every package built against this target.
-        # Bake BOTH the non-PIC and PIC variant of each half: the cache is
-        # variant-aware (-fPIC ⇒ a distinct entry), and many build systems
-        # force -fPIC into CFLAGS even for a static target (zlib's configure:
-        # `CFLAGS="${CFLAGS--O3} -fPIC"`). Without the PIC variant pre-baked,
-        # such a build misses the RO sysroot, the toolchain tries to populate
-        # the read-only store cache, the link fails, and configure silently
-        # mis-detects. `native` gates the sanity run (cross can't run on the
-        # builder); `cxx` gates the C++ half.
+        # unpinSysroot bakes a read-only per-target sysroot; linking (not -c)
+        # triggers the on-demand build of libc/CRTs (and libc++ when `cxx`). Bake
+        # BOTH non-PIC and PIC variants: the cache is variant-aware and many build
+        # systems force -fPIC even for a static target (zlib's configure does).
+        # Without the PIC variant pre-baked the link fails writing the RO store
+        # cache and configure silently mis-detects. `native` gates the sanity run
+        # (cross can't exec on the builder); `cxx` the C++ half.
         unpinSysroot = { pkgs, toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system, triple, optClass ? "-O2", native ? false, cxx ? false }:
           pkgs.runCommand "unpin-sysroot-${triple}" { } ''
             export HOME=$TMPDIR
@@ -72,42 +60,30 @@
               | sed "s|$out/cache/unpin-llvm/||"
           '';
 
-        # § unpinToolchain: the vendored `unpin-llvm` build (nix-lib/toolchain),
-        # built from nix-lib's OWN pinned nixpkgs for the given build system — so
-        # the toolchain's LLVM version is locked together with nix-lib (the
-        # "versioned together" property). Lazy: only forced when a consumer calls
-        # mkUnpinStdenv. Used as the default `toolchain` below so consumers don't
-        # have to wire `unpin-llvm` themselves.
-        # origPkgs replicates exactly what mkStandaloneFlake's `nixpkgsFor` hands a
-        # package's `build` under the catalog defaults (optimize.gc = true,
-        # ssp = true, opt = null) — i.e. the gc-sections overlay scoped to the
-        # `llvm` package's chain. The toolchain build pulls pkgsStatic.{zlib,zstd}
-        # (which are in that scope) as buildInputs, so this is what makes the
-        # vendored toolchain byte-identical to the catalog `unpin-llvm` it was
-        # validated as (same .drv → same already-built output, no rebuild).
+        # The vendored `unpin-llvm` build, from nix-lib's OWN pinned nixpkgs, so
+        # the toolchain's LLVM version is locked together with nix-lib. Lazy.
+        # `origPkgs` replicates the gc-sections-overlay scope mkStandaloneFlake's
+        # `nixpkgsFor` hands the `llvm` package under catalog defaults, so the
+        # vendored toolchain is byte-identical to the catalog `unpin-llvm` it was
+        # validated as (same .drv, no rebuild) — the toolchain pulls those scoped
+        # pkgsStatic.{zlib,zstd} as buildInputs.
         unpinToolchain = system:
           import ./toolchain {
             origPkgs = mkPkgsGC { inherit system; ssp = true; opt = null; pkgName = "llvm"; };
             inherit unpinPackTool;
           };
 
-        # § mkUnpinStdenv (route A: bespoke, no cc-wrapper). Wrappers inject
-        # -target/optClass/-flto after "$@"; the setup-hook exports
-        # CC/CXX/AR/… + XDG_CACHE_HOME pointing at the RO sysroot. Returns
-        # `{ sysroot, unpinCC, cc, mkDerivation }` where mkDerivation is
-        # stdenvNoCC + this toolchain.
+        # mkUnpinStdenv (route A: bespoke, no cc-wrapper). Returns
+        # `{ sysroot, unpinCC, cc, mkDerivation }` (mkDerivation = stdenvNoCC +
+        # this toolchain).
         #
-        # stackSize: musl's default THREAD stack is 128 KB (it reads the ELF
-        # PT_GNU_STACK memsz); glibc's is 8 MB. Software developed on glibc
-        # routinely assumes that — a 137 KB single stack frame in ffmpeg's
-        # ffv1 encoder, deep recursion, large on-stack buffers in a pthread.
-        # So we bake the glibc-parity 8 MB as the DEFAULT for every package:
-        # it's address-space only (lazily paged → no RAM cost), invisible to
-        # thread-free packages, and kills a whole class of glibc→musl porting
-        # crashes. Override per package via `stackSize` (null/false disables).
-        # The flag is link-only: a guard strips it from compile-only calls
-        # (-c/-S/-E/-M) so a configure probe under -Werror doesn't read the
-        # clang -Wunused-command-line-argument as "flag unsupported".
+        # stackSize: musl's default THREAD stack is 128 KB vs glibc's 8 MB, and
+        # glibc-developed software assumes the latter (a 137 KB stack frame in
+        # ffmpeg's ffv1 encoder, deep recursion). Bake glibc-parity 8 MB as the
+        # default: address-space only (lazily paged, no RAM cost), invisible to
+        # thread-free packages. Link-only: a guard strips it from compile-only
+        # calls (-c/-S/-E/-M) so a -Werror configure probe doesn't read clang's
+        # -Wunused-command-line-argument as "flag unsupported".
         mkUnpinStdenv =
           { pkgs, toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
           , target, lto ? "full", optClass ? "-O2"
@@ -164,40 +140,32 @@
             });
           };
 
-        # § unpinAdapterStdenv (route B: a drop-in nixpkgs stdenv over unpin-llvm).
-        # Where mkUnpinStdenv (route A) demands a hand-written recipe (CC/CXX +
-        # configure+make, like the playground mkLz4/mkJq), this wraps the same
-        # `llvm` toolchain in a real nixpkgs cc-wrapper so an UNMODIFIED nixpkgs
-        # recipe builds through it: `pkgs.pkgsStatic.<name>.override { stdenv =
-        # unpinAdapterStdenv {...}; }`. Modelled on cosmocc.nix's stdenv wiring.
+        # unpinAdapterStdenv (route B: a drop-in nixpkgs stdenv over unpin-llvm).
+        # Wraps the same `llvm` toolchain in a real nixpkgs cc-wrapper so an
+        # UNMODIFIED nixpkgs recipe builds through it:
+        # `pkgs.pkgsStatic.<name>.override { stdenv = unpinAdapterStdenv {...}; }`.
+        # Modelled on cosmocc.nix's stdenv wiring.
         #
-        # Three things make it work (each a trap learned the hard way):
-        #  1. passthru.isGNU = true (NOT isClang) on the unwrapped cc — otherwise
-        #     the nixpkgs clang wrapper injects `--gcc-toolchain=…` + gcc -B/-L,
-        #     poisoning clang's self-contained VFS sysroot. isGNU + libc = null
-        #     (in both wrapCCWith and wrapBintoolsWith) keeps the wrapper from
-        #     adding ANY libc/gcc-for-libs flags: unpin-llvm brings its own
-        #     compiler-rt/libc++/musl. Same trick cosmocc uses.
+        # Three things make it work:
+        #  1. passthru.isGNU = true (NOT isClang) + libc = null on the unwrapped
+        #     cc — otherwise the clang wrapper injects `--gcc-toolchain=` + gcc
+        #     -B/-L, poisoning clang's self-contained VFS sysroot. unpin-llvm
+        #     brings its own compiler-rt/libc++/musl. Same trick cosmocc uses.
         #  2. The shims append ${optClass} after "$@" (route-A parity) so every
         #     invocation hits the SAME on-demand sysroot variant the seed warms.
-        #  3. A WRITABLE, build-local XDG_CACHE_HOME seeded from the RO pre-baked
-        #     sysroot. unpin-llvm's sysroot is keyed by a per-flag variant hash;
-        #     a generic recipe uses flag combos the RO bake didn't cover, and
-        #     writing into the /nix/store RO path fails ("mkdir … failed" → link
-        #     silently falls back to a broken dynamic musl). The seed makes known
-        #     variants hit warm; any new variant builds on demand in the copy.
+        #  3. A writable, build-local XDG_CACHE_HOME seeded from the RO sysroot.
+        #     unpin-llvm's sysroot is keyed by a per-flag variant hash; a generic
+        #     recipe uses flag combos the bake didn't cover, and writing into the
+        #     RO store path fails → link silently falls back to a broken dynamic
+        #     musl. The copy lets new variants build on demand.
         #
-        # lto: when true, the cc/c++ shims also append `-flto`, so every object
-        # the recipe compiles is LLVM BITCODE (not ELF). This is the prerequisite
-        # for the bitcode-LTO multicall module emitter (multicallModuleHookLTO):
-        # llvm-link/opt operate on bitcode, and a whole-program-LTO mega-link
-        # folds the modules. Off by default (the engine's normal path stays -O2
-        # ELF, which the objcopy-based multicallModuleHook needs). -flto is safe
-        # on both compile and link; the cpp (-E) shim deliberately omits it
-        # (clang warns "argument unused" under -E, which a -Werror configure
-        # probe would read as unsupported). Mixing bitcode app objects with the
-        # ELF musl libc.a from the RO sysroot is the standard LTO-app/non-LTO-libc
-        # case — clang LTO-compiles the bitcode, then links libc.a normally.
+        # lto: the cc/c++ shims append `-flto` so every object is LLVM BITCODE,
+        # the prerequisite for the bitcode-LTO module emitter
+        # (multicallModuleHookLTO). Off by default (the normal path is -O2 ELF,
+        # which the objcopy-based multicallModuleHook needs). The cpp (-E) shim
+        # omits it (clang warns "argument unused" under -E, which a -Werror probe
+        # reads as unsupported). Bitcode app objs + ELF musl libc.a is the
+        # standard LTO-app/non-LTO-libc case.
         unpinAdapterStdenv =
           { pkgs, toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
           , target, optClass ? "-O2", cxx ? true, native ? false, lto ? false
@@ -216,33 +184,23 @@
           let
             sysroot = unpinSysroot { inherit pkgs toolchain; triple = target; inherit optClass native cxx; };
             ltoArg = if lto then " -flto" else "";
-            # Windows: fortify (`-D_FORTIFY_SOURCE=2`) leaks in two ways — the
-            # nixpkgs cc-wrapper's hardening (the engine's hardeningDisable=all
-            # doesn't propagate through the mingw makeStaticLibraries wrap) AND
-            # gnulib's own config.h, which self-enables it under `-O` via
-            # `#if !defined _FORTIFY_SOURCE`. The engine's mingw CRT carries none of
-            # the `__*_chk` shims (mingwex's are absent), so any known-size
-            # memcpy/strcpy fails to link (`undefined symbol __memcpy_chk`). `-U`
-            # doesn't work — it leaves the macro UNDEFINED, so gnulib's
-            # `#if !defined` re-enables it. `-D_FORTIFY_SOURCE=0` (appended AFTER
-            # "$@", so it wins over the wrapper's `=2`) leaves it DEFINED → gnulib's
-            # guard is false → fortify stays off. Per-target shim, so Linux shims
-            # stay byte-identical (empty).
+            # Windows: force fortify off. The engine's mingw CRT has none of the
+            # `__*_chk` shims, so any known-size memcpy/strcpy fails to link. `-U`
+            # doesn't work (gnulib's config.h `#if !defined _FORTIFY_SOURCE`
+            # re-enables it); `-D_FORTIFY_SOURCE=0` (appended after "$@", wins over
+            # the wrapper's `=2`) leaves it DEFINED so gnulib's guard stays false.
+            # Empty on Linux.
             winFortifyOff = nixpkgs.lib.optionalString isWinTarget " -D_FORTIFY_SOURCE=0";
-            # darwin: use the packaged macOS SDK on every build. The engine clang
-            # honours SDKROOT as `-isysroot` and its darwin front (frontRewriteDarwin)
-            # then links against the SDK's libSystem + System/Library/Frameworks
-            # (CoreFoundation/IOKit/… resolve) instead of the minimal embedded
-            # sysroot — that minimal sysroot existed only for the linux→darwin cross,
-            # which the native-darwin turn removed. The SDK is a BUILD-time dep
-            # (cached); shipped binaries stay 0-ref since libSystem/frameworks are
-            # system paths. DEVELOPER_DIR is cleared so the engine never shells out to
-            # xcrun (it reads SDKROOT directly). Empty on non-darwin (shim is shared).
+            # darwin: feed the packaged macOS SDK via SDKROOT (the engine clang
+            # honours it as `-isysroot`, then links the SDK's libSystem +
+            # Frameworks). BUILD-time dep, cached; shipped binaries stay 0-ref
+            # since libSystem/frameworks are system paths. DEVELOPER_DIR cleared
+            # so the engine never shells out to xcrun. Empty on non-darwin.
             darwinEnvSetup = nixpkgs.lib.optionalString isDarwinTarget
               "export SDKROOT=${pkgs.apple-sdk.sdkroot}; unset DEVELOPER_DIR; ";
             # Records each executable link to a per-output sidecar (objs + .a,
             # split local vs /nix/store) — the source the multicall hook reads
-            # back for a program's objs/internalArchives. Inputs are resolved to
+            # back for a program's objs/internalArchives. Inputs resolved to
             # absolute paths so the sidecar stays valid in the later postBuild.
             captureScript = ''
               #!/bin/sh
@@ -385,13 +343,11 @@
               EOF
               chmod +x $out/bin/cpp
             '';
-            # Target-PREFIXED tool names (`${target}-ar`, …). nixpkgs' cross
-            # bintools-wrapper sources its tools as `$ldPath/${targetPrefix}ar`
-            # etc., so a genuine cross (which `pkgsStatic.buildPackages.wrap…`
-            # produces — see the wrapper block below) only finds them when they
-            # carry the target prefix. Unprefixed tools left RANLIB empty under a
-            # cross wrapper. The cc-wrapper, by contrast, sources UNPREFIXED
-            # `clang`, so `ccUnwrapped` stays unprefixed.
+            # Target-PREFIXED tool names (`${target}-ar`, …): nixpkgs' cross
+            # bintools-wrapper sources tools as `$ldPath/${targetPrefix}ar`, so a
+            # genuine cross only finds them when prefixed (unprefixed left RANLIB
+            # empty). The cc-wrapper sources unprefixed `clang`, so `ccUnwrapped`
+            # stays unprefixed.
             bintoolsUnwrapped = pkgs.runCommand "unpin-bintools-unwrapped-${target}"
               { passthru = { isGNU = true; targetPrefix = "${target}-"; }; } ''
               mkdir -p $out/bin
@@ -426,48 +382,24 @@
                 mkt lipo lipo ; mkt otool otool ; mkt dsymutil dsymutil
               ''}
             '';
-            # Wrap from `pkgsStatic.buildPackages`, NOT `pkgsStatic` directly —
-            # i.e. build the cc/bintools wrapper exactly the way nixpkgs builds
-            # the wrapper for ANY cross stdenv, instead of enumerating helpers.
-            #
-            # A cc/bintools wrapper is a BUILD-platform derivation: its helper
-            # executables — `coreutils` (`date`/`mktemp` in build phases),
-            # `gnugrep` (the wrapper scripts' grep), `expand-response-params`
-            # (run by every `ld` as `expandResponseParams "$@"`), and any future
-            # ones — run on the build host. But a *spliced* package coerces to
-            # its hostTarget value by default, so `pkgsStatic.wrapCCWith` (the
-            # host/target set) defaults every helper to the static TARGET build.
-            # `pkgsStatic` is itself always a gnu→musl cross, so even the native
-            # case picks up musl-static helpers; on a real cross (ppc64le/
-            # riscv64) they become FOREIGN binaries the build then execs →
-            # `cannot execute binary file: Exec format error` (the grep/sed/
-            # coreutils CI failures; masked locally only by a qemu binfmt
-            # handler). The previous fix enumerated the three helpers and pinned
-            # them to `buildPackages` by hand — a list to maintain as nixpkgs
-            # adds wrapper helpers.
-            #
-            # `pkgsStatic.buildPackages.wrap…With` is the wrapper as a genuine
-            # build-platform derivation: callPackage's splice resolves EVERY
-            # helper to the build platform automatically — no per-tool list, no
-            # foreign binary in the closure, no qemu. This is what nixpkgs' own
-            # cross stdenv does. Two details make it work for our hand-rolled
-            # toolchain: the salt still comes from `targetPlatform.config` = the
-            # musl host (identical to the host-set wrapper, so bash's strict
-            # `--host=…-musl` lookup still resolves), and the wrapper now runs in
-            # genuine cross mode (host=build gnu, target=musl), which sources
-            # PREFIXED bintools — hence `bintoolsUnwrapped`'s `${target}-` names
-            # above. The cc-wrapper sources unprefixed `clang`, so `ccUnwrapped`
-            # stays unprefixed.
+            # Wrap from `pkgsStatic.buildPackages`, not `pkgsStatic` directly:
+            # build the cc/bintools wrapper the way nixpkgs builds it for ANY
+            # cross stdenv. The wrapper is a build-platform derivation, but a
+            # spliced package coerces to its hostTarget, so `pkgsStatic.wrapCCWith`
+            # defaults every helper (coreutils, gnugrep, expand-response-params) to
+            # the static TARGET build — FOREIGN binaries on a real cross →
+            # `Exec format error` (the grep/sed/coreutils CI failures, masked
+            # locally by qemu). `pkgsStatic.buildPackages.wrap…With` resolves every
+            # helper to the build platform via callPackage's splice — no per-tool
+            # list, no qemu. The salt still comes from `targetPlatform.config` (the
+            # musl host, so bash's `--host=…-musl` lookup resolves) and the wrapper
+            # runs genuine cross mode, sourcing PREFIXED bintools — hence
+            # `bintoolsUnwrapped`'s `${target}-` names.
             staticBuild = hostPkgs.buildPackages;
-            # A genuine-cross wrapper names every tool `${target}-…` and emits NO
-            # unprefixed alias (cross tools are prefixed-only). Our single LLVM
-            # driver is target-agnostic, so consumers expect the bare names too:
-            # the stdenv sets `CC=${target}-cc`, but bash pins `CC=${cc}/bin/cc`
-            # by abspath and stray Makefiles call bare `gcc`/`ar`. Re-add an
-            # unprefixed alias for every `${target}-` tool — restoring exactly the
-            # tool set the old native-mode wrapper exposed (bash's CC_FOR_BUILD
-            # pin already disambiguates the bare-`gcc` shadow on a real cross),
-            # without disturbing the build-platform helper splice above.
+            # A genuine-cross wrapper names tools `${target}-…` only. Our single
+            # LLVM driver is target-agnostic and consumers expect bare names too
+            # (stray Makefiles call bare `gcc`/`ar`), so re-add an unprefixed alias
+            # for each `${target}-` tool — without disturbing the helper splice.
             unprefixAliases = ''
               for f in "$out"/bin/${target}-*; do
                 [ -e "$f" ] || continue
@@ -475,49 +407,31 @@
                 [ -e "$out/bin/$u" ] || ln -s "$b" "$out/bin/$u"
               done
             '';
-            # Windows targets: the engine resolves the default CRT import libs
-            # (kernel32/advapi32/…) from its embedded VFS, but EXTRA `-l<dll>` libs
-            # (bcrypt, ws2_32, …) are synthesized in-memory from VFS .def files — and
-            # that synthesis FAILS inside the nix build sandbox (only the default set
-            # is baked to disk; an explicit `-lbcrypt` then errors "unable to find
-            # library"). nixpkgs' mingw-w64 ships these as REAL, ABI-neutral import
-            # stubs (the gcc cross uses them); a program that links them through the
-            # engine produces a valid PE32+ (verified). Curate ONLY the extra libs
-            # into a dir on the link search path — NOT kernel32/CRT, so the engine's
-            # own startup objects are never shadowed. Extend alongside winWarmLibs.
+            # Windows: the engine resolves default CRT import libs from its VFS,
+            # but EXTRA `-l<dll>` libs (bcrypt, ws2_32) are synthesized in-memory
+            # from VFS .def files and that synthesis FAILS in the build sandbox
+            # ("unable to find library"). nixpkgs' mingw-w64 ships them as real
+            # ABI-neutral import stubs; curate ONLY the extras into a link-path dir
+            # — NOT kernel32/CRT, so the engine's startup objects aren't shadowed.
             isWinTarget =
               nixpkgs.lib.hasInfix "windows" target || nixpkgs.lib.hasInfix "mingw" target;
-            # darwin (Mach-O) target: arm64/x86_64-apple-darwin / -macos. SDK-always:
-            # darwinEnvSetup exports SDKROOT = the packaged apple-sdk, and the engine's
-            # darwin front (frontRewriteDarwin) then uses the SDK for headers, libSystem
-            # and System/Library/Frameworks. (The engine CAN compile SDK-free from its
-            # own on-demand sysroot — that's how the linux→darwin cross worked — but the
-            # native-darwin turn made the real SDK both available and necessary, e.g.
-            # htop's IOKit/CoreFoundation.) We feed the SDK ourselves rather than letting
-            # nixpkgs' darwin wrapper auto-inject it, because that wrapper also pulls
-            # Csu/crt + ld64 + cctools and re-issues -isysroot/-syslibroot, which would
-            # fight the engine's own crt-less Mach-O link — so `apple-sdk = null` (below)
-            # suppresses the wrapper's auto-fill while SDKROOT supplies the SDK cleanly.
-            # See docs/platforms/darwin.md and mega-multiplatform-design.md §4.1.
+            # darwin (Mach-O) target: arm64/x86_64-apple-darwin / -macos.
             isDarwinTarget =
               nixpkgs.lib.hasInfix "darwin" target || nixpkgs.lib.hasInfix "macos" target;
-            # `apple-sdk = null` stops callPackage auto-filling the cc/bintools wrapper's
-            # `apple-sdk` param from the darwin set (which would re-inject a conflicting
-            # SDK setup); the engine gets the SDK via SDKROOT instead. Inert off darwin
-            # (the attr is absent there), but kept gated for clarity.
+            # `apple-sdk = null` stops callPackage auto-filling the wrapper's
+            # `apple-sdk` param (which re-injects Csu/crt + ld64 + cctools and
+            # re-issues -isysroot/-syslibroot, fighting the engine's crt-less
+            # Mach-O link); the engine gets the SDK via SDKROOT instead. Inert off
+            # darwin. See docs/platforms/darwin.md.
             appleSdkOverride = nixpkgs.lib.optionalAttrs isDarwinTarget { apple-sdk = null; };
-            # Legacy darwin headers that even the packaged macOS SDK no longer ships
-            # but gnulib + ncurses still `#include` on __APPLE__: `<libc.h>` (a legacy
-            # umbrella; gnulib's stackvma-mach.c, pulled by grep/sed/coreutils via the
-            # c-stack module, needs only getpagesize from it), `<nlist.h>` (included by
-            # the same path, `struct nlist` actually lives in <mach-o/nlist.h>, which
-            # the SDK HAS) and `<sys/ttydev.h>` (ncurses' lib_baudrate.c wants it for
-            # USE_OLD_TTY baud indices; recent SDKs dropped it). Inject all three as
-            # thin shims via `-idirafter` (last in the search order, so the real SDK
-            # header wins whenever it exists and these never shadow anything). Kept
-            # off the ncurses recipe so the fix is sysroot-wide and never re-hashes
-            # apple-sdk. Without them every gnulib-heavy / ncurses darwin build dies on
-            # `'libc.h' / 'sys/ttydev.h' not found`. Darwin-only; empty elsewhere.
+            # Legacy darwin headers the SDK no longer ships but gnulib + ncurses
+            # still `#include` on __APPLE__: `<libc.h>` (gnulib's stackvma-mach.c,
+            # via the c-stack module, needs only getpagesize), `<nlist.h>` (the
+            # real struct lives in <mach-o/nlist.h>) and `<sys/ttydev.h>` (ncurses
+            # lib_baudrate.c). Inject as thin `-idirafter` shims (last in search
+            # order, so the real SDK header wins and these never shadow). Kept off
+            # the ncurses recipe so the fix never re-hashes apple-sdk. Empty off
+            # darwin.
             darwinHeaderStubs = pkgs.runCommand "unpin-darwin-hdr-stubs" { } ''
               mkdir -p $out/include/sys
               printf '#ifndef _UNPIN_LIBC_H\n#define _UNPIN_LIBC_H\n#include <unistd.h>\n#include <stdlib.h>\n#endif\n' > $out/include/libc.h
@@ -526,9 +440,8 @@
             '';
             darwinStubFlag =
               nixpkgs.lib.optionalString isDarwinTarget " -idirafter ${darwinHeaderStubs}/include";
-            # (No `-lm`/`-lpthread` stub libs: SDK-always means the engine adds
-            # `-L <sdk>/usr/lib` at link, where the SDK's libm.tbd/libpthread.tbd/…
-            # reexport stubs resolve them — exactly as a stock macOS clang link does.)
+            # (No `-lm`/`-lpthread` stub libs: the engine adds `-L <sdk>/usr/lib`
+            # at link, where the SDK's libm.tbd/libpthread.tbd resolve them.)
             winImportLibs = pkgs.runCommand "unpin-win-implibs-${target}" { } ''
               mkdir -p $out/lib
               for L in bcrypt ws2_32 userenv secur32 crypt32 shlwapi; do
@@ -596,38 +509,29 @@
                 export UNPIN_LINK_DIR="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-links"
               '');
           in
-          # dontPatchELF: static-musl has no interp/RPATH for patchelf to touch.
-          # hardeningDisable=all: match route-A's minimal flag set (clang accepts
-          # the hardening flags, but fortify needs libc support musl only partly
-          # provides). NOTE no dontStrip — unlike cosmocc's APE (apelink needs the
-          # symtab), unpin-llvm's static-musl ELF strips fine and should, so
-          # strippedOrJoined's final strip applies.
+          # dontPatchELF: static-musl has no interp/RPATH to touch.
+          # hardeningDisable=all: match route-A's minimal flag set (fortify needs
+          # libc support musl only partly provides). No dontStrip — unlike
+          # cosmocc's APE, static-musl ELF strips fine, so strippedOrJoined's
+          # final strip applies.
           pkgs.stdenvAdapters.addAttrsToDerivation
             { dontPatchELF = true; hardeningDisable = [ "all" ]; }
             ((pkgs.overrideCC hostPkgs.stdenv cc).override (old: {
               extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ]) ++ [ seedHook ]
                 ++ nixpkgs.lib.optional captureLinks captureHook;
-              # The darwin stdenv bakes `apple-sdk` into its `extraBuildInputs`
-              # (generic stdenv: defaultBuildInputs = extraBuildInputs), so EVERY
-              # mkDerivation pulls in the SDK's setup hooks (which re-export SDKROOT,
-              # add -isysroot/-syslibroot, the Csu crt, …) and fight the engine's own
-              # crt-less Mach-O link. We supply the SDK ourselves via SDKROOT
-              # (darwinEnvSetup), so drop apple-sdk from the default inputs on darwin —
-              # the headers/libs/frameworks all still come from that same SDK, just
-              # through the engine front. Untouched elsewhere (musl/mingw
-              # extraBuildInputs are already empty).
+              # The darwin stdenv bakes `apple-sdk` into `extraBuildInputs`, so
+              # every mkDerivation pulls the SDK's setup hooks (re-export SDKROOT,
+              # -isysroot/-syslibroot, Csu crt) that fight the engine's crt-less
+              # Mach-O link. We supply the SDK via SDKROOT instead, so drop it from
+              # the default inputs on darwin. Untouched elsewhere.
               extraBuildInputs =
                 if isDarwinTarget then [ ] else (old.extraBuildInputs or [ ]);
             }));
 
-        # Append `flags` (string or list) to NIX_CFLAGS_COMPILE.
-        #
-        # `__structuredAttrs = true` drvs (bash, findutils, grep, dash, …)
-        # carry the flag inside `env.NIX_CFLAGS_COMPILE`. Writing a top-level
-        # `NIX_CFLAGS_COMPILE` on top of that collides — nix's mkDerivation
-        # refuses with "attribute set cannot contain any attributes passed to
-        # derivation". So we detect where the existing value lives and append
-        # in-place; never both.
+        # Append `flags` (string or list) to NIX_CFLAGS_COMPILE. structuredAttrs
+        # drvs carry it inside `env`; a top-level write on top of that collides
+        # ("attribute set cannot contain any attributes passed to derivation"), so
+        # append wherever the existing value lives, never both.
         appendCFlags = drv: flags:
           let
             flagStr = builtins.concatStringsSep " "
@@ -659,19 +563,16 @@
             isCross = buildp.system != host.system;
             # CC_FOR_BUILD runs on the builder, so never the engine target cc.
             #   cross         → the build-platform cc.
-            #   native linux  → bare `gcc` (the vanilla build gcc; kept by name so
-            #                   the bash drv stays byte-identical to the published
-            #                   build, even though the host cc is the engine clang).
-            #   native darwin → no gcc exists; pin the vanilla build cc. The static
-            #                   set's buildPackages isn't engine-swapped, so buildCC
-            #                   is genuine clang+cctools. Inert on linux.
+            #   native linux  → bare `gcc` by name (keeps the bash drv
+            #                   byte-identical to the published build).
+            #   native darwin → no gcc exists; pin the vanilla build cc (genuine
+            #                   clang+cctools, not engine-swapped). Inert on linux.
             ccForBuild =
               if isCross || buildp.isDarwin then "${buildCC}/bin/cc" else "gcc";
-            # On native darwin build and host share the `x86_64-apple-darwin` salt,
-            # so the engine bintools (bare `ld` = ELF lld) shadows the vanilla build
-            # cc's cctools ld64 — the salt-separation that keeps the two apart on
-            # linux (musl host vs gnu build) collapses, and the build clang's ld64
-            # args reach ELF lld, which rejects them. Pin to unwrapped cctools ld64.
+            # On native darwin build and host share the `x86_64-apple-darwin`
+            # salt, so the engine bintools (bare `ld` = ELF lld) shadows the build
+            # cc's cctools ld64 (the linux salt-separation collapses) → ld64 args
+            # reach ELF lld, which rejects them. Pin to unwrapped cctools ld64.
             ldPathFlag = nixpkgs.lib.optionalString buildp.isDarwin
               " --ld-path=${buildCC.bintools.bintools}/bin/ld";
           in
@@ -693,86 +594,42 @@
             '';
           });
 
-        # Final-link flag set for a downstream link that happens OUTSIDE the
-        # target pkg's own build (e.g. a multicall.nix post-link). These are
-        # the unpins-standard linker options, applied uniformly:
-        #
-        #   * non-darwin  → lld is the linker (`-fuse-ld=lld`, GNU-compatible
-        #     LLVM linker; needs `lld` on PATH — see lldFinalLink), plus
-        #     `--gc-sections` (dead-section prune; benign without
-        #     function-sections, the real win comes from the gc overlay's
-        #     chain-wide -ffunction-sections on Linux-native) and
-        #     `--icf=safe` (fold identical address-not-taken functions; a
-        #     measured no-op on C, kept for catalog uniformity and the C++
-        #     template tools). `--icf=all`/`--ignore-data-address-equality`
-        #     deliberately NOT used: they break function/data-pointer identity
-        #     (~−1.3% on aom but risks silent miscompiles in codec tables).
-        #   * darwin      → "" (unchanged). The darwin compiler is clang + Apple
-        #     ld64 (not lld) and the unpins allowlist/codesign path is sensitive
-        #     to link changes, so we deliberately do NOT touch the mac link here.
-        #     (ld64 could atom-dead-strip via `-dead_strip`, but that's a
-        #     separate, mac-only change requiring its own rebuild + re-verify.)
-        #
-        # Only valid on a FULL link ($CC-driven), never on `ld -r` relocatable
-        # partial-links (--gc-sections/--icf error there) — hence this lives on
-        # the multicall post-link, not the global cc-wrapper.
-        #
-        # cosmo (Cosmopolitan APE; isWindows && !isMinGW) is excluded: cosmocc
-        # is its own toolchain and doesn't take `-fuse-ld=lld`. It keeps its
-        # native link (returns "").
-        # Which targets use lld (the unpins standard linker). Excludes:
-        #   * darwin → clang + Apple ld64 (allowlist/codesign is link-sensitive)
-        #   * cosmo (isWindows && !isMinGW) → cosmocc, its own toolchain
-        #   * riscv64 → lld can't link our C++ codec chains here: it emits
-        #     "relocation refers to a symbol in a discarded section" (.L data
-        #     and .LEHE C++ landing-pad labels) even with NO --gc-sections/--icf
-        #     — a RISC-V linker-relaxation × section-discard bug in lld that
-        #     GNU ld doesn't have. avif fails to link; the C-only aom happened
-        #     to survive, but "lld for C but GNU for C++" is too fragile a
-        #     split, so riscv64 stays on GNU ld wholesale (size-neutral — lld's
-        #     options don't bite on the crosses anyway).
-        # Which targets use lld (the unpins standard linker). Excludes the
-        # two exotic cross arches whose lld backend has linker bugs GNU ld
-        # doesn't — both stay on GNU ld (size-neutral: lld gives no size win
-        # on the crosses, the gc gain is Linux-native only):
-        #   * riscv64 → lld emits "relocation refers to a symbol in a
-        #     discarded section" (RISC-V relaxation × section-discard) even
-        #     without --gc-sections/--icf.
+        # Which targets use lld, the unpins-standard linker. lldStdOpts is the
+        # flag set (`-fuse-ld=lld --gc-sections --icf=safe`); `--icf=all` is NOT
+        # used (breaks function/data-pointer identity, risks codec-table
+        # miscompiles). Only valid on a FULL link, never `ld -r` (--gc-sections/
+        # --icf error there) — hence it lives on the multicall post-link.
+        # Excludes:
+        #   * darwin → clang + Apple ld64; allowlist/codesign is link-sensitive.
+        #   * cosmo (isWindows && !isMinGW) → cosmocc, its own toolchain.
+        #   * riscv64 → lld emits "relocation refers to a symbol in a discarded
+        #     section" (RISC-V relaxation × section-discard) even without
+        #     --gc-sections/--icf; GNU ld doesn't.
         #   * ppc64le → lld doesn't synthesize the PowerPC out-of-line FP
-        #     save/restore routines (_savefpr_*/_restfpr_*, libgcc crtsavres)
-        #     that GNU ld generates on demand, so any FP-heavy static link
-        #     (e.g. busybox's awk/decompress) fails with undefined _restfpr_N.
+        #     save/restore routines (libgcc crtsavres) GNU ld generates on
+        #     demand, so any FP-heavy static link fails with undefined _restfpr_N.
+        # Both crosses are size-neutral (the gc win is Linux-native only).
         isLLDTarget = pkgs:
           let h = pkgs.stdenv.hostPlatform;
           in !(h.isDarwin)
           && !(h.isWindows && !(h.isMinGW or false))
           && !(h.isRiscV or false)
           && !(h.isPower or false)
-          # m68k is a GNU-binutils-only target: ld.lld has no m68k backend
-          # ("unknown emulation: m68kelf"), so fall back to ld.bfd like
-          # riscv/power above. Without this, any $CC link via lld aborts.
+          # m68k: ld.lld has no m68k backend ("unknown emulation: m68kelf").
           && !(h.isM68k or false)
-          # Same story for the other tier-3 niche crosses exposed under
-          # `.#cross`: lld's mips/s390x support is absent or incomplete, so
-          # route them through ld.bfd (the binutils cross always ships it).
-          # Safe even where lld *might* work — bfd still does --gc-sections;
-          # matches what riscv/power already do.
+          # mips/s390x (tier-3 `.#cross`): lld support absent or incomplete,
+          # route through ld.bfd (always shipped, still does --gc-sections).
           && !(h.isMips or false)
           && !(h.isS390 or false);
 
-        # `ld.lld` aborts on a relocatable link that also carries `--icf`
-        # ("-r and --icf may not be used together"). lldStdOpts carries
-        # `--icf=safe`, and it reaches EVERY $CC link via NIX_CFLAGS_LINK /
-        # makeFlagsArray — including the `$CC -r` relocatable partial-links
-        # some build systems emit (busybox's kbuild links applets/built-in.o
-        # that way). `--gc-sections` is -r-safe (lld ignores it on a
-        # relocatable link); only `--icf` is fatal. So wrap ld.lld: strip
-        # `--icf*` when the args contain -r/-i/--relocatable, pass everything
-        # else straight through. The wrapper dir symlinks the rest of lld/bin,
-        # so it's a drop-in target for `-B<dir>` and PATH — `-fuse-ld=lld`
-        # resolves to the wrapper. `buildPkgs` is the build-platform scope
-        # holding lld/bash/runCommand; callers pass the recursion-safe one
-        # (e.g. `basePkgs.buildPackages` in a cross scope, see withLLDLink).
+        # `ld.lld` aborts on a relocatable (`-r`) link carrying `--icf`
+        # ("-r and --icf may not be used together"), but lldStdOpts' `--icf=safe`
+        # reaches every $CC link including the `$CC -r` partial-links some builds
+        # emit (busybox kbuild). `--gc-sections` is -r-safe; only `--icf` is fatal.
+        # So wrap ld.lld to strip `--icf*` on -r/-i links. The wrapper dir
+        # symlinks the rest of lld/bin so it's a drop-in for `-B<dir>`/PATH.
+        # `buildPkgs` must be the recursion-safe build-platform scope (see
+        # withLLDLink).
         lldRSafe = buildPkgs:
           buildPkgs.runCommand "lld-rsafe-${buildPkgs.lld.version}" { } ''
             mkdir -p $out/bin
@@ -813,23 +670,18 @@
 
         # The unpins-standard lld options for a non-darwin final link.
         lldStdOpts = _: "-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe";
-        # `-B<lld>/bin` makes the compiler driver find `ld.lld` for
-        # `-fuse-ld=lld` WITHOUT needing lld on PATH — so this flag is fully
-        # self-sufficient and every multicall package gets the standard linker
-        # by just appending `${lib.gcSectionsFlag pkgs}` to its post-link, no
-        # per-package nativeBuildInputs edit. (lld/bin ships ld.lld/lld-link
-        # but no `ld`/`as`/`ar`, so -B can't shadow the binutils the build
-        # otherwise uses.)
+        # `-B<lld>/bin` makes the driver find `ld.lld` for `-fuse-ld=lld` without
+        # lld on PATH, so appending `${lib.gcSectionsFlag pkgs}` to a post-link is
+        # self-sufficient (no per-package nativeBuildInputs edit). lld/bin ships no
+        # `ld`/`as`/`ar`, so -B can't shadow the build's binutils.
         gcSectionsFlag = pkgs:
           if isLLDTarget pkgs then
             "-B${lldRSafe pkgs.buildPackages}/bin ${lldStdOpts pkgs}"
           else "";
 
-        # `lld` build tool for the scope. gcSectionsFlag's `-B` already makes
-        # `ld.lld` findable, so this is only needed where a link uses
-        # `-fuse-ld=lld` WITHOUT going through gcSectionsFlag (e.g. the
-        # gc-overlay single-binary makeFlagsArray). Empty list off the lld
-        # targets (darwin keeps ld64, cosmo keeps cosmocc).
+        # `lld` build tool for the scope. Only needed where a link uses
+        # `-fuse-ld=lld` WITHOUT going through gcSectionsFlag's `-B` (e.g. the
+        # gc-overlay single-binary makeFlagsArray). Empty off the lld targets.
         lldFinalLink = pkgs:
           if isLLDTarget pkgs then [ (lldRSafe pkgs.buildPackages) ]
           else [ ];
@@ -886,22 +738,13 @@
           });
 
         # Append to NIX_CFLAGS_LINK (cc-wrapper LINK-time flags),
-        # structuredAttrs-aware like appendCFlags. Unlike NIX_LDFLAGS this
-        # reaches ONLY $CC-driven links, never a direct `ld -r`, so
-        # --gc-sections/--icf are safe to carry here.
-        # Append to NIX_CFLAGS_LINK (cc-wrapper LINK-time flags),
-        # structuredAttrs-aware like appendCFlags. Unlike NIX_LDFLAGS this
-        # reaches ONLY $CC-driven links, never a direct `ld -r`, so
-        # --gc-sections/--icf are safe to carry here.
-        #
-        # The `old ? env && old.env ? VAR` test is the right signal (NOT
-        # `old.__structuredAttrs`, which is NOT visible in overrideAttrs' `old`):
-        # when a structuredAttrs build presets `env.NIX_CFLAGS_LINK` (e.g. whois'
-        # " -static") we MUST append inside `env`, since adding a top-level
-        # NIX_CFLAGS_LINK would overlap and nixpkgs rejects the duplicate. When
-        # the var is absent, a top-level scalar is exported fine even under
-        # structuredAttrs (verified: withDnsFallback's top-level NIX_LDFLAGS
-        # reaches whois' linker).
+        # structuredAttrs-aware like appendCFlags. Unlike NIX_LDFLAGS this reaches
+        # ONLY $CC-driven links, never a direct `ld -r`, so --gc-sections/--icf
+        # are safe here. The `old ? env && old.env ? VAR` test (NOT
+        # `old.__structuredAttrs`, invisible in overrideAttrs' `old`) routes the
+        # append into `env` when a structuredAttrs build presets it there (a
+        # top-level dup would be rejected); a top-level scalar exports fine when
+        # the var is absent.
         appendLinkFlags = drv: flagStr:
           drv.overrideAttrs (old:
             if old ? env && old.env ? NIX_CFLAGS_LINK then {
@@ -924,33 +767,21 @@
             } else { NIX_LDFLAGS = flagStr; });
 
         # DNS fallback (linux-static). A tiny C archive providing
-        # __wrap_getaddrinfo / __wrap_freeaddrinfo, linked into every
-        # linux-static artifact. musl's resolver falls back to 127.0.0.1 when
-        # /etc/resolv.conf is absent — which is the case on Android (no
-        # resolv.conf; DNS lives behind Bionic + netd, unreachable from a
-        # non-Bionic static binary), so every catalog binary fails to resolve.
-        # The wrapper delegates to the real resolver in every normal case. It
-        # takes over only when the OS resolver can't be REACHED (EAI_AGAIN) for a
-        # real hostname AND the user OPTED IN to a fallback resolver — via
-        # $UNPIN_DNS or a `dns =` line in unpin's config file, which the shim
-        # reads itself so every unpins program honours it without an env var. The
-        # fallback is OFF by default: with nothing configured it surfaces the real
-        # error and calls a weak hook (unpin_dns_note_unreachable) that unpin
-        # overrides to teach the user how to opt in — there is no built-in public
-        # default, so it never fires without consent. If UDP/53 is itself blocked
-        # (captive portals, port-53 firewalls), it can escalate to DoH over
-        # HTTPS/443 through an OPTIONAL weak hook (unpin_readurl — a generic
-        # "fetch this URL" call) that a binary carrying a TLS stack provides from
-        # that stack: the Rust tools (unpin/unpin-readme) do, over rustls; a
-        # networked C tool could over its libcurl/OpenSSL. Left unprovided, the
-        # binary stays UDP-only at zero cost. See dns-fallback/dns-fallback.c for
-        # the full contract.
+        # __wrap_getaddrinfo / __wrap_freeaddrinfo. musl's resolver can't reach
+        # DNS where /etc/resolv.conf is absent (Android: DNS lives behind Bionic +
+        # netd), so catalog binaries fail to resolve. The wrapper delegates to the
+        # real resolver normally and only takes over on EAI_AGAIN AND when the
+        # user opted in (via $UNPIN_DNS or a `dns =` line the shim reads itself).
+        # OFF by default: with nothing configured it surfaces the real error and
+        # calls a weak hook unpin overrides to teach opt-in. Can escalate to DoH
+        # via an OPTIONAL weak hook (unpin_readurl) a TLS-carrying binary provides
+        # (the Rust tools do, over rustls); unprovided it stays UDP-only at zero
+        # cost. See dns-fallback/dns-fallback.c for the contract.
         #
-        # Built with the TARGET stdenv so it compiles per arch/OS — one C file,
-        # three link mechanisms selected by #ifdef (see dns-fallback.c): musl/
-        # mingw via `--wrap`, darwin via a getaddrinfo redefinition + dlsym. The
-        # interposed symbol is also what Rust's std::net resolution emits, so this
-        # fixes the Rust binaries (unpin/unpin-readme) with no Rust-side change.
+        # Built with the TARGET stdenv (per arch/OS); three link mechanisms via
+        # #ifdef: musl/mingw `--wrap`, darwin getaddrinfo redefinition + dlsym.
+        # The interposed symbol is also what Rust's std::net emits, so this fixes
+        # the Rust binaries with no Rust-side change.
         dnsFallbackLib = pkgs: pkgs.stdenv.mkDerivation {
           pname = "unpin-dns-fallback";
           version = "0.1";
@@ -971,30 +802,18 @@
           '';
         };
 
-        # Wrap a built drv's final link with the DNS fallback (linux-static
-        # only; darwin/windows keep their native resolver). `--wrap` rides
-        # NIX_LDFLAGS (not NIX_CFLAGS_LINK — that gets wiped in postConfigure by
-        # some builds, e.g. whois). The lldRSafe ld wrapper strips `--wrap` from
-        # any `-r` relocatable partial-link routed through ld.lld, so the wrap
-        # applies only at the final full link. The archive is pulled by the
-        # linker only when (and only when) getaddrinfo is referenced.
-        #
-        # `staticPkgs` is the static scope the drv was actually built in
-        # (`pkgs.pkgsStatic` — NOT the native `pkgs` `stripped` receives, whose
-        # hostPlatform is the glibc build host). Both the guard and the
-        # archive's toolchain come from it, so the .a matches the consumer's
-        # arch (native or cross-musl) exactly.
-        # Interpose getaddrinfo per toolchain (see dns-fallback.c's header):
-        #   - linux musl / windows mingw: GNU ld `--wrap`. NIX_LDFLAGS lands at
-        #     the END of the link line, after the toolchain's own libc, and a
-        #     static archive only satisfies references that come BEFORE it — so we
-        #     re-state the libc AFTER our archive (`-lc` on linux; `-lws2_32`
-        #     `-lmsvcrt` on windows, for the socket + CRT calls it makes).
-        #     rustc's `-nodefaultlibs` link is what exposes this.
-        #   - darwin: ld64 has no `--wrap`, so the archive DEFINES getaddrinfo/
-        #     freeaddrinfo and we `-force_load` it to win over libSystem; the real
-        #     ones are reached at runtime via dlsym(RTLD_NEXT).
-        # The archive is pulled by the linker only when getaddrinfo is referenced.
+        # Wrap a built drv's final link with the DNS fallback (linux-static only;
+        # darwin/windows keep their native resolver). `--wrap` rides NIX_LDFLAGS
+        # (NIX_CFLAGS_LINK gets wiped in postConfigure by some builds, e.g.
+        # whois); lldRSafe strips `--wrap` from any `-r` partial-link, so the wrap
+        # applies only at the final full link. `staticPkgs` is the scope the drv
+        # was actually built in (pkgsStatic, NOT the glibc-host `pkgs`), so the .a
+        # matches the consumer's arch. Interpose per toolchain:
+        #   - linux musl / windows mingw: GNU ld `--wrap`. NIX_LDFLAGS lands at the
+        #     END of the link line, so re-state the libc AFTER our archive (`-lc`;
+        #     `-lws2_32 -lmsvcrt` on windows). rustc's `-nodefaultlibs` exposes it.
+        #   - darwin: ld64 has no `--wrap`, so the archive DEFINES the symbols and
+        #     `-force_load` wins over libSystem; the real ones via dlsym(RTLD_NEXT).
         withDnsFallback = staticPkgs: drv:
           let h   = staticPkgs.stdenv.hostPlatform;
               lib = "${dnsFallbackLib staticPkgs}/lib";
@@ -1012,14 +831,11 @@
              else drv;
 
         # Make a build scope link `pkgName`'s final $CC link with lld + the
-        # standard options, via NIX_CFLAGS_LINK (build-system agnostic —
-        # cmake/meson/make all pass it to the cc-wrapper at link). Covers what
-        # the gc overlay (Linux-native only, makeFlagsArray) and gcSectionsFlag
-        # (multicall post-link) don't: SINGLE-BINARY packages on the cross
-        # targets. Also harmlessly covers multicall on those scopes (libXApps
-        # inherits pkgName's env; redundant with gcSectionsFlag). No-op on
-        # darwin/cosmo and when pkgName is absent. Returns a full pkgs scope
-        # (like mkPkgsGC) so `pkgs.pkgsStatic.<name>` reaches the overlay.
+        # standard options via NIX_CFLAGS_LINK (build-system agnostic). Covers
+        # what the gc overlay (Linux-native makeFlagsArray) and gcSectionsFlag
+        # (multicall post-link) don't: SINGLE-BINARY packages on the cross targets.
+        # No-op on darwin/cosmo and when pkgName is absent. Returns a full pkgs
+        # scope so `pkgs.pkgsStatic.<name>` reaches the overlay.
         withLLDLink = pkgName: basePkgs:
           basePkgs // {
             pkgsStatic = basePkgs.pkgsStatic.extend (self: super:
@@ -1061,15 +877,12 @@
               });
           };
 
-        # Remove .so/.dylib/.la/.dll/.dll.a from a drv's outputs; leave .a + headers + bins.
-        # Build-system agnostic (postFixup, not configure flags).
-        #
-        # Why: GNU ld and Apple ld64 both prefer shared over .a in -L paths, and ld64 has
-        # no `-Bstatic` analog. Removing the shared artifact post-build is the only
-        # platform-neutral way to force a static link without patching the consumer.
-        #
-        # Self-guarded: pkgsStatic drvs already produce only .a; skip them to avoid busting
-        # cache.nixos.org without changing the output.
+        # Remove .so/.dylib/.la/.dll/.dll.a from a drv's outputs (postFixup, not
+        # configure flags). GNU ld and Apple ld64 prefer shared over .a in -L
+        # paths and ld64 has no `-Bstatic`, so deleting the shared artifact is the
+        # only platform-neutral way to force a static link without patching the
+        # consumer. Self-guarded: pkgsStatic drvs already produce only .a, skip
+        # them to keep cache.nixos.org hits.
         dropSharedLibs = drv:
           let isStatic = drv.stdenv.hostPlatform.isStatic or false;
           in if isStatic then drv
@@ -1089,28 +902,14 @@
           });
 
         # Curated terminfo entries baked into libtinfo.a via ncurses
-        # `--with-fallbacks=`. Covers what users actually hit across the
-        # three OSes: legacy (xterm/vt100/ansi/dumb), Linux console
-        # (linux), multiplexers (screen/tmux), Windows shells (mintty/
-        # cygwin/ms-terminal/vscode), modern emulators (alacritty/foot/
-        # kitty/ghostty), DE defaults (gnome/konsole), suckless (st),
-        # rxvt, putty, macOS Terminal.app (nsterm), iTerm2 direct-color.
-        #
-        # Why bake at all: the unpins promise is "single binary that
-        # runs anywhere" — we can't assume `/usr/share/terminfo` or
-        # `/etc/terminfo` exists on the host (scratch containers, Alpine
-        # without ncurses-terminfo-base, raw Windows, ...). Embedding
-        # ~35 essentials keeps libedit / ncurses-TUI consumers
-        # functional with zero data files. See docs/runtime-data.md for
-        # the "complete coverage" path (data archive) — not yet wired.
-        #
-        # Modern entries that ncurses 6.6 (nixpkgs 26.05) doesn't ship
-        # — `xterm-ghostty`, `xterm-kitty`, `rxvt-unicode*` — come from
-        # `extra-terminfo.src` (appended pre-tic via
-        # `embedFallbackTerminfo*`'s postPatch). The `xterm-…` aliases
-        # are the names Ghostty/kitty actually set in $TERM by default;
-        # ncurses' own `kitty`/`ghostty` entries lack those aliases, so
-        # we ship the upstream-canonical entries separately.
+        # `--with-fallbacks=`. We can't assume `/usr/share/terminfo` exists on the
+        # host (scratch containers, raw Windows), so embedding ~35 essentials keeps
+        # libedit / ncurses-TUI consumers working with zero data files. See
+        # docs/runtime-data.md for the complete-coverage path (not yet wired).
+        # Entries ncurses 6.6 doesn't ship (`xterm-ghostty`, `xterm-kitty`,
+        # `rxvt-unicode*`) come from `extra-terminfo.src`; the `xterm-…` aliases
+        # are the $TERM names Ghostty/kitty set by default (ncurses' own entries
+        # lack those aliases).
         fallbackTerminals =
           "xterm,xterm-color,xterm-256color,ansi,vt100,vt102,vt220,dumb,"
           + "linux,mintty,cygwin,ms-terminal,vscode,"
@@ -1122,12 +921,9 @@
           + "rxvt,rxvt-256color,rxvt-unicode,rxvt-unicode-256color,"
           + "iterm2-direct,nsterm,putty,putty-256color";
 
-        # Patch ncurses to (a) append `extra-terminfo.src` to the source
-        # database so newer entries (ghostty, ...) are known to tic at
-        # build time, then (b) add `--with-fallbacks=<fallbackTerminals>`
-        # so each entry is compiled into libtinfo.a as a C array. Host
-        # terminfo files still take precedence at runtime (database
-        # lookup stays enabled).
+        # Patch ncurses to append `extra-terminfo.src` (so newer entries are
+        # known to tic) and `--with-fallbacks=` (compile each into libtinfo.a as a
+        # C array). Host terminfo still wins at runtime (database lookup stays on).
         embedFallbackTerminfo = ncurses: ncurses.overrideAttrs (oa: {
           postPatch = (oa.postPatch or "") + ''
             cat ${./extra-terminfo.src} >> misc/terminfo.src
@@ -1137,12 +933,10 @@
           ];
         });
 
-        # Same as embedFallbackTerminfo plus `--disable-database` — the
-        # compiled libtinfo.a no longer tries the runtime path lookup.
-        # For Windows targets (cosmo, mingw) where the binary's
-        # compiled-in `/nix/store/.../share/terminfo` doesn't exist on
-        # the user's machine and there's no system convention to fall
-        # back on; the only source of truth becomes the baked array.
+        # embedFallbackTerminfo + `--disable-database` (no runtime path lookup).
+        # For Windows (cosmo, mingw): the compiled-in /nix/store terminfo path
+        # doesn't exist on the user's machine and there's no system convention, so
+        # the baked array is the only source of truth.
         embedFallbackTerminfoOnly = ncurses: ncurses.overrideAttrs (oa: {
           postPatch = (oa.postPatch or "") + ''
             cat ${./extra-terminfo.src} >> misc/terminfo.src
@@ -1154,21 +948,13 @@
         });
 
         # Strip `--enable-static`/`--disable-shared` from configureFlags on
-        # darwin. Background: pkgsStatic adds both flags to every derivation.
-        # The configure.ac in many GNU-ish packages (dash, htop, ...)
-        # translates `--enable-static` into `export LDFLAGS="-static"`, which
-        # then breaks every subsequent AC_CHECK_LIB probe — darwin has only
-        # libSystem.dylib, no libSystem.a. The probes fail and consumers
-        # think their deps are missing (libedit, libsensors, ...).
-        #
-        # Filtering the flags lets each pkgsStatic input still contribute a
-        # `.a` to the link line; only libSystem stays implicitly-dynamic,
-        # matching the catalog's darwin policy. Applied automatically inside
-        # `mkStandaloneFlake`'s native pipeline so individual fix files don't
-        # need to repeat the workaround.
-        #
-        # Not applied to mingw / cosmo cross builds (no libSystem issue, and
-        # --enable-static there is genuinely a static link request).
+        # darwin. Many GNU-ish configure.ac (dash, htop) translate
+        # `--enable-static` into `LDFLAGS=-static`, which breaks every subsequent
+        # AC_CHECK_LIB probe — darwin has only libSystem.dylib, no libSystem.a — so
+        # consumers think deps are missing. Filtering lets each pkgsStatic input
+        # still contribute its `.a`; only libSystem stays dynamic. Applied in
+        # mkStandaloneFlake's native pipeline. Not on mingw/cosmo (no libSystem
+        # issue, and --enable-static there is a genuine static-link request).
         filterEnableStaticOnDarwin = drv:
           if (drv.stdenv.hostPlatform.isDarwin or false)
           then drv.overrideAttrs (old: {
@@ -1178,35 +964,23 @@
           })
           else drv;
 
-        # Darwin libiconv handling, applied automatically to every darwin build
-        # in mkStandaloneFlake's pipeline (like filterEnableStaticOnDarwin) so
-        # individual packages stop re-solving the same two iconv traps. macOS
-        # keeps iconv in a standalone libiconv (not libSystem), and the darwin
-        # portability allow-list permits only libSystem/libobjc/Frameworks — so
-        # anything that references iconv must link it, and statically:
+        # Darwin libiconv handling, applied to every darwin build in
+        # mkStandaloneFlake's pipeline. macOS keeps iconv in a standalone libiconv
+        # and the portability allow-list permits only libSystem/libobjc/Frameworks,
+        # so anything referencing iconv must link it statically:
         #
-        #  * Target link (every darwin build): C objects that reference iconv
-        #    (libxml2.a's encoding.o, ...) and rustc's default `-liconv` need a
-        #    libiconv to resolve against. Use the *static* libiconv — a leaf in
-        #    pkgsStatic, so it doesn't drag in the broken cctools-static cascade
-        #    — so the final binary carries no libiconv.2.dylib load command (the
-        #    allow-list rejects that). The bare `-liconv` is appended to the
-        #    unsalted NIX_LDFLAGS the target cc-wrapper reads; harmless when
-        #    nothing references iconv (a static archive contributes only the
-        #    objects that resolve undefined symbols — none, here).
+        #  * Target link (every darwin build): use the *static* libiconv (a
+        #    pkgsStatic leaf, dodging the broken cctools-static cascade) so the
+        #    binary carries no libiconv.2.dylib load command. The bare `-liconv`
+        #    rides the unsalted NIX_LDFLAGS; harmless when nothing references it.
         #
-        #  * Build-host link (darwin CROSS only): cargo/cmake build scripts and
-        #    proc-macro dylibs are linked for the BUILD host, and rustc appends
-        #    `-liconv` there too, against the build cc-wrapper's salted
-        #    NIX_LDFLAGS_<buildSalt> — which has no default path for it, so the
-        #    build dies with "library not found for -liconv". Hand it a -L to the
-        #    build-arch libiconv. CROSS-ONLY: on a native build the build salt
-        #    equals the target salt, so this -L would instead pull a *dynamic*
-        #    libiconv into the final binary and trip the allow-list.
+        #  * Build-host link (darwin CROSS only): rustc appends `-liconv` for
+        #    build-host links (build scripts, proc-macro dylibs) against the salted
+        #    NIX_LDFLAGS_<buildSalt>, which has no path for it → "library not found".
+        #    Hand it a build-arch -L. CROSS-ONLY: native, build salt == target
+        #    salt, so this -L would pull a *dynamic* libiconv and trip the allow-list.
         #
-        # Darwin-only; linux/windows/cosmo drvs pass through untouched (windows
-        # never reaches this pipeline anyway). See docs/platforms/darwin.md
-        # ("the libiconv catch").
+        # Darwin-only. See docs/platforms/darwin.md ("the libiconv catch").
         withDarwinIconv = pkgs: drv:
           let
             host = pkgs.stdenv.hostPlatform;
@@ -1227,34 +1001,11 @@
                 then { env = old.env // { NIX_LDFLAGS = old.env.NIX_LDFLAGS + " -liconv"; }; }
                 else { NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " -liconv"; }));
 
-        # Embed a package's multi-call alias list into `$out/bin/<primary>` as a
-        # `unpin/aliases` entry of the binary's embedded ZIP, so unpin's
-        # installer can spawn argv[0]-dispatch links (xz → xzcat/unxz/lzma…) at
-        # `unpin install` time. The container is a plain ZIP (one name per line
-        # in `unpin/aliases`), located/read by unpin via the ZIP's native EOCD —
-        # see docs/embedded-metadata.md and `unpin/src/meta.rs`. Embedding is the
-        # shared `__unpin_embed_subtree` (see `unpinEmbedSh`).
-        #
-        # Two input modes (exactly one required):
-        #   aliases = [ "xzcat" "unxz" "lzma" ];   # explicit list, Nix-eval-time
-        #   aliasesFromSymlinksIn = "bin";         # harvest $out/bin/* symlinks
-        #
-        # `aliasesFromSymlinksIn` is the multicall pattern (coreutils,
-        # busybox): upstream creates one symlink per applet next to the real
-        # multicall binary. We collect them in postInstall, wipe the symlinks
-        # (we ship one binary, the alias links are unpin's job at install time)
-        # then embed the list in postFixup so the embed runs AFTER stdenv strip.
-        #
-        # Alias security (no marker needed): aliases are honored at install time
-        # only for catalog-owner packages, and every name passes the blocklist —
-        # both upstream of the reader. See docs/embedded-metadata.md §4.
-
         # Build-host-native tool that packs a staging `unpin/` tree into a
-        # zstd-in-zip (ZIP method 93) overlay — the format `withMan` uses for the
-        # man payload. Compresses with libzstd; shipped binaries decode method 93
-        # with `unpin`'s pure-Rust ruzstd reader (unpin/src/meta.rs). Sources
-        # vendored from unpins/unpin-vfs. `-DMINIZ_NO_TIME` zeroes entry mtimes
-        # so the overlay is byte-reproducible.
+        # zstd-in-zip (ZIP method 93) overlay — the format withMan/withAliases use.
+        # Shipped binaries decode method 93 with unpin's pure-Rust ruzstd reader
+        # (unpin/src/meta.rs). Sources vendored from unpins/unpin-vfs.
+        # `-DMINIZ_NO_TIME` zeroes entry mtimes so the overlay is byte-reproducible.
         unpinPackTool = pkgs: pkgs.buildPackages.stdenv.mkDerivation {
           name = "unpin-vfs-pack";
           dontUnpack = true;
@@ -1268,30 +1019,21 @@
         };
 
         # Shared embed primitive for withAliases/withMan/withRuntimeData: add a
-        # staging tree (the ZIP-root layout: `unpin/...` metadata entries and/or
-        # a VFS runtime tree) to the binary's embedded ZIP
-        # (docs/embedded-metadata.md).
-        # Every binary ends up with exactly ONE ZIP whose offsets are
-        # file-adjusted (absolute) — the self-extracting-archive convention, so
-        # `unzip <binary>` reads clean and cosmo's zipos can parse it (zipos
-        # rejects zip-relative offsets). Two paths:
+        # staging tree to the binary's embedded ZIP (docs/embedded-metadata.md).
+        # Every binary ends up with exactly ONE ZIP with absolute offsets (the
+        # self-extracting convention, so `unzip <binary>` reads clean and cosmo's
+        # zipos parses it). Two paths:
         #
-        #  * cosmo: REWRITE the runtime's existing tail-ZIP. We must not append
-        #    a second ZIP after it (cosmo finds its `/zip/` store via the
-        #    end-of-file EOCD, and a trailing ZIP would shadow it), so
-        #    unpin-vfs-pack `--carry` copies the existing entries verbatim —
-        #    deflate/store preserved so cosmo still reads them, `.symtab.amd64`
-        #    dropped — and adds ours as zstd (method 93) in the same archive.
-        #  * everything else: there is no tail-ZIP, so truncate the binary back
-        #    to its pre-embed size and append our ZIP.
-        # Both ACCUMULATE the subtree in a per-binary staging dir and repack the
-        # whole accumulated tree as one unpin-vfs-pack ZIP — zstd entries except
-        # `unpin/aliases` deflate so pre-zstd readers still decode it. A later
-        # call (withMan after withAliases) replaces the overlay with a superset
-        # — idempotent, never two ZIPs.
+        #  * cosmo: REWRITE the existing tail-ZIP (a second appended ZIP would
+        #    shadow cosmo's `/zip/` store, found via the EOF EOCD). `--carry`
+        #    copies its entries verbatim and adds ours as zstd in the same archive.
+        #  * everything else: truncate back to pre-embed size and append our ZIP.
+        # Both accumulate the subtree per-binary and repack the whole tree as one
+        # ZIP (all zstd except `unpin/aliases`, kept deflate for pre-zstd readers);
+        # a later call replaces the overlay with a superset — never two ZIPs.
         #
         # On Mach-O the overlay sits past LC_CODE_SIGNATURE, outside the signed
-        # range — the kernel ignores it (smoke-proven on Apple Silicon).
+        # range, so the kernel ignores it.
         unpinEmbedSh = ''
           __unpin_embed_subtree() {
             __ues_bin="$1"; __ues_stage="$2"
@@ -1374,34 +1116,25 @@
           }
         '';
 
-        # ---- withUnpinEmbed: the ONE call that builds a package's embedded
-        # container ---------------------------------------------------------
-        #
-        # Stages every kind of embedded payload into a single ZIP-root tree
-        # and packs the binary's single EOF ZIP ONCE:
+        # withUnpinEmbed: the ONE call that builds a package's embedded
+        # container. Stages every payload into a single ZIP-root tree and packs
+        # the binary's EOF ZIP once:
         #
         #   * aliases       → `unpin/aliases` (explicit list or symlink harvest)
         #   * man pages     → `unpin/man/*` via mkmeta.py (`man = true`, or an
         #                     explicit `manRoot`; optional `manFallback`)
         #   * runtime tree  → arbitrary entries at the ZIP root, served by the
-        #                     unpin-vfs self-EOF mode (`runtimeStage` snippet,
-        #                     run with $__unpin_stage = the empty ZIP root)
+        #                     unpin-vfs self-EOF mode (`runtimeStage` snippet)
         #
-        # withAliases / withMan / withRuntimeData below are thin wrappers over
-        # this; composing several of them still works (the accumulator in
-        # `unpinEmbedSh` repacks a superset), it just repacks once per call —
-        # a package that passes everything here pays for ONE pack.
+        # withAliases/withMan/withRuntimeData are thin wrappers; passing
+        # everything here pays for ONE pack. When man is included the result
+        # carries `passthru.unpinEmbedsMan` so mkStandaloneFlake skips its own
+        # withMan.
         #
-        # When man is included, the result carries `passthru.unpinEmbedsMan =
-        # true` and mkStandaloneFlake skips its own withMan application, so
-        # the consumer's single call really is the only embed step.
-        #
-        # Failure policy: a missing primary binary is a hard error when the
-        # call ships aliases or a runtime tree (the caller knows the layout),
-        # but a warn-and-skip for man-only calls — embedMan is default-on
-        # across the catalog and a man-less package is degraded, not broken.
-        # An empty runtime stage always fails: a missing runtime tree is a
-        # broken program.
+        # Failure policy: a missing primary binary is a hard error for an
+        # aliases/runtime call but warn-and-skip for man-only (embedMan is
+        # default-on; man-less is degraded, not broken). An empty runtime stage
+        # always fails.
         withUnpinEmbed = pkgs:
           { primary
           , aliases ? null
@@ -1417,27 +1150,18 @@
             manEnabled = man || manRoot != null;
             aliasesActive = (hasExplicit && aliases != [ ]) || hasAuto;
 
-            # Alias names are embedded verbatim — nix-lib does NOT validate
-            # them. All alias policy (charset/length/leading-char rules,
-            # Windows-reserved names, the catalog-owner gate, and the
-            # credential-shadowing confirmation) lives solely in unpin and is
-            # enforced at install time by `validate_alias` /
-            # `alias_needs_confirmation` in unpin/src/aliases.rs — the single
-            # canonical reference. Keeping a second copy here only let the two
-            # drift (the build rejected names the installer had since relaxed,
-            # e.g. uppercase or punctuation applet names). The build just ships
-            # the declared list; the installer decides what is safe to link.
+            # Alias names are embedded verbatim — nix-lib does NOT validate them.
+            # All alias policy lives solely in unpin (validate_alias /
+            # alias_needs_confirmation in unpin/src/aliases.rs), enforced at
+            # install time; a second copy here only drifts.
             explicitCsv =
               if hasExplicit
               then nixpkgs.lib.concatStringsSep "," aliases
               else "";
 
-            # Pick the output the binary actually lives in. nixpkgs convention:
-            # multi-output drvs put bins under the `bin` output (jq, htop in
-            # some configs); pkgsStatic typically collapses to `out` even with
-            # `info`/`debug` siblings (so `bin` is absent → fall back to `out`).
-            # In the inline shell snippets below, `''${${binOutputName}}` renders
-            # as e.g. `${bin}` or `${out}` for bash to expand to the path.
+            # Pick the output the binary lives in: `bin` when split (jq, htop),
+            # else `out` (pkgsStatic usually collapses to it). `''${${binOutputName}}`
+            # below renders as `${bin}`/`${out}` for bash to expand.
             binOutputName =
               let outs = drv.outputs or [ "out" ];
               in
@@ -1612,9 +1336,8 @@
           else if !aliasesActive && !manEnabled && runtimeStage == null then drv
           else wrapped;
 
-        # Thin wrapper over withUnpinEmbed — embed only the alias list. See
-        # the doc block above unpinPackTool for the alias model (two input
-        # modes, symlink harvest, security gates).
+        # Thin wrapper over withUnpinEmbed — embed only the alias list. Two
+        # input modes (explicit `aliases` list or `aliasesFromSymlinksIn` harvest).
         withAliases = pkgs:
           { primary
           , aliases ? null
@@ -1625,38 +1348,27 @@
           else
             withUnpinEmbed pkgs { inherit primary aliases aliasesFromSymlinksIn; } drv;
 
-        # Thin wrapper over withUnpinEmbed — embed only the package's man
-        # pages as `unpin/man/<name>.<section>` entries, so `unpin man <pkg>`
-        # reads docs straight out of the binary. `manRoot`: when null, harvest
-        # man from the drv's own outputs (`$man`/`$out`) — the native path.
-        # When set to a store path, read `$manRoot/share/man` instead — an
-        # explicit external override (consumer-supplied `winManRoot`).
-        # `manFallback`: optional store path consulted ONLY on the harvest-own
-        # path (manRoot == null) when the drv ships no man of its own — the
-        # windows/cosmo default. Composition with withAliases/withRuntimeData
-        # is order-free: all calls accumulate into the binary's one ZIP.
+        # Thin wrapper over withUnpinEmbed — embed only the package's man pages
+        # as `unpin/man/<name>.<section>` entries. `manRoot` null harvests from
+        # the drv's own outputs (`$man`/`$out`); a store path reads
+        # `$manRoot/share/man` instead. `manFallback` is consulted only on the
+        # harvest-own path when the drv ships no man (the windows/cosmo default).
         withMan = pkgs: { primary, manRoot ? null, manFallback ? null }: drv:
           withUnpinEmbed pkgs { inherit primary manRoot manFallback; man = true; } drv;
 
         # Thin wrapper over withUnpinEmbed — embed only a runtime tree (vim's
-        # share/vim, perl's @INC, …), read back at run time by the unpin-vfs
-        # self-EOF mode (-DUNPIN_VFS_SELF, github:unpins/unpin-vfs). `stage`
-        # is a shell snippet run in postFixup (i.e. AFTER strip) with
-        # `$__unpin_stage` pointing at an empty directory that is the ZIP
-        # root: populate it with the tree exactly as the VFS should serve it.
-        # An empty stage fails the build: unlike man pages, a missing runtime
-        # tree is a broken program, not a degraded one.
+        # share/vim, perl's @INC), read back at run time by the unpin-vfs self-EOF
+        # mode. `stage` is a postFixup shell snippet (AFTER strip) with
+        # `$__unpin_stage` = the empty ZIP-root dir to populate. An empty stage
+        # fails the build (a missing runtime tree is broken, not degraded).
         withRuntimeData = pkgs: { primary, stage }: drv:
           withUnpinEmbed pkgs { inherit primary; runtimeStage = stage; } drv;
 
-        # Drop Cosmopolitan's `.symtab.amd64` from a cosmo APE's tail-ZIP.
-        # That entry is the symbol table cosmocc's apelink adds for crash
-        # backtraces (`--ftrace`/`--strace`), ~30-80 KB deflated and unused at
-        # runtime — stdenv `strip` can't reach it (it's a ZIP member, not an
-        # ELF section). `zip -d` removes just that member, preserving the PE
-        # prefix, `.cosmo`, any `usr/share/zoneinfo/*`, and our `unpin/*` entries.
-        # Self-guarding: no-op on mingw PE (no tail-ZIP). Apply AFTER withMan
-        # so it trims what's left once the man block is embedded.
+        # Drop Cosmopolitan's `.symtab.amd64` (apelink's crash-backtrace symtab,
+        # ~30-80 KB, unused at runtime) from a cosmo APE's tail-ZIP — stdenv strip
+        # can't reach a ZIP member. `zip -d` removes just it, preserving the PE
+        # prefix, `.cosmo`, zoneinfo and our `unpin/*` entries. No-op on mingw PE.
+        # Apply AFTER withMan.
         withCosmoStrip = pkgs: { primary }: drv:
           let
             binOutputName =
@@ -1686,42 +1398,27 @@
           });
 
         # Recipe-A multicall dispatcher generator (the `ld -r` family:
-        # e2fsprogs/util-linux/shadow/findutils/procps-ng). The input model is a
-        # NAME→FUNCTION table that is many-to-one
-        # (e2fsprogs: mkfs.ext2/3/4 → mke2fs_main; e2label/findfs → tune2fs_main),
-        # so the symbol can't be derived from the applet name. The caller writes
-        # `multicall/applets.list` as a TSV, one row per dispatchable name:
+        # e2fsprogs/util-linux/shadow/findutils/procps-ng). The caller writes
+        # `multicall/applets.list` as a TSV (the NAME→FUNCTION table is
+        # many-to-one, so the symbol can't be derived from the applet name):
         #
         #     <applet-name>\t<fn-base>      (the C symbol is <fn-base>_main)
         #
-        # Aliases are just extra rows pointing at the same <fn-base> (the upstream
-        # tool re-checks argv[0] itself). util-linux/shadow/procps-ng already
-        # produce this TSV from their Makefile parse; e2fsprogs/findutils write it
-        # from a static list. The dispatcher this emits follows the standard
-        # dispatch contract: an alias symlink (`base != CANON` matching an
-        # applet) runs via argv[0] and ignores `--unpin-program`; the canonical
-        # name (or a renamed copy) selects an applet with `--unpin-program=NAME`
-        # as the first argument (no positional form). `copy_basename` strips a
-        # `/`/`\\` dir prefix (the `\\` is unconditional — cosmo APE argv[0] can
-        # carry it and `_WIN32` isn't defined for cosmo), a trailing `.exe`, and a
-        # libtool `lt-` prefix before matching. Invoke at COLUMN 0, after the TSV.
+        # Aliases are extra rows at the same <fn-base>. Dispatch contract: an
+        # alias symlink (base != canon, matching an applet) runs via argv[0] and
+        # ignores `--unpin-program`; the canonical name (or a renamed copy) selects
+        # via `--unpin-program=NAME` first arg. `copy_basename` strips a `/`/`\\`
+        # dir prefix (`\\` unconditional — cosmo APE argv[0] carries it and
+        # `_WIN32` isn't defined for cosmo), a trailing `.exe`, and a `lt-` prefix.
         #
-        # Optional `defaultApplet` (a <fn-base>, NOT an applet name — its symbol
-        # `<defaultApplet>_main` must exist): a bare invocation runs it instead of
-        # printing usage. procps-ng uses `src_ps_pscommand` so `procps-ng
-        # --version` and a renamed binary route to ps. See docs/multicall.md.
+        # Optional `defaultApplet` (a <fn-base>): a bare invocation runs it instead
+        # of printing usage (procps-ng → ps). See docs/multicall.md.
         #
-        # Applet entries are called as `fn(argc, argv, environ)` — the THREE-arg
-        # main form. Some programs (notably bash) declare `main(argc,argv,env)`
-        # and read the environment from the THIRD main argument, NOT the environ
-        # global; a 2-arg call leaves that parameter holding a garbage register
-        # → SIGSEGV at startup. Passing environ is ABI-safe for the common 2-arg
-        # mains (coreutils, grep, …) — they simply ignore the extra register.
-        # The cosmo path links the renamed main DIRECTLY, so the 3rd arg reaches
-        # it. The bitcode-LTO path interposes a trampoline per program; that
-        # trampoline is ALSO 3-arg and forwards all three (see
-        # multicallModuleHookLTO) — a 2-arg trampoline would drop environ and the
-        # 3rd-arg-main would receive NULL (verified: it does, deterministically).
+        # Applets are called `fn(argc, argv, environ)` — the THREE-arg main form.
+        # bash declares main(argc,argv,env) and reads env from the 3rd arg; a
+        # 2-arg call leaves it a garbage register → SIGSEGV. Passing environ is
+        # ABI-safe for 2-arg mains (they ignore the extra register). The LTO path
+        # interposes a 3-arg trampoline that forwards all three.
         multicallTableDispatcherC = { name, defaultApplet ? null }:
           let
             fallbackC =
@@ -1825,28 +1522,21 @@ CBODY
       } > multicall/dispatcher.c'';
 
         # ── Multicall MODULE artifact (the `.a`-generation scheme) ──────────
-        # Add a `module` output to a package's NORMAL build carrying a
-        # self-describing multicall module: `module.a` (the package's own
-        # objects, with `main`→`unpin__<pkg>__<prog>_main` and every other
-        # defined global namespaced `unpin__<pkg>__<prog>__<sym>`) plus the
-        # package's PRIVATE bundled archives (gnulib) with their callbacks INTO
-        # the program rewritten to the namespaced names. Produced purely by
-        # post-processing — `objcopy --redefine-syms` over the objects the build
-        # ALREADY compiled — so no recompile and no second build: it rides the
-        # same builder as the shipped binary (overrideAttrs composes in place,
-        # so the .o tree is still present in postBuild even under withAliases).
+        # Add a `module` output carrying a self-describing multicall module:
+        # `module.a` (the package's objects, `main`→`unpin__<pkg>__<prog>_main`,
+        # every other defined global namespaced) plus the package's PRIVATE
+        # bundled archives (gnulib) with their callbacks rewritten to the
+        # namespaced names. Produced by `objcopy --redefine-syms` over the
+        # already-compiled objects — no recompile, rides the shipped binary's
+        # builder.
         #
-        # The manifest (applets / depArchives / requires) is a Nix value the
-        # caller assembles around this — see mkStandaloneFlake's `multicall`
-        # arg, which attaches it as `passthru.multicallModule`. The mega-builder
-        # (mkMegaMulticall) links N such modules into one busybox-style binary.
-        #
-        # Distinguishes a PRIVATE bundled lib (gnulib: `internalArchives` —
-        # callbacks namespaced, own defs untouched so they stay dedupable across
-        # packages) from a CLEAN external dep (pcre2/zlib: `depArchives` in the
-        # manifest — never touched, deduped by member at mega-link). Linux
-        # native only for now (ELF symbol shapes + objcopy redef map). See
-        # docs/multicall.md and the mega-multicall plan.
+        # The manifest (applets/depArchives/requires) is assembled by the caller
+        # (mkStandaloneFlake's `multicall` arg, attached as
+        # passthru.multicallModule); mkMegaMulticall links N modules into one
+        # binary. A PRIVATE bundled lib (gnulib: `internalArchives`, callbacks
+        # namespaced but own defs untouched so they stay dedupable) is
+        # distinguished from a CLEAN external dep (`depArchives`, never touched,
+        # deduped at mega-link). Linux native only for now. See docs/multicall.md.
         multicallModuleHook =
           { package                 # "grep" — namespace component
           , programs                # [ { name; objs = [ "src/x.o" ]; } ]
@@ -1900,34 +1590,26 @@ CBODY
           });
 
         # Bitcode-LTO variant of multicallModuleHook for engine = "unpin-llvm".
-        # The adapter (lto = true) compiled every object as LLVM BITCODE, so the
-        # ELF-only objcopy --redefine-syms of multicallModuleHook can't apply
-        # (llvm-objcopy refuses bitcode). Instead, per program:
+        # The adapter compiled every object as LLVM BITCODE, so objcopy
+        # --redefine-syms can't apply (llvm-objcopy refuses bitcode). Per program:
         #
         #   1. a tiny trampoline `unpin__<pkg>__<prog>_main` calls the program's
-        #      `main` (no recompile of the program — the trampoline is the only
-        #      thing compiled here; the program's bitcode objects are used as-is);
-        #   2. a REAL linker (`ld.lld -r --lto-emit-llvm`, NOT llvm-link) folds
-        #      the program's bitcode objects + the trampoline + the PRIVATE
-        #      internalArchives (gnulib) into one bitcode module — lld's
-        #      on-demand archive pull (first-def-wins dedup + back-ref
-        #      resolution) is what llvm-link's whole-load/single-pass can't do;
-        #      see the detailed note on `perProgram` below for why;
-        #   3. `opt -passes=internalize` keeping ONLY the trampoline entry
-        #      localizes everything else — the real `main` (NOT auto-preserved by
-        #      LLVM 21's new-PM InternalizePass, unlike legacy -internalize) and
-        #      every shared/callback global — to internal linkage, so two
-        #      programs' same-named statics can't collide at the mega-link.
+        #      `main` (only the trampoline is compiled; bitcode objs used as-is);
+        #   2. a REAL linker (`ld.lld -r --lto-emit-llvm`, NOT llvm-link) folds the
+        #      program's bitcode objs + trampoline + PRIVATE internalArchives into
+        #      one bitcode module — lld's on-demand archive pull (first-def dedup +
+        #      back-ref resolution) is what llvm-link can't do (see perProgram);
+        #   3. `opt -passes=internalize` keeps ONLY the trampoline entry external,
+        #      localizing everything else (incl. the real `main`, which LLVM 21's
+        #      new-PM InternalizePass does NOT auto-preserve) so two programs'
+        #      same-named statics can't collide at the mega-link.
         #
-        # The per-program internalized modules are llvm-link'd into one
-        # module.bc; llvm-link auto-renames colliding internals (main → main.1,
-        # …) while the external entries stay distinct. CLEAN external depArchives
-        # (pcre2/zlib) are NOT folded — they stay external in the manifest,
-        # deduped by member at the mega-link (which links with -flto -fuse-ld=lld
-        # for whole-program LTO across all modules). Linux-native only.
-        #
-        # Needs llvm-link + opt, which the vendored multicall `llvm` carries
-        # (toolchain Patch 4); they're passed as `llvm` = "${toolchain}/bin/llvm".
+        # The per-program modules are llvm-link'd into one module.bc (colliding
+        # internals auto-renamed, external entries stay distinct). CLEAN external
+        # depArchives stay external in the manifest, deduped at the mega-link
+        # (which is -flto -fuse-ld=lld for whole-program LTO). Linux-native only.
+        # Needs llvm-link + opt from the vendored `llvm` (toolchain Patch 4),
+        # passed as `llvm` = "${toolchain}/bin/llvm".
         multicallModuleHookLTO =
           { package                 # "grep" — namespace component
           , programs                # [ { name; objs = [ "src/x.o" ]; } ]
@@ -1943,24 +1625,17 @@ CBODY
             san = n: nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ] n;
             entryOf = p: "unpin__${san package}__${san p.name}_main";
             spaceSep = nixpkgs.lib.concatStringsSep " ";
-            # Fold the program's bitcode objects + trampoline + the PRIVATE
-            # archives into one module with a REAL linker (ld.lld -r), not
-            # llvm-link. llvm-link has no proper archive semantics: it either
-            # whole-loads every archive (duplicate strong defs when a shared
-            # helper is bundled into several members — coreutils' every
-            # libsinglebin_*.a carries its own blake2b-ref.o/cksum.o; gnulib
-            # lists backupfile twice → "symbol multiply defined") or, with
-            # --only-needed, does a single left-to-right pass that can't satisfy
-            # cross-archive back-references (basenc → base32's isubase32, df →
-            # gnulib c_iscntrl). lld pulls archive members on demand, takes the
-            # first definition and skips the rest (dedup), and resolves
-            # back-references by default (no --start-group needed) — exactly the
-            # native single-binary link. `-r` keeps it relocatable so libc/dep
-            # symbols stay undefined for the mega-link; `--lto-emit-llvm` writes
-            # the merged result as bitcode (inputs are bitcode) instead of
-            # codegen'ing it, so the cross-module LTO chain stays intact. The
-            # program objects are passed as objects (always included, never GC'd
-            # under -r). Then opt internalizes everything but the entry.
+            # Fold the program's bitcode objs + trampoline + PRIVATE archives
+            # into one module with a REAL linker (ld.lld -r), not llvm-link.
+            # llvm-link has no archive semantics: it whole-loads (duplicate strong
+            # defs — coreutils' libsinglebin_*.a each carry blake2b-ref.o →
+            # "multiply defined") or, with --only-needed, a single left-to-right
+            # pass that can't satisfy cross-archive back-references. lld pulls
+            # members on demand, first-def-wins dedup, resolves back-refs by
+            # default — the native single-binary link. `-r` keeps libc/dep symbols
+            # undefined for the mega-link; `--lto-emit-llvm` writes bitcode (not
+            # codegen) so the cross-module LTO chain stays intact. Then opt
+            # internalizes everything but the entry.
             perProgram = p:
               let
                 linkBc = "multicall/link_${san p.name}.bc";
@@ -2100,35 +1775,26 @@ CBODY
             '';
           });
 
-        # Cosmo (APE) multicall MODULE emitter for engine = "cosmocc". The
-        # bitcode/LTO emitter can't be used — ld.lld won't link cosmo objects
-        # (the IFUNC/IPLT wall, see the cosmo-PE spike) — so the cosmo mega-link
-        # is a NATIVE link through cosmocc + ld.bfd + apelink, and the module
-        # carries plain renamed ELF objects/archives (cosmo objects are ELF
-        # before apelink, so `objcopy --redefine-syms` applies directly).
+        # Cosmo (APE) multicall MODULE emitter for engine = "cosmocc". ld.lld
+        # won't link cosmo objects (the IFUNC/IPLT wall), so the cosmo mega-link
+        # is NATIVE through cosmocc + ld.bfd + apelink and the module carries
+        # plain renamed ELF objects (cosmo objects are ELF before apelink, so
+        # objcopy --redefine-syms applies directly).
         #
-        # FULL per-package namespacing (stronger than multicallModuleHook's
-        # per-program scheme): every DEFINED global across the program objects
-        # AND the package's own archives is renamed `unpin__<pkg>__<sym>`
-        # (`main` → `unpin__<pkg>__<prog>_main`). The same map is applied to the
-        # objects and to BOTH archive buckets, so a package's internal
-        # references follow the rename and stay resolved, while libc's undefined
-        # symbols are untouched — making every package hermetic and
-        # cross-package symbol collisions impossible (no reliance on archive
-        # member dedup, which the cosmo native link can't guarantee across
-        # packages — cf. the "blake2 multiply defined" failure in the LTO path).
+        # FULL per-package namespacing (stronger than the per-program scheme):
+        # every defined global across objs AND the package's archives is renamed
+        # `unpin__<pkg>__<sym>` (`main` → the entry), so internal references stay
+        # resolved while libc's undefined symbols are untouched — every package is
+        # hermetic, no reliance on archive-member dedup (which the cosmo native
+        # link can't guarantee — cf. the "blake2 multiply defined" LTO failure).
         #
-        # Three staged buckets preserve the package's NATIVE link order at the
-        # mega-link (mkMegaMulticall's cosmo branch links them in this order):
-        #   objs/    program objects — linked DIRECT (always pulled), so a
-        #            program object that strongly overrides an archive symbol
-        #            (coreutils csplit.o's own xalloc_die) wins before any
-        #            archive is scanned;
-        #   applet/  per-applet archives — scanned (in a --start-group) BEFORE
-        #            gnulib, so the override is satisfied from the applet object,
-        #            not gnulib's default (which would then collide);
-        #   gnulib/  the private bundled archive(s) — scanned AFTER applets.
-        # Single-program packages (coreutils single-binary, bash, dash) only.
+        # Three staged buckets preserve the NATIVE link order at the mega-link:
+        #   objs/    program objects, linked DIRECT, so an object that overrides
+        #            an archive symbol (csplit.o's xalloc_die) wins first;
+        #   applet/  per-applet archives, scanned BEFORE gnulib so the override is
+        #            satisfied from the applet object, not gnulib's default;
+        #   gnulib/  the private bundled archive(s), scanned AFTER applets.
+        # Single-program packages only.
         multicallModuleHookCosmo =
           { package                  # "bash" — namespace component
           , program                  # single program; entry = unpin__<pkg>__<prog>_main
@@ -2194,25 +1860,22 @@ CBODY
           });
 
         # Cross-platform multicall fold (cpp-rename / "X+Z" recipe). A package
-        # that ships N sibling programs from one source tree (each its own
-        # subdir Makefile, sharing a clean static lib with no callbacks into the
-        # programs) is folded into ONE binary at bin/<primary>, every other
-        # program name an argv[0] alias.
+        # shipping N sibling programs from one source tree (each its own subdir
+        # Makefile, sharing a clean static lib with no callbacks into the
+        # programs) folds into ONE binary at bin/<primary>, the others argv[0]
+        # aliases.
         #
         # Each program is recompiled with a per-program `-include <p>.rename.h`
-        # that renames `main`→<san>_main and namespaces every other defined
-        # global behind `<san>__`, so two programs can't collide. Objects stay
-        # normal compiled .o (no partial link), so the cross lld's `--gc-sections`
-        # is happy (unlike the older ld -r + objcopy fold, which trips i686's
-        # linkonce thunks) and the same recipe works on ELF, Mach-O (leading-`_`
-        # strip + `S`-type data symbols) and cosmo APE. Shared static libs
-        # (libacl.a, libexfat.a) are NOT renamed — called identically by every
-        # program, no collisions — so they stay one copy, passed via `linkExtra`.
+        # that renames `main`→<san>_main and namespaces every other defined global
+        # behind `<san>__`. Objects stay normal .o (no partial link), so the cross
+        # lld's `--gc-sections` is happy (unlike the older ld -r + objcopy fold,
+        # which trips i686's linkonce thunks) and the recipe works on ELF, Mach-O
+        # (leading-`_` strip) and cosmo APE. Shared static libs (libacl.a) are NOT
+        # renamed (called identically by every program), passed via `linkExtra`.
         #
-        # Generalized from the per-package mc.nix used by acl/psmisc/dosfstools/
-        # exfatprogs (bc/e2fsprogs keep bespoke variants: bc is procps-class —
-        # its shared number.o calls back into per-program rt_error — so it can't
-        # share lib objects). See docs/multicall.md.
+        # Generalized from the per-package mc.nix (acl/psmisc/dosfstools/
+        # exfatprogs); bc/e2fsprogs keep bespoke variants (bc's shared number.o
+        # calls back into per-program rt_error). See docs/multicall.md.
         cppRenameMulticall =
           { pkgs                    # build-host pkgs (writeText, withAliases)
           , basePkg                 # pkgsStatic.<pkg> (or cosmo/mingw pkg) to override
@@ -2355,17 +2018,13 @@ CBODY
             multicall;
 
         # The external static archives a multicall build links, derived from the
-        # build derivation itself instead of being hand-named per package. We
-        # walk the TRANSITIVE propagated-input closure (+ direct buildInputs) and
-        # return their store-path DIRECTORIES — pure strings, NO
-        # import-from-derivation: we never readDir at eval time, so evaluating a
-        # package flake does not force building its deps. The mega builder globs
-        # `<dir>/lib/*.a` at BUILD time (the deps are real build inputs there).
-        # libc/cc are implicit stdenv deps and never appear in this closure, so
-        # there is nothing to exclude; unreferenced archives are inert under
-        # archive-link semantics (the link wraps them in --start-group). Reads
-        # buildInputs off the FINAL build drv, so a recipe's `.override` that adds
-        # deps (coreutils' acl/attr) is reflected.
+        # build drv rather than hand-named. Walks the transitive propagated-input
+        # closure (+ direct buildInputs) and returns store-path DIRECTORIES — pure
+        # strings, no IFD (never readDir at eval time, so evaluating a flake
+        # doesn't force its deps). The mega builder globs `<dir>/lib/*.a` at build
+        # time. libc/cc are stdenv deps and never appear here; unreferenced
+        # archives are inert under archive-link semantics. Reads the FINAL build
+        # drv, so an `.override` adding deps (coreutils' acl/attr) is reflected.
         multicallExternalDepDirs = drv:
           let
             isDrv = d: d != null && builtins.isAttrs d && (d ? outPath);
@@ -2384,27 +2043,21 @@ CBODY
           in nixpkgs.lib.unique (builtins.concatMap (item: outsOf item.val) closure);
 
         # mkMegaMulticall: fold N package multicall MODULES (the
-        # passthru.multicallModule manifests mkStandaloneFlake attaches) into ONE
-        # busybox-style binary "unpinbox". Each manifest carries:
-        #   moduleFormat  "bitcode" (the -flto emitter) | "elf-archive" (objcopy)
+        # passthru.multicallModule manifests) into ONE busybox-style binary
+        # "unpinbox". Each manifest carries:
+        #   moduleFormat  "bitcode" (-flto emitter) | "elf-archive" (objcopy)
         #   moduleArchive  store path to module.bc / module.a
         #   depArchives    external clean .a (pcre2, zlib) — passthru store paths
         #   applets        [ { name; entry } ]  entry = unpin__<pkg>__<prog>_main
         #   requires       { cxx; group; … }
         #
-        # The dispatcher (multicallTableDispatcherC) routes argv[0]-basename or a
-        # leading `--unpin-program=NAME` to the matching entry. Bitcode modules
-        # link with `clang -flto -fuse-ld=lld` (whole-program LTO across every
-        # package); the module.bc files are plain objects (always pulled), the
-        # external depArchives are passed once, deduped by store path (the linker
-        # pulls only the members each module needs). The link runs through
-        # unpinAdapterStdenv so the on-demand musl sysroot (libc, libc++) is
-        # seeded and each entry's libc/pcre2 U-symbols resolve.
-        #
-        # Applet-name collisions across packages are a HARD error (the plan's
-        # recommended policy) — pass `nameOverrides = { old = new; }` to rename.
-        # `cppRenameMulticall` is the degenerate single-package fold; this is the
-        # cross-package one. See docs/multicall.md and the mega-multicall plan.
+        # The dispatcher routes argv[0]-basename or `--unpin-program=NAME` to the
+        # matching entry. Bitcode modules link with `clang -flto -fuse-ld=lld`
+        # (whole-program LTO); external depArchives passed once, deduped by store
+        # path. The link runs through unpinAdapterStdenv so the on-demand musl
+        # sysroot is seeded. Applet-name collisions across packages are a HARD
+        # error — pass `nameOverrides = { old = new; }`. cppRenameMulticall is the
+        # single-package fold; this is the cross-package one. See docs/multicall.md.
         mkMegaMulticall =
           { pkgs
           , name ? "unpinbox"
@@ -2449,10 +2102,9 @@ CBODY
               (map (m: m.nativeArchive or null) modules);
             depArchives = nixpkgs.lib.unique
               (nixpkgs.lib.concatMap (m: m.depArchives) modules);
-            # Auto-derived external dep dirs (per-module input closure). The
-            # builder globs <dir>/lib/*.a at build time and skips libc-family
-            # archives (the engine/cosmo provides libc — a deep closure that
-            # surfaces musl's libc.a must not clash with it).
+            # Auto-derived external dep dirs. The builder globs <dir>/lib/*.a and
+            # skips libc-family archives (the engine/cosmo provides libc; a deep
+            # closure surfacing musl's libc.a must not clash with it).
             depInputDirs = nixpkgs.lib.unique
               (nixpkgs.lib.concatMap (m: m.depInputDirs or [ ]) modules);
             # Shell prelude (shared by both builders) that fills a `autodeps`
@@ -2476,13 +2128,10 @@ CBODY
             # target. Derived from the link `pkgs` host platform.
             isWin = pkgs.stdenv.hostPlatform.isWindows or false;
             binFile = if isWin then "${name}.exe" else name;
-            # darwin (Mach-O) mega: `-fuse-ld=lld` still auto-selects the right lld
-            # flavor (ld64.lld) by target, but ld64 rejects the GNU linker flags the
-            # ELF/PE path uses — `--start-group`/`--end-group` (ld64 resolves archive
-            # back-references in multiple passes by default, so no group is needed)
-            # and `-s` (ld64's strip-at-link spelling is `-x`, strip local symbols).
-            # So darwin drops the groups and swaps `-Wl,-s`→`-Wl,-x`. (The final
-            # strippedOrJoined strip runs regardless.) No-op off darwin.
+            # darwin (Mach-O) mega: ld64 rejects the GNU flags the ELF/PE path
+            # uses — `--start-group`/`--end-group` (ld64 resolves back-refs
+            # multi-pass, no group needed) and `-s` (ld64's spelling is `-x`). So
+            # darwin drops the groups and swaps `-Wl,-s`→`-Wl,-x`. No-op off darwin.
             isDarwinHost = pkgs.stdenv.hostPlatform.isDarwin or false;
             stripLinkFlag = if isDarwinHost then "-Wl,-x" else "-Wl,-s";
             # A group is needed when there is more than one archive to back-ref
@@ -2493,32 +2142,29 @@ CBODY
             groupOpen = nixpkgs.lib.optionalString needGroup "-Wl,--start-group";
             groupClose = nixpkgs.lib.optionalString needGroup "-Wl,--end-group";
             # darwin frameworks a folded module references (htop → IOKit /
-            # CoreFoundation). The per-package build linked them via its own
-            # configure, but the mega relinks every module from bitcode, so it must
-            # name them itself. Union across modules; darwin-only, on demand.
+            # CoreFoundation): the mega relinks from bitcode, so it must name them
+            # itself. Union across modules, darwin-only.
             darwinFrameworks = nixpkgs.lib.unique
               (nixpkgs.lib.concatMap (m: (m.requires or { }).frameworks or [ ]) modules);
-            # Just the `-framework <each>` flags. The engine adapter (SDK-always:
-            # SDKROOT points the darwin front at the packaged SDK) already adds
-            # `-F <sdk>/System/Library/Frameworks`, `-L <sdk>/usr/lib` and `-lSystem`
-            # to every darwin link, so the frameworks and CoreFoundation's re-export
-            # of libobjc resolve from there — the mega only names the frameworks.
+            # Just the `-framework <each>` flags. The engine adapter already adds
+            # `-F <sdk>/.../Frameworks`, `-L <sdk>/usr/lib` and `-lSystem`, so the
+            # frameworks (and CoreFoundation's libobjc re-export) resolve from there.
             darwinFrameworkFlags = nixpkgs.lib.optionalString
               (isDarwinHost && darwinFrameworks != [ ])
               (nixpkgs.lib.concatMapStringsSep " " (f: "-framework ${f}") darwinFrameworks);
             adapter = unpinAdapterStdenv {
               inherit pkgs toolchain target;
-              # Cross mega: when pkgs is a cross set the link runs through the
-              # cross stdenv (lld cross-links the per-arch modules); only the
-              # sysroot sanity run is gated off. toolchain stays the build-host
-              # one (buildPlatform.system) — clang -target emits the host arch.
+              # Cross mega: with a cross pkgs the link runs through the cross
+              # stdenv (lld cross-links per-arch modules); only the sysroot sanity
+              # run is gated off. toolchain stays build-host (clang -target emits
+              # the host arch).
               native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
               cxx = anyCxx;
               lto = anyBitcode;
             };
 
-            # ── Bitcode/ELF path (engine default | unpin-llvm): one ELF via the
-            # unpin-llvm adapter, whole-program LTO across modules with lld. ──
+            # ── Bitcode/ELF path: one ELF via the unpin-llvm adapter,
+            # whole-program LTO across modules with lld. ──
             megaElfDrv = adapter.mkDerivation {
               inherit name;
               dontUnpack = true;
@@ -2550,10 +2196,9 @@ CBODY
               '';
             };
 
-            # ── Cosmo path (engine cosmocc): native cosmocc link in each
-            # package's NATIVE order (objs DIRECT, then applet group, then
-            # gnulib group), then apelink to a fat APE (every OS, runs locally)
-            # and a thin Windows PE32+. cosmo objects can't go through lld. ──
+            # ── Cosmo path: native cosmocc link in each package's NATIVE order
+            # (objs DIRECT, then applet group, then gnulib group), then apelink to
+            # a fat APE + a thin Windows PE32+. cosmo objects can't go through lld. ──
             cosmo = cosmoStdenv pkgs;
             cosmoApelink = "${cosmo.cosmocc}/bin/apelink";
             cosmoVbits = toString cosmo.platformBits.windows;
@@ -2599,16 +2244,11 @@ CBODY
             throw ("mkMegaMulticall: applet name collision across packages: "
               + nixpkgs.lib.concatStringsSep ", " dups
               + " — pass nameOverrides to rename");
-          # withAliases embeds UNPIN_META into the primary binary; for cosmo it
-          # resolves `${name}` → `${name}.exe` (withUnpinEmbed's .exe fallback),
-          # so the shipped Windows artifact carries the alias set. The fat
-          # `.ape` rides alongside for local cross-OS testing.
-          #
-          # Man MERGE: the per-package withMan embeds man into each tool's OWN
-          # standalone binary, which the mega never ships. Re-stage every folded
-          # package's share/man into one tree and run withMan once over the mega
-          # so `unpin man <tool>` works for every applet. No-op when no module
-          # carries man (e.g. the cosmo manifest sets no manRoot).
+          # withAliases embeds UNPIN_META into the primary binary (cosmo resolves
+          # `${name}` → `${name}.exe`). Man MERGE: per-package withMan embeds man
+          # into each tool's OWN binary, which the mega never ships, so re-stage
+          # every folded package's share/man into one tree and run withMan once
+          # over the mega. No-op when no module carries man.
           let
             manRoots = nixpkgs.lib.unique
               (nixpkgs.lib.filter (x: x != null) (map (m: m.manRoot or null) modules));
@@ -2624,10 +2264,9 @@ CBODY
                   cp -rL --no-preserve=mode "$r/share/man/." "$out/share/man/" 2>/dev/null || true
                 done
               '';
-            # Drop the primary's own name from the alias set — the shipped binary
-            # IS `${name}` and needs no self-symlink. Load-bearing for the N=1
-            # self-fold whose package name is itself an applet (flac+metaflac →
-            # binary `flac`, alias `metaflac`).
+            # Drop the primary's own name from the alias set (the binary IS
+            # `${name}`). Load-bearing for the N=1 self-fold whose package name is
+            # itself an applet (flac+metaflac → binary `flac`, alias `metaflac`).
             aliased = withAliases pkgs { primary = name; aliases = nixpkgs.lib.filter (n: n != name) names; }
               (if cosmoMode then megaCosmoDrv else megaElfDrv);
             withManDrv =
@@ -2635,10 +2274,8 @@ CBODY
               else withMan pkgs { primary = name; manRoot = combinedMan; } aliased;
 
             # Same merge for embedded RUNTIME DATA (file's magic.mgc): re-stage
-            # every folded package's runtimeDataRoot into one tree, embedded once
-            # over the mega. Trees land at ZIP root, so each package's marker-rooted
-            # reads resolve in the mega exactly as in its standalone. No-op when no
-            # module carries runtime data (the common case).
+            # every runtimeDataRoot into one ZIP-root tree, embedded once over the
+            # mega. No-op when no module carries runtime data.
             rtRoots = nixpkgs.lib.unique
               (nixpkgs.lib.filter (x: x != null) (map (m: m.runtimeDataRoot or null) modules));
             combinedRt =
@@ -2661,26 +2298,22 @@ CBODY
           } withManDrv;
 
         # Why not overlays for per-package fixes? `appendOverlays` invalidates
-        # `pkgsBuildHost.stdenv` → cascade rebuild of compiler-rt-libc-static, ninja,
-        # python3 in pkgsStatic-darwin (none cached; Hydra only builds pkgsStatic-linux).
-        # 30-60 min of darwin CI to add one configureFlag. Fake-cross via differing
-        # config strings was tried and broke autotools (cross mode disables AC_RUN_IFELSE,
-        # which apple-sdk's atf needs). So `drv.override` / `.overrideAttrs` inside the
-        # consumer's `build`/`windowsBuild` closures (and the lib-only
-        # native-overlay/ + mingw-overlay/ overlay fragments) is the only path
-        # keeping both the cached toolchain AND autotools-native-mode configure
-        # runs.
+        # `pkgsBuildHost.stdenv` → cascade rebuild of compiler-rt-libc-static etc.
+        # in pkgsStatic-darwin (uncached; Hydra only builds pkgsStatic-linux) =
+        # 30-60 min of darwin CI per configureFlag. Fake-cross via differing config
+        # strings broke autotools (cross mode disables AC_RUN_IFELSE, which
+        # apple-sdk's atf needs). So `drv.override`/`.overrideAttrs` inside the
+        # consumer closures is the only path keeping both the cached toolchain AND
+        # native-mode configure.
 
-        # Rebuild `drv` with every dep in `drv.override.__functionArgs` swapped for
-        # its `pkgsStatic` counterpart (.a-only, no shared libs at all), falling back
-        # to `dropSharedLibs` on the regular version when no pkgsStatic variant exists.
-        #
-        # Used by `tmux/flake.nix`'s darwin build closure: pkgsStatic.tmux itself fails to link
-        # (configure.ac passes `-static` globally → libSystem probe fails), so we keep
-        # regular tmux but swap its deps for the static variants. Preferring pkgsStatic
-        # over postFixup-delete dodges the dyld-at-build-time pitfall (ncurses ships
-        # `tic`/`infocmp` binaries dynamically linked to `libncursesw.dylib`; deleting
-        # the dylib breaks tmux-terminfo, which `tic`s at build time).
+        # Rebuild `drv` with every dep in `drv.override.__functionArgs` swapped
+        # for its `pkgsStatic` counterpart (.a-only), falling back to
+        # `dropSharedLibs` when no pkgsStatic variant exists. Used by tmux's darwin
+        # closure: pkgsStatic.tmux itself fails to link (configure.ac passes
+        # `-static` → libSystem probe fails), so keep regular tmux but static its
+        # deps. Preferring pkgsStatic over postFixup-delete dodges the
+        # dyld-at-build-time pitfall (ncurses' tic links libncursesw.dylib and runs
+        # at build time).
         withDepsSharedPruned = pkgs: drv:
           let
             fnArgs = drv.override.__functionArgs or { };
@@ -2705,25 +2338,14 @@ CBODY
           in
           drv.override overrides;
 
-        # `mingwStaticCross pkgs` = `pkgs.pkgsCross.mingwW64` + overlay that, on mingw:
-        #
-        # (1) Wraps stdenv with `makeStaticLibraries` → injects `--enable-static
-        #     --disable-shared` (autotools), `-DBUILD_SHARED_LIBS=OFF` (cmake),
-        #     `-Ddefault_library=static` (meson) into every mkDerivation.
-        #
-        # (2) Sets `stdenv.hostPlatform.isStatic = true`. A "white lie" at the platform
-        #     attr level — NOT a re-instantiation. Upstream recipes key off isStatic
-        #     directly (zlib's `shared ? !isStatic`, zstd's static knob, libpsl's .pc
-        #     handling, ...) and produce .a-only outputs when they see it. Without this
-        #     fudge we'd per-package-override each one.
-        #
-        # Safe for mingw: isStatic here is a build-flag convention; mingw-w64 / mcfgthread
-        # produce byte-identical .a either way (no libc swap analogous to glibc→musl).
-        # cc/bintools and the cross gcc come verbatim from cache.nixos.org — the overlay
-        # only wraps mkDerivation.
-        #
-        # `if isMinGW` gate: pkgsBuildHost of the cross set is linux, so the then-branch
-        # doesn't fire there and pkgsBuildHost.stdenv keeps its cache hash.
+        # `mingwStaticCross pkgs` = `pkgs.pkgsCross.mingwW64` + an overlay that,
+        # on mingw, (1) wraps stdenv with `makeStaticLibraries` (injects
+        # --enable-static/-DBUILD_SHARED_LIBS=OFF/-Ddefault_library=static) and
+        # (2) sets `hostPlatform.isStatic = true` — a white lie so upstream recipes
+        # keying off isStatic (zlib, zstd, libpsl) produce .a-only without a
+        # per-package override. Safe for mingw (mingw-w64/mcfgthread produce
+        # byte-identical .a either way; no glibc→musl libc swap). The `if isMinGW`
+        # gate keeps the linux pkgsBuildHost.stdenv cache-hashed.
         mingwStaticCross = pkgs: pkgs.pkgsCross.mingwW64.appendOverlays [
           (selfPkgs: superPkgs:
             if superPkgs.stdenv.hostPlatform.isMinGW or false
@@ -2743,25 +2365,19 @@ CBODY
             else { })
         ];
 
-        # `darwinStaticCross dpkgs` = the darwin cross set `dpkgs` + an overlay that,
-        # on darwin, wraps stdenv with `makeStaticLibraries` → injects
-        # `--enable-static --disable-shared` (autotools), `-DBUILD_SHARED_LIBS=OFF`
-        # (cmake), `-Ddefault_library=static` (meson) into every mkDerivation, so deps
-        # build `.a`-only. This is what makes the engine darwin MODULE path viable:
-        # a dep that builds a dylib through the engine fails twice — libtool emits the
-        # ELF `-soname` (the engine cc reports isGNU, so libtool picks ELF shared-lib
-        # conventions instead of darwin `-install_name`) which ld64.lld rejects, and a
-        # re-exporting dylib (libiconv → libcharset) trips the fixup's
-        # `install_name_tool`, whose LLVM build can't rewrite `LC_REEXPORT_DYLIB`.
-        # Forcing static-only sidesteps BOTH — no dylib is ever produced.
+        # `darwinStaticCross dpkgs` = the darwin cross set + an overlay that, on
+        # darwin, wraps stdenv with `makeStaticLibraries` so deps build `.a`-only.
+        # Required for the engine darwin MODULE path: a dep that builds a dylib
+        # through the engine fails twice — libtool emits the ELF `-soname` (the
+        # engine cc reports isGNU) which ld64.lld rejects, and a re-exporting dylib
+        # (libiconv → libcharset) trips install_name_tool's LLVM build on
+        # LC_REEXPORT_DYLIB. Static-only sidesteps both.
         #
-        # UNLIKE mingwStaticCross, this does NOT set `hostPlatform.isStatic = true`:
-        # on darwin that white-lie makes recipes add `-static` (a FULL static link),
-        # which ld64 rejects because macOS has no static libSystem (the very trap
-        # `filterEnableStaticOnDarwin` exists to avoid). makeStaticLibraries only
-        # toggles the library build, never the final-executable link mode, so it is
-        # safe here. `dpkgs` is the (engine-swapped) `pkgsCross.{x86_64,aarch64}-darwin`
-        # set; the `isDarwin` gate keeps the linux build host's stdenv untouched.
+        # UNLIKE mingwStaticCross, does NOT set `hostPlatform.isStatic`: on darwin
+        # that makes recipes add `-static` (a FULL static link), which ld64 rejects
+        # (no static libSystem — the filterEnableStaticOnDarwin trap).
+        # makeStaticLibraries toggles only the library build, never the executable
+        # link mode. The `isDarwin` gate keeps the linux build host untouched.
         darwinStaticCross = dpkgs: dpkgs.appendOverlays [
           (_selfPkgs: superPkgs:
             if superPkgs.stdenv.hostPlatform.isDarwin or false
@@ -2769,19 +2385,13 @@ CBODY
             else { })
         ];
 
-        # Finalize a mingw binary for shipping. Input must already be built through
-        # `mingwStaticCross` (libs are .a-only; `--enable-static --disable-shared`
-        # already injected by the stdenv adapter).
-        #
-        # Adds the piece the per-library adapter can't reach: libtool-aware
-        # `LDFLAGS=-all-static` at make-time so the FINAL link resolves to `.a` only.
-        # Without it, libtool picks any `.dll.a` in the link path and the DLL-link hook
-        # copies the matching `.dll` next to the binary.
-        #
-        # `staticDeps` threads via `.override` (libtool sees `.a` in the dep's lib
-        # output); NOT applied as overlay — gcc itself uses zlib/zstd → full xgcc
-        # rebuild. `filterConfigureFlag` strips flags the package adds unconditionally
-        # (curl's `--without-ssl` when `opensslSupport = false`).
+        # Finalize a mingw binary for shipping (input already built through
+        # `mingwStaticCross`). Adds libtool-aware `LDFLAGS=-all-static` at
+        # make-time so the FINAL link resolves to `.a` only; without it libtool
+        # picks a `.dll.a` and the DLL-link hook copies the `.dll` next to the
+        # binary. `staticDeps` threads via `.override` (NOT overlay — gcc uses
+        # zlib/zstd → full xgcc rebuild). `filterConfigureFlag` strips flags the
+        # package adds unconditionally (curl's `--without-ssl`).
         mingwStaticBinary =
           { pkg
           , staticDeps ? { }
@@ -2799,14 +2409,14 @@ CBODY
               configureFlags =
                 (builtins.filter filterConfigureFlag (old.configureFlags or [ ]))
                 ++ extraConfigureFlags;
-              # Make-time only. Passing via NIX_LDFLAGS at configure breaks autoconf's
+              # Make-time only — NIX_LDFLAGS at configure breaks autoconf's
               # "C compiler works" probe.
               makeFlags = (old.makeFlags or [ ]) ++ [ "LDFLAGS=-all-static" ];
             } // extraOverrides old);
           in
-          # mingw headers (nghttp2, libpsl, libcurl, ...) default to
-          # `__declspec(dllimport)`. Static consumers need *_STATICLIB defined or
-          # the link leaves `__imp_*` unresolved.
+          # mingw headers (nghttp2, libpsl, libcurl) default to
+          # `__declspec(dllimport)`; static consumers need *_STATICLIB or the link
+          # leaves `__imp_*` unresolved.
           if extraCFlags == [ ]
           then withMingwOverrides
           else appendCFlags withMingwOverrides extraCFlags;
@@ -2825,27 +2435,24 @@ CBODY
             passthru = { inherit (stripped) version pname; };
           };
 
-        # Single output for both single- and multi-output drvs (strip vs symlinkJoin
-        # bin+man). Keeps `nix build` producing the bare `result` symlink that
-        # action-build's verify step looks for at `result/bin/<pkg>` — multi-output drvs
-        # would otherwise land at `result-bin`/`result-man` and verify fails.
+        # Single output for both single- and multi-output drvs (strip vs
+        # symlinkJoin bin+man), so `nix build` produces the bare `result` symlink
+        # action-build verifies at `result/bin/<pkg>` (multi-output drvs would land
+        # at `result-bin`/`result-man`).
         strippedOrJoined = pkgs: name: drv:
           let
-            # A `module` output (multicall .a-generation, opt-in) is a sidecar,
-            # not a shipped runtime output: ignore it when deciding strip-vs-join
-            # and let it ride through the strip branch untouched. Identity for
-            # every package that doesn't carry one.
+            # A `module` output (multicall, opt-in) is a sidecar, not a shipped
+            # output: ignore it when deciding strip-vs-join.
             shipOutputs = builtins.filter (o: o != "module") (drv.outputs or [ "out" ]);
             out =
               if shipOutputs == [ "out" ]
               then drv.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
               else packageWithMan pkgs name drv;
           in
-          # strip/symlinkJoin yield a synthetic meta that drops the upstream
-          # license/description/homepage. Carry them back onto the artifact so
-          # tooling (the website packages page, `unpin info`) can read them with
-          # no per-package table. `meta` is not part of the derivation hash, so
-          # this adds no rebuilds.
+          # strip/symlinkJoin yield a synthetic meta dropping upstream
+          # license/description/homepage. Carry them back so tooling (website
+          # packages page, `unpin info`) reads them. `meta` isn't hashed, no
+          # rebuilds.
           out // {
             meta = (out.meta or { }) // builtins.intersectAttrs
               { license = null; description = null; homepage = null; longDescription = null; }
@@ -2858,29 +2465,21 @@ CBODY
         #   packages.x86_64-linux."windows-x86_64"   = mingw-cross build
         #   apps.<system>.default                    = `nix run` entry
         #
-        # `name` is the user-facing id (catalog/gh-repo/binary). `pkgsAttr`
-        # overrides the nixpkgs / nativeFixes / pkgsCross.cosmo lookup when the
-        # nixpkgs attribute differs (e.g. nixpkgs ships `links2`, we ship as
-        # `links`). Falls back to `pkgs.pkgsStatic.${pkgsAttr}` /
-        # `pkgs.pkgsCross.mingwW64.${pkgsAttr}` / `pkgs.pkgsCross.cosmo.${pkgsAttr}`.
-        # Consumers wanting full control pass `build` / `windowsBuild` directly.
-        # `binName` overrides when bin name ≠ name. `nativeBuild = false` →
-        # windows-only (e.g. gvim: static GTK infeasible on linux, MacVim is its
-        # own .app bundle). `linuxOnly = true` → suppresses every darwin attr
-        # from packages.<sys>, used for Linux-kernel-only tools (kmod,
-        # util-linux, shadow, procps-ng, iproute2).
+        # `name` is the user-facing id. `pkgsAttr` overrides the nixpkgs/nativeFixes
+        # lookup when the nixpkgs attribute differs (nixpkgs `links2` → we ship
+        # `links`). `binName` overrides when bin name ≠ name. `nativeBuild = false`
+        # → windows-only (gvim). `linuxOnly = true` → suppresses every darwin attr,
+        # for Linux-kernel-only tools (kmod, util-linux, shadow, procps-ng).
         mkStandaloneFlake =
           { self
           , name
           , build ? null
           , windowsBuild ? null
-          # darwinBuild: consumer-supplied darwin (Mach-O) build closure, the
-          # darwin analogue of `windowsBuild`. Receives the engine+static darwin
-          # cross set (`darwinStaticCross` applied) and returns the package drv
-          # the module hook compiles. Needed when the darwin module must carry a
-          # source tweak the stock nixpkgs package lacks — e.g. grep's
-          # `restoreArgv0Dispatch` (egrep/fgrep → -E/-F), which the linux `build`
-          # and `windowsBuild` already apply. Null → use the stock cross package.
+          # darwinBuild: consumer darwin (Mach-O) build closure, the analogue of
+          # `windowsBuild`. Receives the engine+static darwin cross set and returns
+          # the drv the module hook compiles. For a darwin module needing a source
+          # tweak the stock package lacks (grep's restoreArgv0Dispatch). Null →
+          # stock cross package.
           , darwinBuild ? null
           , binName ? name
           , pkgsAttr ? name
@@ -2901,97 +2500,55 @@ CBODY
           # man (codec libs, coreutils/busybox) skip gracefully. Set false to
           # opt a package out.
           , embedMan ? true
-          # Override the man source for the windows/cosmo binary. The cross
-          # build ships no man of its own, so by default we graft the
-          # version-locked pages from the x86_64-linux nixpkgs build of
-          # `pkgsAttr` (see `winManSrc` below). That harvests EVERY page the
-          # upstream ships — including tools/libs the unpins binary doesn't
-          # actually carry (e.g. ffmpeg's ffplay.1 / libav*.3). Set this to a
-          # store path with `share/man` to embed exactly that set instead, so
-          # the windows binary's man matches what native/darwin embed (parity).
-          # null = keep the nixpkgs graft (default; unchanged for every package
-          # that doesn't opt in).
+          # Override the man source for the windows/cosmo binary. By default the
+          # cross build (which ships no man) grafts the version-locked pages from
+          # the x86_64-linux nixpkgs build, which over-harvests (ffmpeg's
+          # ffplay.1/libav*.3). Set a store path with `share/man` to embed exactly
+          # that set instead. null = keep the nixpkgs graft.
           , winManRoot ? null
-          # Opt-in smoke-test args, e.g. `[ "--version" ]`. action-build
-          # runs `<bin> ${smoke[*]}` after each build on runners with a
-          # matching ABI (and on a Windows runner for windows-x86_64).
-          # Exit 0 alone is too lax — some tools print "Unknown option"
-          # and still exit 0 (links does this on Windows). Pair with
-          # `smokePattern` to also require a stdout substring match.
-          # Skip both with null when the binary lacks a quick non-
-          # interactive probe.
+          # Opt-in smoke-test args, e.g. `[ "--version" ]`. action-build runs
+          # `<bin> ${smoke[*]}` after each build on matching-ABI runners. Exit 0
+          # alone is too lax (some tools print "Unknown option" and exit 0), so
+          # pair with `smokePattern` for a stdout substring match. null skips.
           , smoke ? null
           , smokePattern ? null
-          # Per-package exception to the darwin portability allow-list. A list
-          # of Apple PrivateFramework names (e.g. [ "MediaRemote" ]) that
-          # action-build's "Verify binary is portable" step will accept for
-          # THIS package only, in addition to the always-allowed public
-          # /System/Library/Frameworks/*, libSystem and libobjc. Default []:
-          # the strict contract is unchanged for every package that doesn't
-          # opt in. Use only when an upstream macOS feature genuinely depends
-          # on a private framework with no public equivalent (the symbols
-          # should be weak-import + NULL-guarded so the feature degrades
-          # gracefully if a future macOS drops the framework).
+          # Per-package exception to the darwin portability allow-list: Apple
+          # PrivateFramework names (e.g. [ "MediaRemote" ]) the verify step accepts
+          # for THIS package, beyond the always-allowed public Frameworks/libSystem/
+          # libobjc. Default []. Use only when a macOS feature depends on a private
+          # framework with no public equivalent (symbols should be weak-import +
+          # NULL-guarded).
           , darwinAllowPrivateFrameworks ? [ ]
-          # optimize: knobs for opt-level / stack protector / LTO / GC.
-          # Defaults merged with
-          # `{ lto = false; opt = null; ssp = true; gc = true; }`. Keys:
+          # optimize: knobs for opt-level / stack protector / LTO / GC, merged
+          # with `{ lto = false; opt = null; ssp = true; gc = true; }`:
           #
-          #   lto = true       → enable mkPkgsLTO overlay; chain-LTO consumer
-          #                       + its level-1 buildInputs (Linux native
-          #                       only — mingw/cosmocc fall through). OFF by
-          #                       default since the LTO chain has produced
-          #                       systemic recurring failures (autoconf
-          #                       conftest leakage, ltrans debug-info refs,
-          #                       muslLTO symbol internalization, buildInput
-          #                       test-suite miscompiles). For tiny static
-          #                       CLIs the size win is 5-15% and the latency
-          #                       win is invisible (ms-scale runs), so the
-          #                       maintenance cost was not justified. Opt
-          #                       in per-package when a hot path genuinely
-          #                       benefits.
-          #   opt = "-Os"      → appended to NIX_CFLAGS_COMPILE (wins over
-          #                       upstream). null leaves it to upstream
-          #                       (~ -O2). When LTO is active, null is
-          #                       resolved to -O2 inside the overlay.
-          #   ssp = false      → drop stack protector + skip the LTO
-          #                       `-Wl,-u,__stack_chk_fail` retention flag.
-          #   gc = false       → disable the function/data-sections +
-          #                       --gc-sections dead-code prune (mkPkgsGC,
-          #                       Linux native only). ON by default: it is a
-          #                       benign codegen knob (no LTO-class failures)
-          #                       that shrinks every binary 6-19% measured
-          #                       (jq 6%, aom 19% — the win scales with how
-          #                       much dead code the deps carry). LTO subsumes
-          #                       it (lto = true makes gc a no-op). NOTE for
-          #                       multicall packages whose `name` ≠ the nixpkgs
-          #                       attr: set `pkgsAttr` to the real lib (e.g.
-          #                       aom → "libaom") or the overlay finds nothing
-          #                       to rebuild and only the multicall final link
-          #                       gets --gc-sections (weak prune). The
-          #                       multicall.nix post-link must also append
-          #                       `${lib.gcSectionsFlag pkgs}` to reach that
-          #                       external link.
-          # Pin the artifact's `meta.license` to an explicit SPDX id (or list of
-          # them), e.g. "GPL-3.0-or-later". The upstream license is carried
-          # automatically by `strippedOrJoined`; set this only when the build has
-          # none (a custom mkDerivation — ffmpeg, python) or inherits a noisy
-          # multi-component list you want pinned to the effective license. Read
-          # by the website packages page; reusable by `unpin info`.
+          #   lto = true   → mkPkgsLTO overlay (Linux native only). OFF by default:
+          #                  the LTO chain has systemic recurring failures
+          #                  (conftest leakage, ltrans refs, muslLTO, buildInput
+          #                  miscompiles) and the 5-15% size win isn't worth it for
+          #                  tiny CLIs. Opt in per-package for a hot path.
+          #   opt = "-Os"  → appended to NIX_CFLAGS_COMPILE (wins over upstream).
+          #                  null leaves it to upstream (~ -O2); under LTO null → -O2.
+          #   ssp = false  → drop stack protector + the LTO retention flag.
+          #   gc = false   → disable the function/data-sections + --gc-sections
+          #                  prune (mkPkgsGC, Linux native). ON by default: benign,
+          #                  shrinks 6-19% (jq 6%, aom 19%). LTO subsumes it. NOTE:
+          #                  for multicall packages where `name` ≠ the nixpkgs attr,
+          #                  set `pkgsAttr` to the real lib (aom → "libaom") or only
+          #                  the multicall final link gets --gc-sections; that
+          #                  post-link must also append `${lib.gcSectionsFlag pkgs}`.
+          # Pin `meta.license` to an explicit SPDX id (or list), e.g.
+          # "GPL-3.0-or-later". strippedOrJoined carries upstream automatically;
+          # set this only when the build has none (custom mkDerivation — ffmpeg,
+          # python) or inherits a noisy list to pin.
           , license ? null
-          # Pin the artifact's `meta.description` (one line; read by the
-          # website packages page and reusable by `unpin info`). The upstream
-          # description is carried automatically by `strippedOrJoined`; set
-          # this only when the build has none (a custom mkDerivation —
-          # ffmpeg, python).
+          # Pin `meta.description` (one line). Set only when the build has none.
           , description ? null
           , optimize ? { }
-          # Opt a package into the multicall MODULE artifact (the .a-generation
-          # scheme). When set, the NATIVE-LINUX `packages.<sys>.default` build
-          # gains a `module` output (module.a + namespaced private archives,
-          # produced by post-processing the objects the build already compiled —
-          # no recompile) and a `passthru.multicallModule` manifest the
-          # mega-builder consumes. Shape:
+          # Opt a package into the multicall MODULE artifact. When set, the
+          # native-linux `packages.<sys>.default` build gains a `module` output
+          # (post-processed from already-compiled objects, no recompile) and a
+          # `passthru.multicallModule` manifest. Shape:
           #   multicall = {
           #     programs = [ { name = "grep"; objs = [ "src/grep.o" … ];
           #                    aliases = [ "egrep" "fgrep" ]; } ];
@@ -2999,23 +2556,15 @@ CBODY
           #     depArchives = [ "${pkgs.pkgsStatic.pcre2.out}/lib/libpcre2-8.a" ];
           #     requires = { };   # cxx/group/frameworks/… overrides
           #   }
-          # null = unchanged (every package that doesn't opt in is untouched;
-          # CI matrix and shipped binary bytes are unaffected by this option's
-          # existence). Linux native only for now — darwin/windows/cosmo and
-          # procps-class shared-callback packages are deferred. The `depArchives`
-          # closure is a passthru reference only (not linked into the shipped
-          # binary), so it doesn't bloat `packages.<sys>.default`.
+          # null = unchanged. Linux native only for now. `depArchives` is a
+          # passthru reference, not linked into the shipped binary.
           , multicall ? null
-          # Cosmo counterpart of `multicall`: opt a package into the cosmo
-          # (APE) multicall MODULE, emitted from the COSMO CROSS build (the
-          # `windows-x86_64` artifact) instead of the native-linux one. cosmocc
-          # objects are ELF before apelink, so multicallModuleHookCosmo's objcopy
-          # `--redefine-syms` applies directly — no lld (the cosmo IFUNC/IPLT
-          # wall) and no -flto. When set (and the package builds for cosmo), the
-          # cosmo build gains a `module` output (renamed objs/ + applet/ + gnulib/
-          # in native link order) and a `passthru.cosmoMulticallModule` manifest
-          # the mega-builder's cosmoMode consumes. Shape (single-program only —
-          # coreutils single-binary, bash, dash):
+          # Cosmo counterpart of `multicall`, emitted from the COSMO CROSS build
+          # (the `windows-x86_64` artifact). cosmocc objects are ELF before
+          # apelink, so objcopy --redefine-syms applies directly (no lld, no
+          # -flto). Gains a `module` output (renamed objs/applet/gnulib in native
+          # link order) and a `passthru.cosmoMulticallModule` manifest. Shape
+          # (single-program only — coreutils single-binary, bash, dash):
           #   multicallCosmo = {
           #     program = "coreutils";                  # entry = unpin__<name>__<program>_main
           #     programObjs = [ "src/coreutils-coreutils.o" ];  # DIRECT at mega-link
@@ -3025,65 +2574,44 @@ CBODY
           #     depArchives = [ "${pkgs.readline}/lib/libreadline.a" … ];  # external .a
           #     requires = { };                         # cxx override (default false)
           #   }
-          # null = unchanged. Independent of `multicall`/`engine` (those drive the
-          # native-linux artifact); a package can carry both, neither, or just one.
+          # null = unchanged. Independent of `multicall`/`engine`; a package can
+          # carry both, neither, or one.
           , multicallCosmo ? null
           # Link the DNS fallback (__wrap_getaddrinfo) into the linux-static
           # artifact so it resolves names where /etc/resolv.conf is absent
-          # (Android, minimal containers). OPT-IN: set `dnsFallback = true` only
-          # on packages that actually resolve hostnames (curl, whois, nmap, …).
-          # It is NOT free on programs that never resolve: the appendix ends in
-          # `-lc` (needed so __wrap_getaddrinfo's own libc deps — inet_pton,
-          # fopen, getaddrinfo, … — resolve after the archive), and that trailing
-          # `-lc` plus `--wrap=getaddrinfo` makes ld pull ~25 KB of musl's
-          # resolver into EVERY binary, used or not. On a real DNS consumer the
-          # archive is genuinely linked so this is correct and free; on a
-          # non-consumer it is dead bloat that shifted bzip2's bss enough to tip
-          # its decompressor into a SIGSEGV (`bzip2 --help`). Hence opt-in, not
-          # catalog-wide. No-op on darwin/windows. See withDnsFallback.
+          # (Android, minimal containers). OPT-IN: only on hostname-resolving
+          # packages (curl, whois, nmap). NOT free elsewhere: the trailing `-lc` +
+          # `--wrap=getaddrinfo` pulls ~25 KB of musl's resolver into EVERY binary
+          # (a non-consumer once tipped bzip2's bss into a SIGSEGV). No-op on
+          # darwin/windows. See withDnsFallback.
           , dnsFallback ? false
           # engine: which toolchain builds the NATIVE-LINUX artifact.
-          #   "default"    → nixpkgs' static-musl stdenv (gcc/clang via cc-wrapper),
-          #                  the catalog default — unchanged for every package.
-          #   "unpin-llvm" → build the SAME unmodified nixpkgs recipe through the
-          #                  vendored unpin-llvm toolchain via unpinAdapterStdenv
-          #                  (pkgsStatic.<pkgsAttr>.override { stdenv = …; }). Only
-          #                  the native-linux path is rerouted; cross-linux,
-          #                  darwin and windows keep their existing toolchains
-          #                  (a deliberate follow-up — unpin-llvm has those
-          #                  backends but the cross wiring isn't done yet). The
-          #                  swap is transparent: a consumer-supplied `build`
-          #                  receives a `pkgs` whose pkgsStatic.<pkgsAttr> is
-          #                  already on the engine stdenv, so the recipe needs no
-          #                  engine plumbing (see rawBuild). Composes with neither
-          #                  lto nor gc (the adapter replaces the stdenv those
-          #                  overlays wrap, so they'd be silent no-ops); nixpkgsFor
-          #                  falls back to plain nixpkgs under this engine.
+          #   "default"    → nixpkgs' static-musl stdenv, the catalog default.
+          #   "unpin-llvm" → the SAME nixpkgs recipe through the vendored unpin-llvm
+          #                  toolchain via unpinAdapterStdenv. The swap is
+          #                  transparent: a consumer `build` gets a `pkgs` whose
+          #                  pkgsStatic.<pkgsAttr> is already on the engine stdenv
+          #                  (see rawBuild), no per-package plumbing. Composes with
+          #                  neither lto nor gc (the adapter replaces the stdenv
+          #                  those overlays wrap); nixpkgsFor falls back to plain
+          #                  nixpkgs here.
           , engine ? "default"
           }:
           let
             optimize_ = { lto = false; opt = null; ssp = true; gc = true; } // optimize;
             inherit (optimize_) lto opt ssp gc;
             ltoOpt = if opt == null then "-O2" else opt;
-            # LTO and GC overlays apply on Linux only — musl is Linux-specific
-            # and the cross-darwin path doesn't have an analogous chain we want
-            # to rewire yet. Darwin/cross fall back to stock pkgs. LTO already
-            # includes function/data-sections + --gc-sections, so it subsumes
-            # gc; when both are set, lto wins and gc is a no-op.
-            # Plain nixpkgs import. Darwin dep fixes (e.g. ncurses) are NOT wired
-            # here as `overlays` — an overlay on the nixpkgs IMPORT joins the
-            # stdenv-bootstrap fixpoint and re-hashes the whole darwin base
-            # closure (a fresh bootstrap LLVM, uncached → full rebuild). A fix
-            # needed only by a leaf wrapper goes there instead — e.g. the ncurses
-            # <sys/ttydev.h> fix rides inside `embedFallbackTerminfoOnly`, scoped
-            # to the fallback ncurses so the set-wide ncurses (and apple-sdk,
-            # which embeds its headers) stay byte-identical and cached.
+            # LTO/GC overlays apply on Linux only; darwin/cross fall back to stock
+            # pkgs. LTO subsumes gc (lto wins when both set).
+            # Plain nixpkgs import. Darwin dep fixes are NOT wired here as
+            # `overlays` — an overlay on the nixpkgs IMPORT joins the
+            # stdenv-bootstrap fixpoint and re-hashes the whole darwin base closure
+            # (uncached → full rebuild). A leaf-wrapper fix goes there instead (the
+            # ncurses <sys/ttydev.h> fix rides inside embedFallbackTerminfoOnly).
             importNixpkgs = system: import nixpkgs { inherit system; };
             nixpkgsFor = forAllNative (system:
-              # unpin-llvm replaces the whole stdenv (overrideCC), so the gc/lto
-              # overlays — which rewrite the nixpkgs cc-wrapper stdenv — would be
-              # silent no-ops under it. Use plain nixpkgs to avoid the wasted eval
-              # and the false impression they're active.
+              # unpin-llvm replaces the whole stdenv, so the gc/lto overlays would
+              # be silent no-ops; use plain nixpkgs.
               if engine == "unpin-llvm" then importNixpkgs system
               else if lto && isLinuxSys system
               then mkPkgsLTO { inherit system; opt = ltoOpt; inherit ssp; pkgName = pkgsAttr; }
@@ -3091,9 +2619,8 @@ CBODY
               then mkPkgsGC { inherit system ssp opt; pkgName = pkgsAttr; }
               else importNixpkgs system);
 
-            # Apply opt/ssp knobs to a built drv. No-op when both at
-            # default (opt = null + ssp = true) so cache.nixos.org hits
-            # stay intact for packages that don't override.
+            # Apply opt/ssp knobs. No-op at default (opt = null + ssp = true) so
+            # cache.nixos.org hits stay intact.
             applyOptSsp = drv:
               if opt == null && ssp then drv
               else
@@ -3119,28 +2646,20 @@ CBODY
               else drv // { meta = (drv.meta or { }) // { description = description; }; };
 
             defaultRawBuild = nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
-            # The unpin-llvm engine swaps the recipe's `stdenv` for our toolchain
-            # adapter. For the DEFAULT recipe we override it directly. For a package
-            # with a CUSTOM `build` (an opaque pkgs -> drv closure we can't reach
-            # into) we instead hand the closure a `pkgs` whose pkgsStatic.<pkgsAttr>
-            # is ALREADY built with the engine stdenv — so the recipe reads exactly
-            # as off-engine (`pkgs.pkgsStatic.gnugrep.overrideAttrs …`), no engine
-            # plumbing per package; just set `engine = "unpin-llvm"`. The shallow
-            # `//` swaps only that one top package, leaving its deps and the rest of
-            # pkgsStatic normal (external depArchives stay plain ELF). linux-static
-            # host only; darwin/cross/off-engine get `pkgs` untouched, so every
-            # existing package is byte-identical. A bitcode-LTO multicall module
-            # (engine + multicall) needs every object as bitcode, so the adapter
-            # gets lto = true ONLY then; engine-only packages keep the -O2 ELF path.
+            # The unpin-llvm engine swaps the recipe's `stdenv` for our adapter.
+            # A CUSTOM `build` (opaque closure) instead gets a `pkgs` whose
+            # pkgsStatic.<pkgsAttr> is already on the engine stdenv, so the recipe
+            # reads as off-engine with no per-package plumbing. linux-static host
+            # only; darwin/cross/off-engine untouched (byte-identical). A
+            # bitcode-LTO module (engine + multicall) needs bitcode, so the adapter
+            # gets lto = true ONLY then.
             wantBitcodeModule = engine == "unpin-llvm" && multicall != null;
             engineStdenvFor = pkgs: unpinAdapterStdenv {
               inherit pkgs;
               target = pkgs.pkgsStatic.stdenv.hostPlatform.config;
-              # `native` only gates the sysroot's sanity RUN (a foreign binary
-              # can't exec on the build host). For a cross pkgs (pkgsCross.*)
-              # the wrapped stdenv stays a REAL cross stdenv — clang just swaps
-              # `-target` — so configure runs in cross mode (AC_RUN_IFELSE off,
-              # build tools are build-host arch); no "exec format error".
+              # `native` only gates the sysroot's sanity RUN. For a cross pkgs the
+              # wrapped stdenv stays a REAL cross stdenv (clang swaps `-target`), so
+              # configure runs cross mode (AC_RUN_IFELSE off); no exec-format error.
               native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
               cxx = true;
               lto = wantBitcodeModule;
@@ -3148,38 +2667,32 @@ CBODY
             };
             rawBuild = pkgs:
               let
-                # Engine on linux (native or cross — the one LLVM toolchain
+                # Engine on linux (native or cross — one LLVM toolchain
                 # cross-emits every target via `clang -target`, no qemu) and on a
-                # native darwin host (mac→mac). Both ride the same mechanism: a
-                # stdenv swap on `pkgsStatic` (Layer A below). Only packages that
-                # opt into `engine = "unpin-llvm"` are touched. Toolchain proven
-                # native (see project_unpins_mac_on_mac).
+                # native darwin host. Both ride a stdenv swap on `pkgsStatic`
+                # (Layer A below).
                 useEngine = engine == "unpin-llvm"
                   && (pkgs.stdenv.hostPlatform.isLinux || pkgs.stdenv.hostPlatform.isDarwin);
                 # Built from the ORIGINAL pkgs (un-extended) so it never sees the
                 # overlay below — no recursion.
                 engStdenv = if useEngine then engineStdenvFor pkgs else null;
                 # SET-LEVEL stdenv swap so the top package AND its whole link
-                # closure compile on the engine (the all-deps-bitcode mechanism; a
-                # shallow `//` would leave deps as gcc ELF). The `isMusl || isStatic`
-                # guard is load-bearing: the overlay also reaches buildPackages, and
-                # an unguarded swap forces the engine onto the build host → trips
-                # `isFromBootstrapFiles` and poisons build tools. isMusl selects the
-                # linux target host alone (build host is glibc; cross too). Darwin
-                # has no musl split, but its pkgsStatic is cross-to-self — host is
-                # isStatic, buildPackages and bootstrap are not — so isStatic selects
-                # the darwin target host. Linux pkgsStatic is also isStatic, so the
-                # disjunct is a no-op there. Byte-identical on linux.
+                # closure compile on the engine (all-deps-bitcode; a shallow `//`
+                # would leave deps gcc ELF). The `isMusl || isStatic` guard is
+                # load-bearing: the overlay also reaches buildPackages, and an
+                # unguarded swap forces the engine onto the build host → trips
+                # `isFromBootstrapFiles`. isMusl selects the linux target host;
+                # darwin has no musl split but its pkgsStatic host is isStatic
+                # (buildPackages/bootstrap aren't), so isStatic selects it.
+                # Byte-identical on linux.
                 #
                 # engineBashAttrs: recipe fixes for engine DEPS, layered on top.
-                # Explicit, NOT a blanket nativeFixes pass — consumer flakes (chafa,
-                # tmux, avif) already apply most fixes by hand and would double-apply.
-                # The next breaking dep gets added here.
+                # Explicit (NOT a blanket nativeFixes pass — consumers already apply
+                # most by hand and would double-apply). The next breaking dep here.
                 engineBashAttrs = [ "bash" "bashInteractive" "bashNonInteractive" ];
-                # Engine DEPS whose `native-overlay/<n>.nix` fix must be wired into
-                # the engine set — transitive deps that no consumer build closure
-                # fixes by hand (so applying here can't double-apply). libcap: drop
-                # the go input that the engine cc can't build (see Layer C).
+                # Engine DEPS whose native-overlay fix must be wired in —
+                # transitive deps no consumer closure fixes by hand. libcap: drop
+                # the go input the engine cc can't build (see Layer C).
                 engineDepFixAttrs = [ "libcap" ];
                 enginePkgsStatic =
                   if !useEngine then pkgs.pkgsStatic
@@ -3191,11 +2704,11 @@ CBODY
                           if prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic
                           then { stdenv = engStdenv; }
                           else { });
-                      # Layer B: bash build fix on TOP, in a SEPARATE extend so
-                      # `prev.<n>` already carries the engine stdenv (one overlay
-                      # would still see the original gcc). `prev` not `final` → no
-                      # cycle. prev.buildPackages.stdenv.cc stays the vanilla build
-                      # cc, which CC_FOR_BUILD needs (see unpinBashBuildFix).
+                      # Layer B: bash build fix in a SEPARATE extend so `prev.<n>`
+                      # already carries the engine stdenv (one overlay would still
+                      # see gcc). `prev` not `final` → no cycle.
+                      # prev.buildPackages.stdenv.cc stays vanilla, which
+                      # CC_FOR_BUILD needs (see unpinBashBuildFix).
                       withBashFix = withEngineStdenv.extend
                         (_final: prev:
                           if prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic
@@ -3229,17 +2742,14 @@ CBODY
                 # the shipped binary. No-op when `multicall == null` or off-Linux.
                 sanMc = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
                 # The bitcode module rides the engine's -flto objects. Linux:
-                # always (native or cross). Darwin: only when the package opts
-                # into the darwin mega (multicall.darwin) — the module is then
-                # emitted NATIVELY on a darwin host (default + within-darwin
-                # cross), never cross-built from linux (darwin builds on darwin).
+                # always. Darwin: only when the package opts into the darwin mega
+                # (multicall.darwin), emitted NATIVELY on a darwin host (never
+                # cross-built from linux).
                 wantModule = multicall != null
                   && (pkgs.stdenv.hostPlatform.isLinux
                       || (pkgs.stdenv.hostPlatform.isDarwin && (multicall.darwin or false)));
-                # engine = "unpin-llvm" builds with -flto → bitcode objects → the
-                # objcopy redef map can't apply; use the bitcode-LTO emitter
-                # (llvm-link + opt -internalize). engine = "default" (gcc/clang
-                # ELF) keeps the objcopy hook.
+                # engine = "unpin-llvm" → bitcode objects → use the bitcode-LTO
+                # emitter (llvm-link + opt -internalize); "default" keeps objcopy.
                 useBitcodeModule = wantModule && engine == "unpin-llvm";
                 rawHooked =
                   if useBitcodeModule
@@ -3262,12 +2772,11 @@ CBODY
                     }
                     (rawBuild pkgs)
                   else rawBuild pkgs;
-                # iconv: stock darwin uses Apple libiconv-113, but its STATIC build
-                # fails through the engine (cross: meson/static-modules.gperf break;
-                # native: the atf self-test miscompiles). Mirror the cross dIconvSwap:
-                # drop Apple libiconv, append GNU libiconvReal (clean static .a) built
-                # with the engine stdenv — configure then links -liconv against it.
-                # Harmless for non-iconv packages.
+                # iconv: Apple libiconv-113's STATIC build fails through the engine
+                # (cross: meson/static-modules.gperf; native: atf self-test
+                # miscompiles). Drop Apple libiconv, append GNU libiconvReal (clean
+                # static .a) built with the engine stdenv. Harmless for non-iconv
+                # packages.
                 darwinIconvFixed = drv:
                   if engine == "unpin-llvm" && pkgs.stdenv.hostPlatform.isDarwin
                   then
@@ -3275,8 +2784,8 @@ CBODY
                       noIconv = nixpkgs.lib.filter (x: (x.pname or "") != "libiconv");
                     in
                     drv.overrideAttrs (old: {
-                      # gnulib tools carry libiconv in propagatedBuildInputs, not
-                      # buildInputs — filter BOTH or Apple libiconv survives.
+                      # gnulib tools carry libiconv in propagatedBuildInputs too —
+                      # filter BOTH or Apple libiconv survives.
                       buildInputs =
                         (noIconv (old.buildInputs or [ ]))
                         ++ [ (pkgs.pkgsStatic.libiconvReal.override { stdenv = engineStdenvFor pkgs; }) ];
@@ -3284,41 +2793,32 @@ CBODY
                     })
                   else withDarwinIconv pkgs drv;
                 core = darwinIconvFixed (dropSharedLibs (filterEnableStaticOnDarwin (applyOptSsp rawHooked)));
-                # C catalog keeps the fallback linux-only for now; the darwin-C
-                # and windows-cosmo paths are a deliberate follow-up (the Rust
-                # tools opt into darwin/windows by calling withDnsFallback directly).
+                # DNS fallback linux-only for now; the Rust tools opt into
+                # darwin/windows via withDnsFallback directly.
                 base = if dnsFallback && pkgs.stdenv.hostPlatform.isLinux
                        then withDnsFallback pkgs.pkgsStatic core else core;
-                # withMan must run on the underlying drv (it edits the bin
-                # output and reads the man output) BEFORE strippedOrJoined
-                # collapses multi-output drvs into a symlinkJoin. Skipped when
-                # the consumer's own withUnpinEmbed call already included man
-                # (passthru.unpinEmbedsMan) — one pack, not two.
+                # withMan must run on the underlying drv (edits the bin output,
+                # reads the man output) BEFORE strippedOrJoined collapses
+                # multi-output drvs. Skipped when the consumer's withUnpinEmbed
+                # already included man (passthru.unpinEmbedsMan).
                 withMaybeMan0 =
                   if embedMan && !(base.unpinEmbedsMan or false)
                   then withMan pkgs { primary = binName; } base
                   else base;
                 # When a `module` output rides along, force the SAME final strip
-                # selection (`[bin out]`) that strippedOrJoined / packageWithMan
-                # apply downstream. That makes their internal strip override a
-                # no-op (identical .drv), so the `module` output we reference for
-                # the manifest is the very build the shipped binary comes from —
-                # no second build — and survives even the symlinkJoin branch
-                # (multi-output packages like grep, which has an `info` output).
-                # Shipped bytes are unchanged: [bin out] is exactly what those
-                # helpers already set.
+                # selection (`[bin out]`) strippedOrJoined/packageWithMan apply
+                # downstream, so their internal strip is a no-op (identical .drv)
+                # and the `module` we reference is the very build the shipped binary
+                # comes from — no second build. Shipped bytes unchanged.
                 withMaybeMan =
                   if wantModule
                   then withMaybeMan0.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
                   else withMaybeMan0;
                 # SELF-FOLD: a multi-program package (find+xargs, flac+metaflac)
-                # must still ship ONE binary (one-pkg-one-bin), so apply the mega
-                # fold to its single module (N=1). Single-program packages keep
-                # their upstream binary untouched. Side benefit: extra upstream
-                # binaries not listed in `programs` (benchmark_xl, tjbench) are
-                # dropped, since only listed entries enter the module.
+                # must still ship ONE binary, so apply the mega fold to its single
+                # module (N=1). Drops extra upstream binaries not in `programs`.
                 # `defaultProgram` runs on a bare invocation (default = binName if
-                # it's itself an applet, else null → dispatcher lists programs).
+                # an applet, else null → dispatcher lists programs).
                 selfFold = wantModule && builtins.length multicall.programs > 1;
                 selfFoldDefault =
                   let dp = multicall.defaultProgram or binName;
@@ -3331,24 +2831,22 @@ CBODY
                 };
                 shipped = if selfFold then selfFolded else withMaybeMan;
                 result = withLicense (withDescription (strippedOrJoined pkgs name shipped));
-                # The manifest the mega-builder consumes. `moduleArchive`/the
-                # gnulib `depArchives` reference the `module` output of the same
-                # built drv (built once, same builder); the external `depArchives`
-                # are verbatim store paths (passthru reference, NOT linked into
-                # the shipped binary).
+                # The manifest the mega-builder consumes. moduleArchive/gnulib
+                # depArchives reference the `module` output of the same built drv;
+                # external depArchives are verbatim store paths (passthru, NOT
+                # linked into the shipped binary).
                 multicallManifest = {
                   package = name;
-                  # Bitcode path: ONE module.bc with the internalArchives folded
-                  # IN (llvm-link). ELF/objcopy path: module.a + the renamed
-                  # private archives sit alongside as separate depArchives.
+                  # Bitcode: ONE module.bc with internalArchives folded in.
+                  # ELF/objcopy: module.a + renamed private archives as depArchives.
                   moduleFormat = if useBitcodeModule then "bitcode" else "elf-archive";
                   moduleArchive =
                     if useBitcodeModule
                     then "${withMaybeMan.module}/lib/module.bc"
                     else "${withMaybeMan.module}/lib/module.a";
                   # Native (asm/SIMD) objects the bitcode link dropped, rescued into
-                  # a sidecar archive the mega-link adds alongside module.bc. Always
-                  # present (possibly empty) on the bitcode path; null otherwise.
+                  # a sidecar the mega-link adds alongside module.bc. Always present
+                  # (possibly empty) on the bitcode path; null otherwise.
                   nativeArchive =
                     if useBitcodeModule
                     then "${withMaybeMan.module}/lib/module_native.a"
@@ -3366,22 +2864,19 @@ CBODY
                     multicall.programs;
                   requires = { cxx = false; group = true; } // (multicall.requires or { });
                   # Auto-derived external dep DIRS (pure store paths, no IFD); the
-                  # mega builder globs <dir>/lib/*.a at build time. Replaces the
-                  # need to hand-name `depArchives` (which stays as an additive
-                  # override for archives not in the build's input closure).
+                  # mega builder globs <dir>/lib/*.a at build time. `depArchives`
+                  # stays as an additive override for archives not in the closure.
                   depInputDirs = multicallExternalDepDirs withMaybeMan;
-                  # Man source for the mega to MERGE (see mkMegaMulticall). Points at
-                  # the built drv's man-bearing output (split `man` output, else the
-                  # default out). null when this build ships no man (embedMan = false,
-                  # or a cross with none); the merge skips nulls.
+                  # Man source for the mega to MERGE: the built drv's man-bearing
+                  # output (split `man`, else out). null when this build ships no
+                  # man; the merge skips nulls.
                   manRoot =
                     if embedMan
                     then "${withMaybeMan.man or withMaybeMan}"
                     else null;
-                  # Runtime-data source for the mega to MERGE (same role as manRoot;
-                  # file's magic.mgc). The consumer points `multicall.runtimeDataRoot`
-                  # at the staged tree — a store path, or a `pkgs:` function for
-                  # cross. null when the package ships none.
+                  # Runtime-data source for the mega to MERGE (file's magic.mgc).
+                  # `multicall.runtimeDataRoot` is a store path or a `pkgs:` function
+                  # for cross. null when the package ships none.
                   runtimeDataRoot =
                     let r = multicall.runtimeDataRoot or null;
                     in
@@ -3392,38 +2887,24 @@ CBODY
               in
               if wantModule then result // { multicallModule = multicallManifest; } else result;
 
-            # Windows runs on x86_64-linux runners. `allowUnsupportedSystem` because
-            # most nixpkgs `meta.platforms` exclude mingw / cosmo → cross-built drv
-            # would be filtered out. Dispatch order:
-            #   windowsBuild   → consumer-supplied closure. For mingw, returns
-            #                    `(mingwStaticCross pkgs).${name}.overrideAttrs …`;
-            #                    for cosmocc, returns `(cosmoStaticCross pkgs).${name}
-            #                    .overrideAttrs …`. Per-binary cosmo recipes live
-            #                    in `<consumer>/cosmo.nix` sidecars, mingw recipes
+            # Windows runs on x86_64-linux runners. `allowUnsupportedSystem`
+            # because most nixpkgs `meta.platforms` exclude mingw/cosmo. Dispatch:
+            #   windowsBuild   → consumer closure (mingw or cosmocc). Per-binary
+            #                    cosmo recipes in `<consumer>/cosmo.nix`, mingw
             #                    inline in the consumer's `windowsBuild`.
-            #   windowsCosmo   → `(cosmoStaticCross pkgs).${pkgsAttr}`. The
-            #                    cosmo cross stdenv carries an apelink setup
-            #                    hook that auto-converts ELF → PE32+ in
-            #                    fixupPhase, so no helper wrapping is needed.
-            #                    Use for cosmo builds where vanilla nixpkgs
-            #                    cross builds cleanly and no further consumer
-            #                    customization is needed. Most catalog cosmo
-            #                    packages have extra quirks (drop symlinks,
-            #                    withAliases, configureFlags) and use
-            #                    `windowsBuild = import ./cosmo.nix` instead.
-            #   windows        → plain `(mingwStaticCross pkgs).${pkgsAttr}`,
-            #                    no consumer customization.
+            #   windowsCosmo   → `(cosmoStaticCross pkgs).${pkgsAttr}`; the cosmo
+            #                    cross stdenv's apelink hook auto-converts ELF →
+            #                    PE32+. For cosmo builds with no consumer quirks
+            #                    (most use `windowsBuild = import ./cosmo.nix`).
+            #   windows        → plain `(mingwStaticCross pkgs).${pkgsAttr}`.
             windowsEnabled = windows || windowsBuild != null || windowsCosmo;
-            # windowsPkgs is the single root from which BOTH cross targets live:
+            # windowsPkgs is the single root for BOTH cross targets:
             #   pkgsCross.mingwW64  →  vanilla nixpkgs cross
-            #   pkgsCross.cosmo     →  cosmocc-as-cross-stdenv (via
-            #                          replaceCrossStdenv + cosmoOverlay)
-            # The applyPatches step registers `cosmo` as a kernel + example
-            # crossSystem in nixpkgs (see ./cosmo-lib-systems.patch). The
-            # overlay self-guards on `isCosmo` so it's a no-op for
-            # pkgsCross.mingwW64; `replaceCrossStdenv` likewise guards
-            # before swapping in cosmocc. Net effect: vanilla mingw drvs
-            # are unchanged, cosmo drvs are routed through cosmocc.
+            #   pkgsCross.cosmo     →  cosmocc-as-cross-stdenv (replaceCrossStdenv +
+            #                          cosmoOverlay)
+            # applyPatches registers `cosmo` as a kernel + example crossSystem
+            # (./cosmo-lib-systems.patch). Both the overlay and replaceCrossStdenv
+            # self-guard on `isCosmo`, so vanilla mingw drvs are unchanged.
             windowsPkgs =
               let
                 basePkgs = nixpkgs.legacyPackages.${"x86_64-linux"};
@@ -3461,51 +2942,35 @@ CBODY
               else if windowsCosmo then (pkgs: (cosmoStaticCross pkgs).${pkgsAttr})
               else (pkgs: (mingwStaticCross pkgs).${pkgsAttr});
             # Cosmo multicall MODULE opt-in (symmetric to the linux `multicall`
-            # path in `stripped`). When `multicallCosmo` is set, post-process the
-            # cosmo cross build with multicallModuleHookCosmo to add a `module`
-            # output (renamed ELF objs — cosmo objects are ELF before apelink),
-            # then emit `passthru.cosmoMulticallModule` from the same build the
-            # `windows-x86_64` artifact ships (no second build). mingw is never a
-            # cosmo module source; the hook is only applied on the cosmo path.
+            # path). When `multicallCosmo` is set, post-process the cosmo cross
+            # build with multicallModuleHookCosmo (renamed ELF objs — cosmo objects
+            # are ELF before apelink) and emit `passthru.cosmoMulticallModule` from
+            # the same build the `windows-x86_64` artifact ships.
             sanMcW = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
             wantCosmoModule = multicallCosmo != null && (windowsCosmo || windowsBuild != null);
-            # Mingw BITCODE multicall MODULE opt-in — the engine counterpart of the
-            # cosmo `multicallCosmo` path below, and symmetric to the linux
-            # `multicall` path in `stripped`. When the package opts into the engine
-            # AND `multicall` AND ships a windows binary via mingw (NOT cosmo),
-            # route its mingw cross build through the engine adapter so it emits
-            # BITCODE objects, then post-process with multicallModuleHookLTO to add
-            # a `module` output (module.bc) and emit a `passthru.windowsMulticallModule`
-            # (bitcode) manifest the mega-builder folds with `-target …-windows-gnu
-            # -flto`. The `multicall` config is target-agnostic, so it's reused
-            # verbatim. No-op unless engine+multicall and windows is enabled without
-            # cosmo — every existing package (cosmo, plain mingw, off-engine) is
-            # byte-identical. multicallCosmo == null keeps the two windows module
-            # paths mutually exclusive (a coreutils-class package takes the cosmo
-            # path; a grep-class package takes this bitcode path).
-            # OPT-IN (`multicall.windows = true`), NOT implied by having a
-            # windowsBuild: a package's deps must cross-build cleanly through the
-            # engine for mingw first (e.g. file's zlib uses a gcc-only
-            # win32/Makefile.gcc the engine adapter doesn't satisfy). Validate per
-            # package (same 8-gate fold methodology), then flip the flag. grep/sed/
-            # file are validated; htop/bc/… stay on their current windows path
-            # until each is proven.
+            # Mingw BITCODE multicall MODULE opt-in — the engine counterpart of
+            # the cosmo path. When engine + multicall + a mingw (NOT cosmo) windows
+            # binary, route the mingw cross build through the engine adapter
+            # (bitcode), post-process with multicallModuleHookLTO and emit a
+            # `passthru.windowsMulticallModule` the mega folds with `-target
+            # …-windows-gnu -flto`. multicallCosmo == null keeps the two windows
+            # module paths mutually exclusive. OPT-IN (`multicall.windows = true`),
+            # NOT implied by windowsBuild: deps must cross-build cleanly through the
+            # engine for mingw first (file's zlib uses a gcc-only win32/Makefile.gcc).
+            # grep/sed/file validated; htop/bc stay on their current path.
             wantWindowsModule =
               engine == "unpin-llvm" && multicall != null && (multicall.windows or false)
               && multicallCosmo == null && windowsEnabled;
-            # Engine adapter for the mingw cross host (bitcode, like the linux
-            # engine). Built from the ORIGINAL windowsPkgs.pkgsCross.mingwW64
-            # (un-swapped) so it never sees the overlay below — no recursion.
-            # `target` = the mingw config string (x86_64-w64-windows-gnu), exactly
-            # as engineStdenvFor uses pkgsStatic.…config for linux.
+            # Engine adapter for the mingw cross host (bitcode). Built from the
+            # ORIGINAL un-swapped mingwW64 so it never sees the overlay below — no
+            # recursion. `target` = the mingw config string.
             windowsEngineStdenv =
               let mc = windowsPkgs.pkgsCross.mingwW64;
               in unpinAdapterStdenv {
                 pkgs = mc;
-                # Base on the mingw cross set (config x86_64-w64-mingw32) — NOT its
-                # pkgsStatic, whose `…-windows-gnu` config string breaks autotools
-                # config.sub. clang accepts the mingw32 spelling as the same gnu
-                # windows environment; static-ness comes from mingwStaticCross.
+                # Base on the mingw cross set (config x86_64-w64-mingw32), NOT its
+                # pkgsStatic whose `…-windows-gnu` string breaks autotools
+                # config.sub. static-ness comes from mingwStaticCross.
                 hostPkgs = mc;
                 target = mc.stdenv.hostPlatform.config;
                 native = false;
@@ -3513,12 +2978,11 @@ CBODY
                 lto = true;
                 captureLinks = true;
               };
-            # windowsPkgs with the mingw cross set's stdenv swapped to the engine
-            # adapter (set-level, guarded on isMinGW so the glibc build host is
-            # untouched — mirror of enginePkgsStatic's isMusl guard). The consumer's
-            # windowsBuild reads `pkgs.pkgsCross.mingwW64` via `mingwStaticCross`,
-            # which wraps that stdenv with makeStaticLibraries, so swapping it here
-            # makes the whole mingw build closure engine-compiled (bitcode).
+            # windowsPkgs with the mingw cross stdenv swapped to the engine adapter
+            # (set-level, guarded on isMinGW so the glibc build host is untouched —
+            # mirror of enginePkgsStatic's isMusl guard). The consumer's windowsBuild
+            # reads it via mingwStaticCross, so the whole mingw closure is
+            # engine-compiled (bitcode).
             windowsEnginePkgs =
               if !wantWindowsModule then windowsPkgs
               else windowsPkgs.extend (_final: prev: {
@@ -3546,28 +3010,18 @@ CBODY
                   internalArchives = multicall.internalArchives or [ ];
                   inferLinkInputs = multicall.inferLinkInputs or false;
                   llvm = "${unpinToolchain windowsPkgs.stdenv.buildPlatform.system}/bin/llvm";
-                  # mingw API is __declspec(dllexport); strip it so internalize
-                  # folds the module to one external (see hook's stripStep).
+                  # mingw API is __declspec(dllexport); strip so internalize folds
+                  # the module to one external (see hook's stripStep).
                   stripDllexport = true;
                 }
                 (windowsRawBuild pkgs)
               else windowsRawBuild pkgs;
-            # Man source for the windows/cosmo binary. The mingw/cosmo cross
-            # build ships no man, so embed the (OS-independent, version-locked)
-            # pages from the regular x86_64-linux build of the same attr. Pick
-            # its `man` output when split, else `out` (man-in-out). null when
-            # the attr doesn't exist or has no man → withMan skips gracefully.
+            # Man source for the windows/cosmo binary. The cross build ships no
+            # man, so the version-locked x86_64-linux nixpkgs graft is borrowed ONLY
+            # when the cross build ships none of its own (the rare help2man package);
+            # an explicit `winManRoot` wins outright. `winManGraft` is null for
+            # custom-named multicall packages (no matching nixpkgs attr).
             winManNixpkgs = nixpkgs.legacyPackages.${"x86_64-linux"};
-            # `winManRoot` (package opt-in) wins: embed exactly the curated set
-            # the package supplies. Otherwise fall back to the nixpkgs graft.
-            # Windows man source. An explicit consumer `winManRoot` wins
-            # outright (curated tree, unchanged behavior). Otherwise the
-            # windows build harvests its OWN share/man — symmetric with every
-            # cross-linux target, which already does this — and borrows the
-            # version-locked nixpkgs graft ONLY when the cross build ships no
-            # man of its own (the rare help2man-driven package). `winManGraft`
-            # is null for custom-named multicall packages (no matching nixpkgs
-            # attr); those harvest-own-or-nothing, same as today.
             winManGraft =
               let p = winManNixpkgs.${pkgsAttr} or null;
               in if p == null then null else (p.man or p.out or p);
@@ -3583,25 +3037,21 @@ CBODY
                 primary = binName;
                 manFallback = if winManGraft == null then null else "${winManGraft}";
               } windowsBase;
-            # Trim cosmo's unused `.symtab.amd64` (no-op on mingw). Runs after
-            # withMan so the man block is already embedded.
+            # Trim cosmo's unused `.symtab.amd64` (no-op on mingw). After withMan.
             windowsTrimmed0 = withCosmoStrip windowsPkgs { primary = binName; } windowsWithMan;
-            # When a `module` output rides along, force the SAME final strip
-            # selection (`[bin out]`) strippedOrJoined applies on the strip
-            # branch (cosmo ships single-output `out`, so it takes that branch
-            # and keeps `module` untouched — see strippedOrJoined's shipOutputs).
-            # This makes that internal strip override a no-op identical .drv, so
-            # `windowsTrimmed.module` is the very build the shipped binary comes
-            # from — no second cosmo build. Same trick as the linux path.
+            # When a `module` output rides along, force the SAME `[bin out]` strip
+            # selection strippedOrJoined applies, so `windowsTrimmed.module` is the
+            # very build the shipped binary comes from — no second cosmo build.
+            # Same trick as the linux path.
             windowsTrimmed =
               if wantCosmoModule || wantWindowsModule
               then windowsTrimmed0.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
               else windowsTrimmed0;
             windowsPkg0 = withLicense (strippedOrJoined windowsPkgs name windowsTrimmed);
             # The manifest the mega-builder's cosmoMode consumes. The module
-            # buckets reference the `module` output of the same built drv; the
-            # external `depArchives` are verbatim store paths (passthru reference,
-            # NOT linked into the shipped `windows-x86_64` binary).
+            # buckets reference the same built drv's `module` output; external
+            # depArchives are verbatim store paths (passthru, NOT linked into the
+            # shipped binary).
             cosmoMulticallManifest =
               let entry = "unpin__${sanMcW name}__${sanMcW multicallCosmo.program}_main";
               in {
@@ -3620,12 +3070,10 @@ CBODY
                   ++ map (al: { name = al; inherit entry; }) (multicallCosmo.aliases or [ ]);
                 requires = { cxx = false; } // (multicallCosmo.requires or { });
               };
-            # Bitcode multicall manifest the mega-builder folds (mingw counterpart
-            # of the linux `multicallManifest` and the cosmo `cosmoMulticallManifest`
-            # above). `moduleArchive`/`nativeArchive` reference the `module` output
-            # of the same built drv (built once); external `depArchives` are verbatim
-            # store paths (passthru reference, NOT linked into the shipped windows
-            # binary).
+            # Bitcode multicall manifest the mega folds (mingw counterpart of the
+            # linux/cosmo manifests). moduleArchive/nativeArchive reference the same
+            # built drv's `module`; external depArchives are verbatim store paths
+            # (passthru, NOT linked into the shipped windows binary).
             windowsMulticallManifest = {
               package = name;
               moduleFormat = "bitcode";
@@ -3658,12 +3106,10 @@ CBODY
               then windowsPkg0 // { windowsMulticallModule = windowsMulticallManifest; }
               else windowsPkg0;
 
-            # `linuxOnly` drops every Darwin attr from `packages.<sys>` so
-            # action-build's auto-discovered matrix doesn't include darwin
-            # runners. Used for packages whose nixpkgs `meta.platforms`
-            # excludes darwin entirely (kmod, util-linux, shadow,
-            # procps-ng, iproute2 — anything that talks to Linux-only
-            # kernel APIs).
+            # `linuxOnly` drops every Darwin attr from `packages.<sys>` so the
+            # auto-discovered CI matrix skips darwin runners. For tools whose
+            # nixpkgs `meta.platforms` excludes darwin (kmod, util-linux, shadow,
+            # procps-ng — Linux-only kernel APIs).
             wantsNative = system: nativeBuild && !(linuxOnly && isDarwinSys system);
           in
           {
@@ -3674,10 +3120,9 @@ CBODY
                 "darwin-x86_64" = stripped pkgs.pkgsCross.x86_64-darwin;
               }
               // nixpkgs.lib.optionalAttrs (nativeBuild && system == "x86_64-linux") {
-                # withLLDLink: the gc overlay (lld + --gc-sections/--icf) is
-                # Linux-native only, so the cross scopes get the unpins-standard
-                # lld link via NIX_CFLAGS_LINK here instead — keeps the linker
-                # uniform across every non-mac target (single-binary included).
+                # withLLDLink: the gc overlay is Linux-native only, so the cross
+                # scopes get the standard lld link via NIX_CFLAGS_LINK here — keeps
+                # the linker uniform across every non-mac target.
                 "linux-i686" = stripped (withLLDLink pkgsAttr pkgs.pkgsCross.musl32);
                 # musl-power = powerpc64le-unknown-linux-musl. Debian calls it
                 # "ppc64el" but uname returns "ppc64le" and the Rust ecosystem
@@ -3691,30 +3136,17 @@ CBODY
                 }));
               }
               // nixpkgs.lib.optionalAttrs (nativeBuild && system == "aarch64-linux") {
-                # armv7l-unknown-linux-musleabihf: nixpkgs.pkgsCross has no
-                # musl example for armv7l (muslpi is armv6), so spell the
-                # crossSystem out — exactly like riscv64 above. Until 2026-06
-                # this used the glibc `armv7l-hf-multiplatform` example and
-                # relied on pkgsStatic's automatic glibc→musl swap; the inner
-                # static drvs are IDENTICAL either way (verified by drv hash),
-                # but the glibc top scope leaked into consumer `build`
-                # closures that read `pkgs` directly (the Rust path), so make
-                # the scope say what we ship. Only the light wrapper drvs
-                # (withMan repack/strip) changed hash.
-                #
-                # The triple means: hardware float (VFPv3) + hardware 64-bit
-                # atomics
-                # (LDREXD/STREXD). Covers Pi 2/3/4 in 32-bit mode,
-                # BeagleBoneBlack, Odroid, and the dominant ARM 32-bit
-                # hardware that runs Linux today. Matches the Rust
-                # ecosystem convention (ripgrep/fd/bat use armv7l in
-                # this slot) and the CI runner (ubuntu-24.04-arm).
-                #
-                # Trade-off: drops armv6 baseline (Pi 1 / Zero / Zero W).
-                # Worth it because anything pulling in 64-bit atomics
-                # (libssh2, glib ≥ 2.68, any modern threading wrapper)
-                # fails to link on armv6 with __atomic_*_8 undefined,
-                # since musl doesn't ship libatomic in pkgsStatic.
+                # armv7l-unknown-linux-musleabihf: pkgsCross has no musl example
+                # for armv7l (muslpi is armv6), so spell the crossSystem out (like
+                # riscv64). Spelling it musl-direct rather than relying on
+                # pkgsStatic's glibc→musl swap keeps the glibc top scope from
+                # leaking into consumer `build` closures (the Rust path); inner
+                # static drvs are drv-hash-identical either way. The triple = HF
+                # (VFPv3) + 64-bit atomics (LDREXD/STREXD): Pi 2/3/4 32-bit,
+                # BeagleBone, the dominant ARM 32-bit Linux hardware, matching the
+                # Rust convention. Drops armv6 (Pi 1/Zero) — worth it, since 64-bit
+                # atomics (libssh2, glib ≥ 2.68) fail to link on armv6 (musl ships
+                # no libatomic in pkgsStatic).
                 "linux-armv7l" = stripped (withLLDLink pkgsAttr (import nixpkgs {
                   inherit system;
                   crossSystem = { config = "armv7l-unknown-linux-musleabihf"; };
@@ -3732,61 +3164,41 @@ CBODY
                 };
               });
 
-            # UNOFFICIAL extra targets — curated "tier-3" arches that we do
-            # NOT want in the CI matrix. `action-build` auto-discovers the
-            # build matrix from `.#packages` only (see build.yml), so anything
-            # exposed here is invisible to CI and never built for the whole
-            # catalog — yet it's available from a plain clone with a short
-            # path: `nix build .#cross.powerpc` (no script, no --override-input).
-            #
-            # `cross` is a FLAT (non-system-keyed) attrset, so `.#cross.<arch>`
-            # resolves literally with NO currentSystem insertion — which is why
-            # the build host is hardcoded `x86_64-linux` (cross is inherently
-            # build-host-specific, and flake purity forbids builtins.currentSystem).
-            # A cloner on a non-x86_64-linux host needs an x86_64-linux builder.
-            #
-            # Each entry maps a friendly uname-style name to its musl triple,
-            # built exactly like the official linux crosses (withLLDLink + strip
-            # + man overlay). Add one line per arch AFTER validating it builds +
-            # smoke-runs under qemu. Start small: powerpc (32-bit big-endian),
-            # proven on bash (ELF32 MSB PowerPC, runs under qemu-ppc).
+            # UNOFFICIAL "tier-3" arches, deliberately NOT in the CI matrix
+            # (action-build discovers the matrix from `.#packages` only), yet
+            # available from a clone: `nix build .#cross.powerpc`. `cross` is a
+            # FLAT attrset, so `.#cross.<arch>` resolves with no currentSystem
+            # insertion — hence the hardcoded `x86_64-linux` build host (flake
+            # purity forbids builtins.currentSystem; a non-x86_64-linux cloner
+            # needs an x86_64-linux builder). Each entry maps a uname-style name to
+            # its musl triple, built like the official crosses. Add one per arch
+            # AFTER validating it builds + smoke-runs under qemu.
             cross = let
               mk = triple: stripped (withLLDLink pkgsAttr (import nixpkgs {
                 system = "x86_64-linux";
                 crossSystem = { config = triple; };
-                # These are unofficial, opt-in tier-3 crosses. A niche arch can
-                # be absent from a package's `meta.platforms` whitelist — not
-                # because it can't build, but because no nixpkgs maintainer
-                # blessed it. `.#cross` is the explicit "best-effort, may not
-                # link" path, so we bypass that gate (same as the windows block
-                # above). No-op for arches already whitelisted (all current
-                # entries are), but keeps `.#cross` robust for future additions.
+                # `.#cross` is best-effort: a niche arch may be absent from a
+                # package's `meta.platforms` whitelist only because no maintainer
+                # blessed it, so bypass the gate (like the windows block). No-op for
+                # already-whitelisted arches.
                 config.allowUnsupportedSystem = true;
               }));
-              # x86-64 micro-architecture feature levels (psABI 2020): SAME
-              # triple as the default x86_64, just a higher `-march` baseline via
-              # gcc.arch. Unlike i586/armv6 (which go DOWN for old hardware /
-              # compat), these go UP (newer CPUs / perf) — a vN binary SIGILLs on
-              # any CPU below that level. So they're a perf OPT-IN, not a
-              # portability target: the default x86_64 deliberately stays v1, the
-              # "runs anywhere" floor. Handy for compute-heavy packages (e.g.
-              # libvpx encode); ~zero gain for text-y CLI tools. v2≈Nehalem'08
-              # (SSE4.2/POPCNT), v3≈Haswell'13 (AVX2/BMI/FMA), v4 (AVX-512).
+              # x86-64 micro-architecture feature levels (psABI 2020): same triple
+              # as default x86_64, higher `-march` baseline via gcc.arch. A vN binary
+              # SIGILLs below its level, so this is a perf OPT-IN, not portability
+              # (default x86_64 stays v1, the "runs anywhere" floor). v2≈Nehalem
+              # (SSE4.2), v3≈Haswell (AVX2/FMA), v4 (AVX-512).
               mkV = arch: stripped (withLLDLink pkgsAttr (import nixpkgs {
                 system = "x86_64-linux";
                 crossSystem = { config = "x86_64-unknown-linux-musl"; gcc.arch = arch; };
                 config.allowUnsupportedSystem = true;
               }));
             in nixpkgs.lib.optionalAttrs nativeBuild (builtins.mapAttrs (_: mk) {
-              # ── Official CI targets, mirrored here so `.#cross.<arch>` is a
-              # UNIFORM interface for every arch — the user makes the same call
-              # whether the target is official or tier-3. These spell out the
-              # exact triples the official `.#packages` cross targets use
-              # (i686→pkgsCross.musl32, ppc64le→pkgsCross.musl-power, the rest
-              # already spelled out), so the derivations are IDENTICAL — cache
-              # hits, byte-for-byte the same binary CI ships. (`allowUnsupported‑
-              # System` in `mk` is an eval gate, not a build input, so it doesn't
-              # perturb the hash.) x86_64 is the native `.#default`, not mirrored.
+              # ── Official CI targets, mirrored so `.#cross.<arch>` is a UNIFORM
+              # interface. These spell out the exact triples the official
+              # `.#packages` crosses use, so the derivations are IDENTICAL (cache
+              # hits, byte-for-byte the CI binary; allowUnsupportedSystem is an eval
+              # gate, not a hash input). x86_64 is the native `.#default`.
               i686 = "i686-unknown-linux-musl";
               ppc64le = "powerpc64le-unknown-linux-musl";
               riscv64 = "riscv64-unknown-linux-musl";
@@ -3794,15 +3206,11 @@ CBODY
               armv7l = "armv7l-unknown-linux-musleabihf";
 
               # ── Unofficial tier-3 arches (curated, NOT in the CI matrix) ──
-              # i586 (Pentium baseline) — the "armv6 of x86". Distinct from the
-              # official `i686` above: i586 has CMPXCHG8B (lock-free 64-bit
-              # atomics) but NO CMOV, so an i686 binary SIGILLs on these. Real
-              # niche: AMD Geode LX/GX (PC Engines ALIX firewalls/routers, OLPC
-              # XO-1), Vortex86, K6. Mainstream distros dropped it (Debian
-              # "i386"/Alpine x86 are i686 since ~2016), so this is the only way
-              # to target that hardware. isX86_32 → lld handles it (no isLLDTarget
-              # change). NOT i386/i486: i386 is dead in modern toolchains; i486
-              # lacks CMPXCHG8B (atomics fall to libatomic) for near-zero gain.
+              # i586 (Pentium baseline). Distinct from `i686`: has CMPXCHG8B but no
+              # CMOV, so an i686 binary SIGILLs on it. Niche: AMD Geode (ALIX
+              # routers, OLPC XO-1), Vortex86, K6 — distros dropped it (Debian
+              # "i386"/Alpine x86 are i686). NOT i386/i486 (dead; i486 lacks
+              # CMPXCHG8B → libatomic for near-zero gain).
               i586 = "i586-unknown-linux-musl";
               powerpc = "powerpc-unknown-linux-musl";
               m68k = "m68k-unknown-linux-musl";
@@ -3826,12 +3234,10 @@ CBODY
               # little-endian `mipsel` above doesn't cover. Routes via ld.bfd
               # (isMips) like mipsel.
               mips = "mips-unknown-linux-musl";
-              # MIPS64 (n64 ABI) — the 64-bit pair of mips/mipsel. musl's mips64
-              # port is n64 ONLY (its n32 is a separate `mipsn32` port), so we
-              # MUST spell out `muslabi64`: the bare `...-musl` triple parses as
-              # gcc's default ABI (n32) and would mismatch musl. el = little-
-              # endian (Loongson 3); BE = Cavium Octeon + lots of BE network
-              # gear. isMips → ld.bfd, same as the 32-bit mips above.
+              # MIPS64 (n64 ABI). musl's mips64 port is n64 ONLY, so spell out
+              # `muslabi64` — the bare `...-musl` parses as gcc's default n32 and
+              # mismatches musl. el = Loongson 3; BE = Cavium Octeon + BE network
+              # gear. isMips → ld.bfd.
               mips64el = "mips64el-unknown-linux-muslabi64";
               mips64 = "mips64-unknown-linux-muslabi64";
               # PowerPC 64-bit BIG-endian — distinct from the shipped `ppc64le`
@@ -3844,18 +3250,13 @@ CBODY
               # static-musl model these binaries rely on. It would need glibc,
               # which breaks self-containment. Don't re-add without a libc story.
               #
-              # NOTE: x32 (x86_64 ILP32) is deliberately kept OUT here — but,
-              # unlike sparc64, NOT because it's impossible. musl has an x32 port
-              # and it builds + smoke-runs fine (proven on bash; see the
-              # playground/x32-spike flake). The catch is COST: nixpkgs's
-              # lib.systems has no `muslx32` ABI, so enabling it needs PATCHING
-              # the nixpkgs SOURCE in 3 spots (parse.nix `abis`, inspect.nix
-              # `isMusl`, parse.nix `mkMuslSystem`) — lib.systems is evaluated
-              # before pkgs, so an overlay can't reach it. Every other entry in
-              # this map is just a curated triple over the pinned nixpkgs (free);
-              # x32 alone would force an applyPatches on the catalog-wide nixpkgs
-              # input. Not worth it for the niche — left as a spike. (Smoke also
-              # needs qemu-system + `syscall.x32=y`; qemu-user has no x32.)
+              # NOTE: x32 (x86_64 ILP32) is kept OUT — not impossible (musl has an
+              # x32 port that builds + smoke-runs, see playground/x32-spike) but
+              # nixpkgs' lib.systems has no `muslx32` ABI, so it'd need PATCHING the
+              # nixpkgs source in 3 spots (lib.systems evaluates before pkgs, so no
+              # overlay reaches it). Every other entry is a free curated triple; x32
+              # alone would force an applyPatches on the catalog-wide nixpkgs. Not
+              # worth the niche. (Smoke also needs qemu-system; qemu-user has no x32.)
             }
             // builtins.mapAttrs (_: mkV) {
               # x86-64 perf feature levels (see mkV above). v1 == default x86_64.
@@ -3867,55 +3268,36 @@ CBODY
             # Read by unpins/action-build to drive CI config.
             manifest = {
               inherit name package_data bootstrap_naming own_software nativeBuild;
-              # `smoke` is null when the caller didn't opt in; otherwise
-              # a list of CLI args. JSON-encoded into the matrix to let
-              # build.yml run `<bin> <args>` after each build.
+              # null unless the caller opted in; otherwise a list of CLI args,
+              # JSON-encoded so build.yml runs `<bin> <args>` after each build.
               smoke = if smoke == null then null else smoke;
-              # Optional grep-E pattern that must match the smoke command's
-              # combined stdout+stderr. Catches "Unknown option" false-pass.
+              # Optional grep-E pattern matching the smoke command's stdout+stderr.
               smoke_pattern = if smokePattern == null then null else smokePattern;
-              # Per-package darwin portability exception: list of Apple
-              # PrivateFramework names the verify step accepts for this package.
-              # Empty for all packages that don't opt in (strict contract).
+              # Per-package darwin portability exception (PrivateFramework names).
               darwin_allow_private_frameworks = darwinAllowPrivateFrameworks;
             };
           };
 
         # Rust-crate flake template. A thin wrapper over mkStandaloneFlake
-        # that supplies Rust-aware build closures. Two source modes (nixpkgs
-        # attr vs own-source, see the `src` arg) × two dep-closure shapes
-        # (pure Rust vs vendored C, see `vendoredC`). Crates with real
-        # external C/TLS deps (ring, openssl-sys) are out of scope — see
-        # unpins/unpin for that hand-rolled shape.
+        # supplying Rust-aware build closures. Two source modes (nixpkgs attr vs
+        # own-source, see `src`) × two dep shapes (pure Rust vs vendored C, see
+        # `vendoredC`). Crates with real external C/TLS deps (ring, openssl-sys)
+        # are out of scope — see unpins/unpin.
         #
-        #   native linux/darwin → pkgs.pkgsStatic.<pkgsAttr>: the nixpkgs
-        #     recipe as-is (src, cargoHash, meta all reused).
-        #   cross-musl (i686, armv7l, ppc64le, riscv64, local aarch64 check)
-        #     → pure Rust: NO C cross toolchain at all — rustup's rust-std
-        #     for *-musl (via the consumer's rust-overlay input) bundles
-        #     musl's libc.a + crt objects (self-contained linking) and the
-        #     build host's ld.lld links any ELF arch. rustc, cargo and the
-        #     crate build scripts all run as native binaries; only --target
-        #     + the linker differ. First proven on unpins/cfonts, all nine
-        #     targets. With vendoredC, the same scopes the C catalog caches
-        #     supply the C compiler/linker instead (unpins/unpin-man).
-        #   cross darwin (CI aarch64→x86_64; local Intel→arm64 gate)
-        #     → nixpkgs cross rustPlatform + the pkgsStatic.libiconv pin
-        #     (rustc injects -liconv; a libiconv.2.dylib load command flunks
-        #     the portability check) + a build-arch -L for the proc-macro
-        #     dylib links (the unpin-readme recipe).
-        #   windows → pkgs.pkgsCross.mingwW64.<pkgsAttr> (pure Rust needs
-        #     none of the mingw-overlay C fixes).
+        #   native linux/darwin → pkgs.pkgsStatic.<pkgsAttr> (recipe as-is).
+        #   cross-musl (i686/armv7l/ppc64le/riscv64/aarch64) → pure Rust: NO C
+        #     cross toolchain — rustup's rust-std for *-musl bundles musl's
+        #     libc.a + crt and the host ld.lld links any ELF arch; rustc/cargo run
+        #     native. With vendoredC, the C catalog's cached scopes supply the C
+        #     compiler/linker instead.
+        #   cross darwin → nixpkgs cross rustPlatform + the pkgsStatic.libiconv pin
+        #     + a build-arch -L for proc-macro dylib links.
+        #   windows → pkgs.pkgsCross.mingwW64.<pkgsAttr>.
         #
-        # dnsFallback is forced off: withDnsFallback's unsalted NIX_LDFLAGS
-        # leaks the arch-specific libunpindns.a into the BUILD-host link of
-        # crate build scripts under the rustup-toolchain crosses. A Rust
-        # crate that resolves hostnames needs bespoke wiring (unpins/unpin);
-        # asking for dnsFallback here is an eval-time error on purpose.
-        #
-        # The consumer passes its own `rust-overlay` input (pin it with
-        # `inputs.nixpkgs.follows = "unpins-lib/nixpkgs"`); nix-lib itself
-        # takes no new input, so the C catalog's lock files are untouched.
+        # dnsFallback is forced off (its unsalted NIX_LDFLAGS leaks the
+        # arch-specific libunpindns.a into crate build-script links); asking for it
+        # here is an eval-time error. The consumer passes its own `rust-overlay`
+        # input, so nix-lib takes no new input and the C lock files are untouched.
         mkRustCrate =
           { self
           , name
@@ -3960,15 +3342,11 @@ CBODY
                 targets = [ triple ];
               };
 
-            # Chain-free cross-musl build (pure Rust only): rust-std bundles
-            # musl's libc.a + crt objects, the native ld.lld links any ELF
-            # arch — rustc, cargo and the crate build scripts all run as
-            # native binaries.
+            # Chain-free cross-musl (pure Rust): rust-std bundles musl's libc.a +
+            # crt, the native ld.lld links any ELF arch; rustc/cargo run native.
             muslCrossPure = pkgs:
               let
-                # Eval-only peek at the scope mkStandaloneFlake hands us:
-                # pkgsStatic elaborates the static-musl host (and converts a
-                # glibc top scope, as armv7l's was on older nix-lib). No
+                # Eval-only peek: pkgsStatic elaborates the static-musl host. No
                 # derivation from the cross scope is ever built.
                 triple = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTarget;
                 npkgs = rustPkgsFor pkgs.stdenv.buildPlatform.system;
@@ -3993,9 +3371,8 @@ CBODY
                   npkgs.lld
                 ];
                 # ld.lld by name → rustc infers the gnu-lld flavor;
-                # link-self-contained uses rust-std's bundled musl crt/libc;
-                # -C strip replaces the fixup strip (native strip can't edit
-                # a foreign-arch ELF, hence dontStrip).
+                # link-self-contained uses rust-std's bundled musl crt/libc; -C
+                # strip replaces the fixup strip (can't edit a foreign-arch ELF).
                 env.RUSTFLAGS = "-C linker=ld.lld -C link-self-contained=yes -C target-feature=+crt-static -C strip=symbols";
                 dontStrip = true;
                 buildPhase = ''
@@ -4010,12 +3387,11 @@ CBODY
                 '';
               };
 
-            # Cross-musl with vendored C: the handed scope's makeRustPlatform
-            # bakes --target plus CC_<T>/CARGO_TARGET_<T>_LINKER to that
-            # scope's C cross toolchain (catalog-cached); rust-overlay
-            # supplies rustc/cargo as native binaries. crt-static because
-            # rust-overlay's musl specs default it off; auditable=false as on
-            # every rustup-toolchain cross (the unpin precedent).
+            # Cross-musl with vendored C: the scope's makeRustPlatform bakes
+            # --target + CC_<T>/CARGO_TARGET_<T>_LINKER to that scope's cached C
+            # cross toolchain; rust-overlay supplies rustc/cargo native. crt-static
+            # because rust-overlay's musl specs default it off; auditable=false (the
+            # unpin precedent).
             muslCrossVendored = pkgs:
               let
                 rust = toolchainFor pkgs.stdenv.buildPlatform.system
@@ -4045,15 +3421,10 @@ CBODY
                     env.RUSTFLAGS = "-C relocation-model=static";
                   }
                 else pkgs.pkgsStatic.${pkgsAttr})
-              # Within-darwin cross (CI builds x86_64-darwin from the arm64
-              # runner): build the crate against the host's default
-              # rustPlatform. rustc injects `-liconv` on darwin targets and the
-              # proc-macro/build-script host links want it too; both are now
-              # handled centrally by mkStandaloneFlake's `withDarwinIconv` (it
-              # pins the static target archive so no libiconv.2.dylib load
-              # command survives the portability check, and hands the
-              # build→build cc-wrapper a `-L` for the BUILD-arch libiconv,
-              # cross-only) — so no per-path iconv wiring is needed here.
+              # Within-darwin cross (CI builds x86_64-darwin from arm64): build
+              # against the host's default rustPlatform. rustc's `-liconv` (target
+              # and build-host links) is handled centrally by withDarwinIconv, so
+              # no per-path iconv wiring here.
               else if host.isDarwin then
                 (if ownSource then mkOwn { rustPlatform = pkgs.rustPlatform; }
                 else pkgs.${pkgsAttr})
@@ -4094,41 +3465,28 @@ CBODY
         # `optimize.gc = true`. Linux-native only.
         mkPkgsGC = import ./gc.nix { inherit nixpkgs appendCFlags appendLinkFlags lldRSafe; };
 
-        # Native cosmoStdenv. Used by playground/{bash,coreutils,dash,links} for
-        # in-tree builds against the `$COSMOS` shared prefix. The full result is
-        # `stdenv // { cosmocc, cosmoCCUnwrapped, cosmoBintoolsUnwrapped,
-        # platformBits, mkCrossWiring, version }` — consumers commonly want
-        # `cosmoStdenv.mkDerivation` and `cosmoStdenv.platformBits`.
+        # Native cosmoStdenv. Result is `stdenv // { cosmocc,
+        # cosmoCCUnwrapped, cosmoBintoolsUnwrapped, platformBits, mkCrossWiring,
+        # version }`; consumers usually want `.mkDerivation` and `.platformBits`.
         cosmoStdenv = pkgs: import ./cosmocc.nix { inherit pkgs; };
 
-        # `cosmoStaticCross pkgs` — fully symmetric with `pkgs.pkgsCross.mingwW64`
-        # and `pkgs.pkgsStatic`: takes a build-host pkgs set (where cosmo wiring
-        # was registered, e.g. mkStandaloneFlake's `windowsPkgs`) and returns
-        # the cosmo cross pkgs set. Per-binary quirks live in the consumer's
-        # `windowsBuild = import ./cosmo.nix { inherit unpins-lib; }`.
-        #
-        # Cosmo is now a first-class nixpkgs cross target: `cosmo-lib-systems.patch`
-        # registers the kernel + an `examples.cosmo` crossSystem, and
-        # `windowsPkgs` is built with the cosmoOverlay + `replaceCrossStdenv`
-        # guarded on `isCosmo`. The cross-arch story (aarch64-cosmo from
-        # x86_64-linux) still needs a buildPackages.pkgsCross stanza — not
-        # exposed yet because no catalog package needs it.
+        # `cosmoStaticCross pkgs` — symmetric with `pkgsCross.mingwW64`/
+        # `pkgsStatic`: takes a build-host pkgs set (with cosmo wiring registered,
+        # e.g. windowsPkgs) and returns the cosmo cross set. Per-binary quirks live
+        # in the consumer's `windowsBuild = import ./cosmo.nix`. Cross-arch cosmo
+        # (aarch64-cosmo from x86_64-linux) needs a buildPackages.pkgsCross stanza
+        # — not exposed yet (no catalog package needs it).
         cosmoStaticCross = pkgs: pkgs.pkgsCross.cosmo;
 
       };
 
-      # Per-target fixes, auto-loaded from sibling directories.
-      # See lib.mkStandaloneFlake and lib.mingwStaticCross for how they're consumed.
-      # Fix files use nixpkgs.lib for stdlib (hasSuffix, filterAttrs, …) AND our
-      # helpers (withDepsSharedPruned, mingwStaticCross, …) — fuse both into one
-      # `lib` for them so they can write `lib.X` uniformly.
-      #
-      # `nativeFixes` is re-exposed inside the lib seen by fix files (and by
-      # consumer `build` closures via `unpins-lib.lib.nativeFixes.<dep>`) so a
-      # downstream consumer can reuse a library override (e.g. tmux's `build`
-      # closure calls `lib.nativeFixes.libevent`). Safe under nix laziness
-      # because cross-fix references only resolve when the consumer calls
-      # the function with `pkgs`, not at top-level evaluation.
+      # Per-target fixes, auto-loaded from sibling directories (consumed by
+      # mkStandaloneFlake/mingwStaticCross). Fix files use both nixpkgs.lib and
+      # our helpers, fused into one `lib` so they write `lib.X` uniformly.
+      # `nativeFixes` is re-exposed inside that lib (and to consumer `build`
+      # closures via `unpins-lib.lib.nativeFixes.<dep>`, e.g. tmux reusing
+      # `lib.nativeFixes.libevent`). Safe under laziness — cross-fix references
+      # resolve only when the consumer calls with `pkgs`.
       fixLibBase = nixpkgs.lib // lib;
       nativeFixes = import ./native-overlay { lib = fixLibBase // { inherit nativeFixes; }; };
       mingwOverlayFixes = import ./mingw-overlay { lib = fixLibBase; };

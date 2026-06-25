@@ -1,12 +1,7 @@
-# Darwin-only fix. Linux speex caches cleanly (no churn).
-#
-# speex (the codec) propagates speexdsp + links against fftw when
-# `withFft = true` (default). Both transitively pull openmp's
-# broken-on-darwin python chain (see [[fftw]] / [[llvm-openmp]]).
-# Drop FFT support entirely on darwin: `withFft = false` controls
-# the echo-cancel demo code's fftw link (ffmpeg's libspeex probe
-# uses only encoder/decoder, no FFT); also propagate the fixed
-# speexdsp so the dsp closure stays clean.
+# Darwin-only fix. speex links fftw when `withFft = true` (default), pulling
+# openmp's broken-on-darwin python chain (see [[fftw]] / [[llvm-openmp]]).
+# `withFft = false` drops it (ffmpeg's libspeex probe uses no FFT); also
+# propagate the fixed speexdsp.
 { lib }:
 pkgs:
 if pkgs.stdenv.hostPlatform.isDarwin

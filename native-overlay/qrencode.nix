@@ -1,21 +1,14 @@
 # Two pkgsStatic / cross fixes:
 #
-# 1. `doCheck = false`. Upstream `nativeCheckInputs` pulls SDL2 to
-#    visually preview QR rendering; SDL2 propagates `libglvnd` which
-#    is `meta.badPlatforms = lib.platforms.isStatic` on pkgsStatic
-#    (no GL on musl). The library + CLI don't need SDL2.
+# 1. `doCheck = false`: `nativeCheckInputs` pulls SDL2 → `libglvnd`, which is
+#    `badPlatforms.isStatic` (no GL on musl). The lib + CLI don't need it.
 #
-# 2. On darwin libtool *sometimes* emits a `libqrencode.dylib` and
-#    links the `qrencode` CLI against it → the CI verifier rejects the
-#    binary for loading a non-system dylib. That happens when the build
-#    leaves shared libs on (a top-level darwin pkgsStatic build whose
-#    `--disable-shared` doesn't take effect). When it *does* take effect
-#    (ffmpeg pulling qrencode as a pkgsStatic dep) libtool produces a
-#    clean static `.a` + statically-linked CLI and emits no dylib — and
-#    the PIC `.libs/*.o` the hand-rebuild needs don't exist. So gate the
-#    whole fixup on a dylib being present: strip it, rebuild the `.a`
-#    from libtool's `.libs/*.o`, relink the CLI static. No dylib =
-#    no-op. Gated on isDarwin; Linux/mingw emit only `.a` and bypass it.
+# 2. Darwin libtool *sometimes* emits a `libqrencode.dylib` and links the CLI
+#    against it → CI rejects the non-system dylib. Happens only when
+#    `--disable-shared` doesn't take effect; otherwise no dylib (and no PIC
+#    `.libs/*.o` to rebuild from). So gate the whole fixup on a dylib being
+#    present: strip it, rebuild the `.a`, relink the CLI static. No dylib =
+#    no-op. Gated isDarwin; linux/mingw emit only `.a`.
 { lib }:
 pkgs:
 let

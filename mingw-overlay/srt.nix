@@ -1,14 +1,13 @@
 # srt cross-mingw, two fixes:
 #
-# 1. `+ windows.pthreads`. srt's CMake
-#    `find_package(Threads REQUIRED)` needs winpthreads on mingw.
+# 1. `+ windows.pthreads`. CMake `find_package(Threads REQUIRED)`
+#    needs winpthreads on mingw.
 #
-# 2. `srt.pc Libs.private` sed-strip. srt's CMake probe captures
-#    the dynamic C++ EH link sequence (`-lgcc_s` ×2) into
-#    `Libs.private` (also in `haisrt.pc`). Static consumers re-
-#    inject `-lgcc_s` and the `.exe` imports `libgcc_s_seh-1.dll`.
-#    Sed-strip the block — `-static-libgcc` at final link provides
-#    the static form. See [[mingw-pc-libgcc-s-probe-trap]].
+# 2. `srt.pc`/`haisrt.pc` `Libs.private` sed-strip. CMake's probe
+#    captures the dynamic C++ EH sequence (`-lgcc_s` ×2); static
+#    consumers re-inject it and the `.exe` imports
+#    `libgcc_s_seh-1.dll`. `-static-libgcc` at final link suffices.
+#    See [[mingw-pc-libgcc-s-probe-trap]].
 { lib }:
 self: super:
 super.srt.overrideAttrs (oa: {

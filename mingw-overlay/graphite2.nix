@@ -1,26 +1,16 @@
 # graphite2 cross-mingw, four fixes:
 #
-# 1. `NIX_CFLAGS += -DGRAPHITE2_STATIC` (own build). Public
-#    headers default `GR2_API` to `__declspec(dllimport)` unless
-#    this macro is defined. The test executables
-#    (`featuremaptest`, …) link against `libgraphite2.a` and fail
-#    with `__imp_gr_*` undef. See
-#    [[mingw-dllimport-static-pattern]].
+# 1. `NIX_CFLAGS += -DGRAPHITE2_STATIC` — headers default `GR2_API` to
+#    dllimport; test exes link `libgraphite2.a` and get `__imp_gr_*` undef.
+#    See [[mingw-dllimport-static-pattern]].
 #
-# 2. `postPatch` strips `add_subdirectory(tests)` from
-#    `CMakeLists.txt`. The `tests/CMakeLists.txt` declares
-#    `*_copy_dll` targets that copy `libgraphite2.dll` into test
-#    dirs; `BUILD_TESTING=OFF` doesn't gate
-#    `add_subdirectory(tests)` at top level.
+# 2. `postPatch` strips `add_subdirectory(tests)` — its `*_copy_dll`
+#    targets copy `libgraphite2.dll`; `BUILD_TESTING=OFF` doesn't gate it.
 #
-# 3. `doCheck = false; doInstallCheck = false`. Belt-and-braces
-#    on top of (2) so nixpkgs' default check phase doesn't try
-#    to run the (now-absent) test binaries.
+# 3. `doCheck/doInstallCheck = false` — belt-and-braces over (2).
 #
-# 4. `.pc` rewrite: `Cflags += -DGRAPHITE2_STATIC` (consumer
-#    side — pairs with fix 1); `Libs: -lgraphite2 -lstdc++`
-#    (graphite2 is C++, static consumers don't pull libstdc++
-#    via DT_NEEDED).
+# 4. `.pc` rewrite: `Cflags += -DGRAPHITE2_STATIC` (consumer side, pairs
+#    with 1); `Libs += -lstdc++` (C++ lib, no DT_NEEDED on static).
 { lib }:
 self: super:
 super.graphite2.overrideAttrs (old: {

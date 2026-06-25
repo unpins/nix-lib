@@ -1,7 +1,5 @@
-# Auto-discovery aggregator for cosmo overlay fixes.
-#
-# Each sibling file is `{ lib }: final: prev: { ... }` — an overlay fragment.
-# Default.nix flattens them into one overlay function by merging attrsets.
+# Auto-discovery aggregator: each sibling is `{ lib }: final: prev: {...}`,
+# merged into one overlay function.
 { lib }:
 let
   entries = builtins.readDir ./.;

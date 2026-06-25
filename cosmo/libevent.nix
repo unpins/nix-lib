@@ -1,14 +1,8 @@
-# Two cosmo gaps libevent's evutil.c trips on (mirrors superconfigure's
-# minimal.diff for libevent 2.1.12):
-#
-#   - if_nametoindex() isn't in cosmo's net/if.h. Stub to 0 — the only
-#     consumer is IPv6 scope-id parsing (`fe80::1%eth0`), a rarely-used
-#     edge case our consumers (tmux only) don't hit.
-#   - epoll detection in config.h.in: cosmo says it has epoll but the
-#     pieces libevent needs aren't all there. Mangling the HAVE_EPOLL*
-#     names disables them at preprocessor time so libevent falls back to
-#     select() (which cosmo translates to WSAPoll on Windows, kqueue on
-#     BSD, etc.).
+# Two cosmo gaps in libevent 2.1.12 (mirrors superconfigure's minimal.diff):
+#   - if_nametoindex() isn't in cosmo's net/if.h. Stub to 0 — only consumer is
+#     IPv6 scope-id parsing, which tmux doesn't hit.
+#   - cosmo claims epoll but lacks the pieces libevent needs; mangle the
+#     HAVE_EPOLL* names so it falls back to select().
 { lib }:
 final: prev:
 if (prev.stdenv.hostPlatform.isCosmo or false) then {

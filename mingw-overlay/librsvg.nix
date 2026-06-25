@@ -1,27 +1,18 @@
 # librsvg cross-mingw, three fixes:
 #
-# 1. `+ windows.pthreads + windows.mcfgthreads`. Rust mingw target
-#    hardcodes `-l:libpthread.a` for `std::thread`; libgcc_eh and
-#    libstdc++ reference `_MCF_*` symbols because nixpkgs' mingw gcc
-#    is built with `--enable-threads=mcf`. Cross-mingw C consumers
-#    that don't link libgcc_eh never trip the mcf path.
+# 1. `+ windows.pthreads + windows.mcfgthreads` — Rust mingw target
+#    hardcodes `-l:libpthread.a`, and libgcc_eh/libstdc++ ref `_MCF_*`
+#    (nixpkgs mingw gcc is `--enable-threads=mcf`).
 #
-# 2. preBuild: re-emit mingw runtime libs at the very END of the
-#    link via `NIX_LDFLAGS_AFTER_<triple>`. libintl.a (pulled by
-#    gdk-pixbuf-sys's `cargo:rustc-link-lib=intl`) references
-#    msvcrt/kernel32/mingwex symbols. Rust's `late_link_args` adds
-#    those BEFORE cc-wrapper's NIX_LDFLAGS (= before `-lintl`), so
-#    ld's single pass misses them. `NIX_LDFLAGS_AFTER_<triple>` is
-#    the only env that lands after NIX_LDFLAGS — CARGO_*_RUSTFLAGS
-#    doesn't (still ordered before). Order matters: mingwex before
-#    msvcrt (mingwex's CRT-wrapper objects need to be pulled in
-#    before ld processes msvcrt), mcfgthread last (libgcc_eh refs).
+# 2. preBuild re-emits mingw runtime libs at the very END of the link via
+#    `NIX_LDFLAGS_AFTER_<triple>` — libintl.a (from gdk-pixbuf-sys) refs
+#    msvcrt/kernel32/mingwex, but Rust's `late_link_args` adds them before
+#    NIX_LDFLAGS so ld's single pass misses them; this is the only env that
+#    lands after NIX_LDFLAGS. Order: mingwex before msvcrt, mcfgthread last.
 #
-# 3. postInstall stub. Upstream runs
-#    `wine64 rsvg-convert.exe --completion {bash,fish,zsh}` to
-#    generate completions; wine doesn't bootstrap on the Linux
-#    builder. Write 1-byte stubs (zero-size trips
-#    installShellCompletion's sanity check).
+# 3. postInstall stubs the shell completions — upstream generates them via
+#    `wine64 rsvg-convert.exe`, but wine doesn't bootstrap on the Linux
+#    builder. 1-byte, not zero (installShellCompletion rejects empty).
 { lib }:
 self: super:
 super.librsvg.overrideAttrs (oa: {

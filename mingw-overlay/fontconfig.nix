@@ -1,13 +1,7 @@
-# fontconfig on mingw static: `fontconfig.pc` declares
-# `Requires.private: expat`, but cairo/pango/librsvg drive
-# pkg-config without `--static` and the transitive expat dep
-# is dropped, causing the cairo link to fail with cascading
-# `XML_*` undefined references (`XML_ParserCreate`,
-# `XML_SetCharacterDataHandler`, `XML_Parse`, …).
-#
-# Same fix pattern as `brotli.nix` / `libtiff.nix`: promote
-# `Requires.private` to public `Requires` so consumers pick
-# expat up regardless of `--static` flag.
+# fontconfig on mingw static: `fontconfig.pc` declares `Requires.private:
+# expat`, but cairo/pango/librsvg drive pkg-config without `--static`,
+# dropping expat → cascading `XML_*` undef refs. Promote it to public
+# `Requires` (same pattern as brotli.nix / libtiff.nix).
 { lib }:
 self: super:
 super.fontconfig.overrideAttrs (old: {
@@ -26,10 +20,7 @@ super.fontconfig.overrideAttrs (old: {
       -e 's/^Requires:\([ \t]*freetype2[^\n]*\)$/Requires:\1, expat/' \
       $dev/lib/pkgconfig/fontconfig.pc
   '';
-  # expat moves from buildInputs (private) to propagatedBuildInputs
-  # (public) — keeps the .pc claim honest now that we promoted
-  # `Requires.private: expat` to public `Requires:`. Without this,
-  # cairo (and any other consumer) sees `pkg-config glib-2.0`
-  # cascade through to expat and aborts.
+  # Propagate expat to match the now-public `Requires:` (else consumers'
+  # transitive pkg-config probe can't find `expat.pc`).
   propagatedBuildInputs = (old.propagatedBuildInputs or [ ]) ++ [ self.expat ];
 })

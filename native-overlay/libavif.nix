@@ -1,33 +1,17 @@
 # pkgsStatic.libavif: static-only, drop the gdk-pixbuf loader + apps/tests.
 #
-# nixpkgs builds libavif with BUILD_SHARED_LIBS=ON plus a gdk-pixbuf loader
-# module (contrib/gdk-pixbuf/libpixbufloader-avif.so). Under pkgsStatic the
-# shared link dies the usual way:
-#   crtbeginT.o: relocation R_X86_64_32 against hidden symbol `__TMC_END__'
-#   can not be used when making a shared object
-# Consumers (chafa, ImageMagick) link the static avif lib, so:
-#   - BUILD_SHARED_LIBS=OFF      — no .so at all
-#   - AVIF_BUILD_GDK_PIXBUF=OFF  — that loader is the failing .so, and its
-#     runtime hookup (gdk-pixbuf-query-loaders + thumbnailer wrapper in
-#     postInstall) is meaningless for a static lib
-#   - AVIF_BUILD_APPS/TESTS=OFF  — avifenc/avifdec + gtest are unused by a
-#     transitive lib consumer
-# postInstall is emptied (it only did the loader cache + thumb wrapper) and
-# doCheck turned off. dav1d (decode) + libaom (encode) codecs stay SYSTEM.
+# The shared link fails under pkgsStatic (crtbeginT.o R_X86_64_32 against
+# hidden `__TMC_END__`), so BUILD_SHARED_LIBS=OFF and the gdk-pixbuf loader /
+# apps / tests are unused by transitive lib consumers (chafa, ImageMagick).
+# dav1d + libaom codecs stay SYSTEM.
 #
-# Static-only also drops libavif's CMake package config — the install(EXPORT)
-# rides on the shared target — so nixpkgs' postFixup (which rewrites
-# _IMPORT_PREFIX in libavif-config.cmake) hits a missing file and aborts.
-# Guard it: consumers here resolve libavif via pkg-config (libavif.pc, still
-# emitted), and the rewrite stays correct for any build where the config
-# does exist.
-# mingw addendum: vanilla libavif lists gdk-pixbuf + make-shell-wrapper-hook
-# in nativeBuildInputs (to run gdk-pixbuf-query-loaders for the loader module
-# we disable above). Harmless on native (an unused build tool), but the
-# wrapper hook is spliced to a *mingw* bash, and bash can't cross-compile to
-# win32 (no sigset_t/fork) → `unknown type name 'sigset_t'`. With the loader,
-# apps and postInstall all off nothing needs either, so drop them — gated to
-# mingw so native/darwin libavif keeps its cached closure.
+# postFixup is guarded: static-only drops the CMake package config (it rides
+# on the shared target), so the upstream _IMPORT_PREFIX rewrite would hit a
+# missing libavif-config.cmake and abort.
+#
+# mingw: drop gdk-pixbuf + make-shell-wrapper-hook — the wrapper hook splices
+# to a mingw bash that can't cross-compile (no sigset_t/fork). Gated to mingw
+# to keep native/darwin's cached closure.
 { lib }:
 pkgs:
 let

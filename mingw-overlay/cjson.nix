@@ -1,9 +1,6 @@
-# cJSON on mingw: `cJSON.c:607` does `if (isnan(d) || isinf(d))`,
-# which expands through mingw's `<math.h>` macro into something
-# gcc 14 flags as `-Wfloat-conversion` (`double → float may change
-# value`). cJSON's CMake sets `-Werror` so the warning aborts the
-# build. Disable the float-conversion gate on mingw; the macro
-# itself is fine, this is a mingw runtime-header artifact.
+# cJSON on mingw: `isnan`/`isinf` at `cJSON.c:607` expand through mingw's
+# `<math.h>` macros into a `-Wfloat-conversion` that gcc 14 + cJSON's
+# `-Werror` turns fatal. Mingw runtime-header artifact; just disable the gate.
 { lib }:
 self: super:
 super.cjson.overrideAttrs (old: {

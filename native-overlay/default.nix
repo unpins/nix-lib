@@ -1,9 +1,6 @@
-# Auto-discovery aggregator for native fixes.
-#
-# Each sibling file is `{ lib }: pkgs: drv` — the function the standalone
-# native build calls when `mkStandaloneFlake { name = "<pkg>"; }` resolves
-# `<pkg>`. lib here is unpins-lib's extended lib (nixpkgs.lib + our helpers
-# like withDepsSharedPruned).
+# Auto-discovery aggregator: each sibling is `{ lib }: pkgs: drv`, called by the
+# standalone native build when `mkStandaloneFlake { name = "<pkg>"; }` resolves
+# `<pkg>`. `lib` is unpins-lib's extended lib.
 { lib }:
 let
   entries = builtins.readDir ./.;

@@ -1,20 +1,12 @@
-# pkgsStatic.xvidcore, one fix (two-part):
+# pkgsStatic.xvidcore: build & install only the static lib. The Makefile's
+# `all` also builds `libxvidcore.so.4.3` with no `--disable-shared` knob, and
+# the `.so` link fails (`crtbeginT.o R_X86_64_32 against __TMC_END__`). Pass
+# the `.a` as a makeFlag to reduce `all` to the archive, then install by hand
+# (upstream `make install` needs the `.so`).
 #
-# Build & install just the static lib. xvidcore's Makefile builds
-# both `libxvidcore.a` AND `libxvidcore.so.4.3` from `all` and has
-# no `--disable-shared` knob; the `.so` link fails in pkgsStatic
-# with `crtbeginT.o R_X86_64_32 against hidden symbol __TMC_END__`
-# (static-PIE startup objects refuse to go into a `.so`). Pass the
-# `.a` as an explicit makeFlag so `all` reduces to the archive,
-# then install by hand (upstream `make install` requires the `.so`
-# we didn't build).
-#
-# MinGW filename quirk: `platform.inc` emits `STATIC_LIB =
-# xvidcore.a` (no `lib` prefix) on mingw, vs `libxvidcore.a` on
-# everything else. The makeFlag follows what configure generates;
-# install always lands as `libxvidcore.a` so consumer `-lxvidcore`
-# resolves under standard ld search rules (mingw's `-l` skips
-# bare `xvidcore.a`).
+# MinGW quirk: `platform.inc` names the archive `xvidcore.a` (no `lib`
+# prefix), vs `libxvidcore.a` elsewhere — so the makeFlag follows configure,
+# but install always lands as `libxvidcore.a` so `-lxvidcore` resolves.
 { lib }:
 pkgs:
 let

@@ -1,43 +1,23 @@
 # x265 in pkgsStatic needs four surgical patches:
 #
-# 1. With `multibitdepthSupport = true`, the build emits three
-#    separate archives — 8-bit main + `libx265-10.a` (Main10/HDR10)
-#    + `libx265-12.a` (Main12) — and the main references symbols
-#    from the siblings. Dynamic builds merge them into one `.so`;
-#    pkgsStatic doesn't, so any `-lx265` consumer sees undef refs.
-#    Merge via `ar -M` (postBuild) into a unified `libx265.a`.
-#    Dropping multibitdepthSupport would shed HDR10/Main12 — too
-#    much loss for a static rebundle.
+# 1. `multibitdepthSupport = true` emits three archives — 8-bit main +
+#    `libx265-10.a` + `libx265-12.a` — with the main referencing the siblings.
+#    Dynamic builds merge them into one `.so`; pkgsStatic doesn't, so `-lx265`
+#    sees undef refs. Merge via `ar -M` (postBuild). nixpkgs gates multibitdepth
+#    off on aarch64-linux, so guard the merge on the siblings existing rather
+#    than re-deriving the platform predicate.
 #
-#    nixpkgs gates multibitdepth off on aarch64-linux
-#    (`is64bit && !(isAarch64 && isLinux)`), so the siblings are
-#    absent there and the main archive is already a complete
-#    8-bit-only build (HIGH_BIT_DEPTH=OFF, no sibling refs). Guard
-#    the merge on the siblings existing rather than re-deriving the
-#    platform predicate — robust if upstream flips the gate, and it
-#    skips cleanly on aarch64 where there is nothing to merge.
+# 2. Upstream `postInstall` `rm -f $out/lib/*.a` is fatal for pkgsStatic. Clear.
 #
-# 2. Upstream `postInstall` does `rm -f $out/lib/*.a` — correct
-#    for the dynamic default, fatal for pkgsStatic. Clear it.
+# 3. `x265.pc Libs.private` bakes an absolute `libstdc++.a`; `pkg-config
+#    --static` consumers route it to ldflags before the test object where
+#    `--as-needed` drops it → unresolvable libstdc++ refs. Rewrite to
+#    `-lstdc++`. Same trap as srt. (Darwin's `.pc` has libc++ → no-op.)
 #
-# 3. `x265.pc Libs.private` bakes an absolute
-#    `/nix/store/.../libstdc++.a` (x265 is C++). A `pkg-config
-#    --static` consumer (ffmpeg's `check_pkg_config`) routes that
-#    absolute path to ldflags *before* the test object, where
-#    `-Wl,--as-needed` drops it (nothing references it yet); then
-#    `-lx265` pulls unresolvable libstdc++ refs (operator new,
-#    std::ios_base, vtables). Rewrite to `-lstdc++` so the cc-wrapper
-#    appends it at the tail, after the object. Same trap and fix as
-#    srt — surfaced on aarch64 (x86_64's x265 test referenced fewer
-#    C++ symbols), but the `-l` form is correct everywhere. Darwin's
-#    `.pc` carries libc++, not libstdc++.a, so the sed is a no-op.
-#
-# 4. mingw-only: x265's CMake probe captures the dynamic C++ EH
-#    link sequence (`-lgcc_s ...`) into `x265.pc Libs.private`,
-#    forcing the consumer `.exe` to import `libgcc_s_seh-1.dll`
-#    even with `-static-libgcc`. Rewrite `Libs.private` to the
-#    static-libgcc form (fully replaces the line, superseding #3 on
-#    mingw). Lives in `postFixup` because (2) emptied `postInstall`.
+# 4. mingw-only: x265's CMake probe bakes the dynamic C++ EH sequence
+#    (`-lgcc_s …`) into `Libs.private`, forcing `libgcc_s_seh-1.dll` even with
+#    `-static-libgcc`. Rewrite the whole line to static-libgcc form
+#    (supersedes #3 on mingw). In `postFixup` since (2) emptied `postInstall`.
 #    See [[mingw-pc-libgcc-s-probe-trap]].
 { lib }:
 pkgs:

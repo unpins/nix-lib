@@ -1,29 +1,20 @@
-# Make pkgsCross.cosmo.zstd build standalone. Three cosmo-specific snags:
+# pkgsCross.cosmo.zstd, three cosmo snags:
 #
-# 1. zstd's CMake builds a *shared* library by default via its own
-#    `ZSTD_BUILD_SHARED` option (independent of `BUILD_SHARED_LIBS`, which is
-#    all `makeStaticLibraries` flips), and cosmocc can't emit `.so`.
-#    `static = true` switches it to `ZSTD_BUILD_STATIC` only.
+# 1. zstd's CMake builds shared by default via its own `ZSTD_BUILD_SHARED`
+#    (not the `BUILD_SHARED_LIBS` that makeStaticLibraries flips), and cosmocc
+#    can't emit `.so`. `static = true` → `ZSTD_BUILD_STATIC` only.
 #
-# 2. On x86_64 zstd's CMakeLists explicitly adds the hand-written
-#    `lib/decompress/huf_decompress_amd64.S` to the source list. Under cosmocc
-#    that file preprocesses to a symbol-less object (its body is guarded on
-#    `__ELF__` / BMI2, which cosmo doesn't satisfy), and cosmocc's `fixupobj`
-#    then aborts with "missing elf symbol table". The CMakeLists already has an
-#    `else` branch — taken on non-asm targets — that instead defines
-#    `-DZSTD_DISABLE_ASM` and ships zstd's C decompression path. Rewrite the
-#    x86_64 branch to that, exactly as the MSVC branch already does: no asm
-#    object, and the C path is functionally identical.
+# 2. On x86_64 the CMakeLists adds `huf_decompress_amd64.S`, which under cosmocc
+#    preprocesses to a symbol-less object (guarded on `__ELF__`/BMI2) → fixupobj
+#    aborts "missing elf symbol table". Take the existing `else` branch
+#    (`-DZSTD_DISABLE_ASM`, C decompression path), as the MSVC branch does.
 #
-# 3. zstd drags `bashNonInteractive` (a buildInput) and `gnugrep` (baked into
-#    its `zstdgrep`/`zstdless` wrapper scripts). Cross-building bash 5.3 under
-#    cosmo fails on gcc-15's C23 `bool` keyword (`mkbuiltins.c`). We never ship
-#    those wrappers and only want `libzstd`, so pull the build-host copies —
-#    dead references at runtime, and the cosmo closure stays free of bash/grep
-#    (this also drops pcre2, which only gnugrep pulls in).
+# 3. zstd drags bashNonInteractive + gnugrep (for zstdgrep/zstdless wrappers we
+#    never ship); cross-building bash 5.3 under cosmo fails on gcc-15's C23 bool.
+#    Use build-host copies — dead refs at runtime, keeps bash/grep/pcre2 out of
+#    the cosmo closure.
 #
-# Gated on isCosmo so buildPackages.zstd (linux-gnu) keeps its
-# cache.nixos.org hash; only pkgsCross.cosmo.zstd is touched.
+# Gated on isCosmo so buildPackages.zstd (linux-gnu) keeps its cache hash.
 { lib }:
 final: prev:
 if (prev.stdenv.hostPlatform.isCosmo or false) then {

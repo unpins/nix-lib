@@ -1,19 +1,13 @@
 # librist cross-mingw, two fixes:
 #
-# 1. `+ windows.pthreads`. librist's meson check
-#    `cc.has_function('pthread_create')` doesn't link winpthreads
-#    in the probe, so config.h sets `HAVE_PTHREADS 0`. We need
-#    winpthreads at link time anyway (mbedtls' `threading.h`
-#    includes `<pthread.h>`).
+# 1. `+ windows.pthreads` — needed at link time anyway (mbedtls'
+#    `threading.h` includes `<pthread.h>`); librist's meson probe doesn't
+#    link it, so config.h gets `HAVE_PTHREADS 0`.
 #
-# 2. postConfigure sed config.h: flip `HAVE_PTHREADS` and
-#    `HAVE_CLOCK_GETTIME` from 0 to 1. When 0, librist's
-#    `pthread-shim.h` / `time-shim.c` emit stub typedefs + decls
-#    for `pthread_rwlock_*` etc. that collide with the real
-#    winpthreads `<pthread.h>` / `<pthread_time.h>` (typedef widths
-#    differ — shim is `int *`, real is `long long int *`).
-#    winpthreads provides both, so flip the macros — shim gates
-#    short-circuit to the real headers.
+# 2. postConfigure flips `HAVE_PTHREADS`/`HAVE_CLOCK_GETTIME` 0→1 — at 0,
+#    librist's pthread/time shims emit stub typedefs that collide with
+#    real winpthreads headers (width mismatch: shim `int *` vs real
+#    `long long int *`). winpthreads provides both; the macros gate the shim.
 { lib }:
 self: super:
 super.librist.overrideAttrs (oa: {

@@ -1,9 +1,6 @@
-# libaom on mingw: tools (aomdec.exe / aomenc.exe) link with bare
-# `-lpthread` which mingw's libc doesn't carry — winpthreads lives
-# under `windows.pthreads`. ffmpeg's `--enable-libaom` only needs
-# `libaom.a`, not the CLI codec tools, so disable them via cmake.
-# Drop the `bin` output too — nothing lands there with tools off
-# and nixpkgs aborts if a declared output produces no path.
+# libaom on mingw: the CLI tools link bare `-lpthread`, absent from mingw
+# libc; ffmpeg only needs `libaom.a`, so disable them. Drop the `bin`
+# output too — with tools off it's empty and nixpkgs aborts on empty outputs.
 { lib }:
 self: super:
 super.libaom.overrideAttrs (old: {

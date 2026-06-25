@@ -1,14 +1,7 @@
-# openssl/default.nix maps hostPlatform.system → Configure target;
-# x86_64-cosmo isn't in the map. linux-x86_64 works fine: cosmocc presents
-# a glibc-shaped surface for OpenSSL's perspective.
-#
-# Disable -dso (cosmo libc has no working dlopen — Dl_info.dli_fname etc.
-# don't compile). `static = true` (via .override) tells nixpkgs to drop
-# "shared" from configureFlags and add the appropriate no-* flags.
-#
-# Gated on isCosmo so buildPackages.openssl (linux-gnu) keeps its
-# cache.nixos.org hash — otherwise any cosmo build that pulls a
-# build-side tool depending on openssl would trigger a full rebuild.
+# x86_64-cosmo isn't in openssl's system→Configure-target map; linux-x86_64
+# works (cosmocc presents a glibc-shaped surface). no-dso because cosmo libc has
+# no working dlopen. `static = true` drops "shared" and adds the no-* flags.
+# Gated on isCosmo so buildPackages.openssl (linux-gnu) keeps its cache hash.
 { lib }:
 final: prev:
 if (prev.stdenv.hostPlatform.isCosmo or false) then {

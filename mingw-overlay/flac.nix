@@ -1,14 +1,7 @@
-# flac on mingw: by default the installed headers decorate every
-# public symbol with `__declspec(dllimport)`, expecting consumers to
-# resolve them through a `flac.dll` at runtime. Static consumers
-# (libsndfile, libopenmpt, ffmpeg via `--enable-libflac`) end up with
-# undefined `__imp_FLAC__*` references at link time because the .a
-# doesn't carry the DLL import thunks.
-#
-# Defining `FLAC__NO_DLL` before including any FLAC header switches
-# the prototypes to plain external linkage. Inject it via the `.pc`
-# `Cflags:` so every consumer picks it up automatically — they'd
-# otherwise each need their own `-DFLAC__NO_DLL`.
+# flac on mingw: headers default to `__declspec(dllimport)`, so static
+# consumers (libsndfile, libopenmpt, ffmpeg) get `__imp_FLAC__*` undef.
+# Inject `-DFLAC__NO_DLL` via the .pc `Cflags:` (plain external linkage)
+# so every consumer picks it up automatically.
 { lib }:
 self: super:
 super.flac.overrideAttrs (old: {

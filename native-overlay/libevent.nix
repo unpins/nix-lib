@@ -1,12 +1,9 @@
-# Inject pkg-config into libevent's nativeBuildInputs. nixpkgs' libevent
-# forgets it, which is invisible on x86_64/aarch64 because the configure
-# fallback probe `cc conftest.c -lssl -lcrypto` resolves on its own. On
-# armv7l (ARM 32-bit) OpenSSL 3.x's libcrypto.a needs `__atomic_*_8`
-# from libatomic — `libcrypto.pc` declares it in `Libs.private`, but only
-# `pkg-config --libs --static openssl` surfaces it; the bare probe fails
-# the link with undefined `__atomic_fetch_add_8`. Splicing-aware: pass
-# `scope.pkg-config` (not `scope.buildPackages.pkg-config`) so nixpkgs
-# picks the cross-correct `<triple>-pkg-config-wrapper`.
+# Inject the pkg-config that nixpkgs' libevent forgets. Invisible on
+# x86_64/aarch64 (the bare `cc -lssl -lcrypto` probe resolves), but on armv7l
+# OpenSSL 3.x's libcrypto.a needs libatomic's `__atomic_*_8` — declared only
+# in libcrypto.pc's Libs.private, which the bare probe misses (undefined
+# `__atomic_fetch_add_8`). Pass `scope.pkg-config` (splicing-aware) so the
+# cross-correct `<triple>-pkg-config-wrapper` is picked.
 { lib }:
 scope:
 scope.libevent.overrideAttrs (oa: {

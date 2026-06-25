@@ -1,21 +1,12 @@
-# nixpkgs `pkgsStatic.quirc`: Makefile's `all` target builds
-# `libquirc.so + qrtest` by default. In pkgsStatic the `.so` fails to
-# link with `R_X86_64_32 against __TMC_END__` (same family as
-# xvidcore / libcaca). Upstream's postInstall does `rm $out/lib/
-# libquirc.a` (correct for the dynamic default, fatal for static).
-# Plus, the Makefile doesn't generate `quirc.pc` — consumers calling
-# `pkg-config quirc` would fail.
+# nixpkgs `pkgsStatic.quirc`: the `all` target builds `libquirc.so` which
+# fails the static link (`R_X86_64_32 against __TMC_END__`), and upstream
+# postInstall `rm`s `libquirc.a` (fatal for static). The Makefile also emits
+# no `quirc.pc`. So build `libquirc.a` directly, install lib + header by hand,
+# and generate a minimal `.pc`. `libjpeg`/`libpng` are only for the `qrtest`
+# CLI — safe to leave in buildInputs (the lib doesn't link them).
 #
-# Fix: build `libquirc.a` directly, install it + header by hand, and
-# generate a minimal `.pc` ourselves. `libjpeg`/`libpng` in upstream
-# buildInputs are for the `qrtest` CLI; the library proper doesn't
-# link against them, so leaving them in is safe (no link-time
-# reference from `libquirc.a`).
-#
-# The Makefile top runs `$(shell pkg-config --cflags sdl)` — without
-# `sdl.pc` available it captures STDERR and injects that text into
-# CFLAGS. Pass `SDL_CFLAGS=` / `SDL_LIBS=` empty to neutralize the
-# probe.
+# `SDL_CFLAGS=`/`SDL_LIBS=` empty: the Makefile's `$(shell pkg-config --cflags
+# sdl)` otherwise captures STDERR into CFLAGS when `sdl.pc` is absent.
 { lib }:
 pkgs:
 pkgs.quirc.overrideAttrs (_oa: {
