@@ -2718,17 +2718,32 @@ CBODY
                             (map (n: { name = n; value = unpinBashBuildFix prev prev.${n}; })
                               (builtins.filter (n: prev ? ${n}) engineBashAttrs))
                           else { });
+                      # Layer C: per-package native fixes for engine DEPS
+                      # (engineDepFixAttrs above), e.g. libcap drops the `go`
+                      # input the engine cc can't build.
+                      withDepFixes = builtins.foldl'
+                        (acc: n: acc.extend
+                          (_final: prev:
+                            if prev.stdenv.hostPlatform.isMusl && prev ? ${n}
+                            then { ${n} = nativeFixes.${n} prev; }
+                            else { }))
+                        withBashFix
+                        engineDepFixAttrs;
                     in
-                    # Layer C: per-package native fixes for engine DEPS (engineDepFixAttrs
-                    # above), e.g. libcap drops the `go` input the engine cc can't build.
-                    builtins.foldl'
-                      (acc: n: acc.extend
-                        (_final: prev:
-                          if prev.stdenv.hostPlatform.isMusl && prev ? ${n}
-                          then { ${n} = nativeFixes.${n} prev; }
-                          else { }))
-                      withBashFix
-                      engineDepFixAttrs;
+                    # Layer D: atf self-test fix, DARWIN-only. atf is a checkInput
+                    # of Apple libiconv, which our static gnugrep pulls in every
+                    # engine darwin build; its flaky installCheck
+                    # (dynstr_test:init_rep) breaks the build on a cache miss. This
+                    # is a LEAF overlay on pkgsStatic — NOT the nixpkgs import,
+                    # which would join the stdenv-bootstrap fixpoint and re-hash the
+                    # cached macOS SDK. Gated on isStatic (the engine target host);
+                    # native-overlay/atf.nix self-gates to darwin, so the linux
+                    # static host is a no-op and stays byte-identical.
+                    withDepFixes.extend
+                      (_final: prev:
+                        if (prev.stdenv.hostPlatform.isStatic or false) && prev ? atf
+                        then { atf = nativeFixes.atf prev; }
+                        else { });
                 enginePkgs = pkgs // { pkgsStatic = enginePkgsStatic; };
               in
               if build != null
