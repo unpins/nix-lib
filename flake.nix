@@ -229,15 +229,17 @@
             # guard is false → fortify stays off. Per-target shim, so Linux shims
             # stay byte-identical (empty).
             winFortifyOff = nixpkgs.lib.optionalString isWinTarget " -D_FORTIFY_SOURCE=0";
-            # darwin: the nixpkgs bintools-wrapper's darwin-sdk-setup.bash exports
-            # SDKROOT (and DEVELOPER_DIR) on every darwin build. With apple-sdk=null
-            # it points them at the unsubstituted `@fallback_sdk@` placeholder, and
-            # the engine clang honours SDKROOT as `-isysroot` → it passes a broken
-            # `-syslibroot` to ld64.lld and `-lSystem` is not found. The engine
-            # manages its OWN on-demand darwin sysroot (where SDKROOT is unset, as in
-            # a raw `llvm clang -target …-darwin` call), so clear both for every
-            # engine invocation on darwin. Empty on non-darwin (the shim is shared).
-            darwinEnvClear = nixpkgs.lib.optionalString isDarwinTarget "unset SDKROOT DEVELOPER_DIR; ";
+            # darwin: use the packaged macOS SDK on every build. The engine clang
+            # honours SDKROOT as `-isysroot` and its darwin front (frontRewriteDarwin)
+            # then links against the SDK's libSystem + System/Library/Frameworks
+            # (CoreFoundation/IOKit/… resolve) instead of the minimal embedded
+            # sysroot — that minimal sysroot existed only for the linux→darwin cross,
+            # which the native-darwin turn removed. The SDK is a BUILD-time dep
+            # (cached); shipped binaries stay 0-ref since libSystem/frameworks are
+            # system paths. DEVELOPER_DIR is cleared so the engine never shells out to
+            # xcrun (it reads SDKROOT directly). Empty on non-darwin (shim is shared).
+            darwinEnvSetup = nixpkgs.lib.optionalString isDarwinTarget
+              "export SDKROOT=${pkgs.apple-sdk.sdkroot}; unset DEVELOPER_DIR; ";
             # Records each executable link to a per-output sidecar (objs + .a,
             # split local vs /nix/store) — the source the multicall hook reads
             # back for a program's objs/internalArchives. Inputs are resolved to
@@ -371,7 +373,7 @@
                   set -- "\$@" "\$__a"
                 done
               fi
-              ${darwinEnvClear}exec ${toolchain}/bin/llvm $2 -target ${target} -D__STDC_ISO_10646__=201706L${darwinStubFlag} "\$@" ${optClass}${winFortifyOff}\$__lto
+              ${darwinEnvSetup}exec ${toolchain}/bin/llvm $2 -target ${target} -D__STDC_ISO_10646__=201706L${darwinStubFlag} "\$@" ${optClass}${winFortifyOff}\$__lto
               EOF
                 chmod +x "$out/bin/$1"
               }
@@ -379,7 +381,7 @@
               mk clang++ clang++ ; mk c++ clang++ ; mk g++ clang++
               cat > $out/bin/cpp <<EOF
               #!/bin/sh
-              ${darwinEnvClear}exec ${toolchain}/bin/llvm clang -E -target ${target} -D__STDC_ISO_10646__=201706L${darwinStubFlag} "\$@"
+              ${darwinEnvSetup}exec ${toolchain}/bin/llvm clang -E -target ${target} -D__STDC_ISO_10646__=201706L${darwinStubFlag} "\$@"
               EOF
               chmod +x $out/bin/cpp
             '';
@@ -485,42 +487,37 @@
             # own startup objects are never shadowed. Extend alongside winWarmLibs.
             isWinTarget =
               nixpkgs.lib.hasInfix "windows" target || nixpkgs.lib.hasInfix "mingw" target;
-            # darwin (Mach-O) target: arm64/x86_64-apple-darwin / -macos. The engine
-            # compiles+links darwin SDK-free (the toolchain builds the macOS sysroot
-            # on demand from vendored Apple-open-source headers + a libSystem.tbd link
-            # stub — proven: `llvm clang -target arm64-apple-darwin hw.c` → Mach-O,
-            # no Xcode SDK). The nixpkgs darwin packaging, however, is structurally
-            # SDK-coupled: callPackage auto-fills the cc/bintools wrapper's `apple-sdk`
-            # parameter from the darwin set, so the wrapper pulls apple-sdk + Csu + ld64
-            # + cctools into the closure (and re-injects `-isysroot`/`-syslibroot`)
-            # even with `libc = null`. Passing `apple-sdk = null` (below) overrides the
-            # auto-fill, keeping the engine's own sysroot the only one. See
-            # docs/platforms/darwin.md and mega-multiplatform-design.md §4.1.
+            # darwin (Mach-O) target: arm64/x86_64-apple-darwin / -macos. SDK-always:
+            # darwinEnvSetup exports SDKROOT = the packaged apple-sdk, and the engine's
+            # darwin front (frontRewriteDarwin) then uses the SDK for headers, libSystem
+            # and System/Library/Frameworks. (The engine CAN compile SDK-free from its
+            # own on-demand sysroot — that's how the linux→darwin cross worked — but the
+            # native-darwin turn made the real SDK both available and necessary, e.g.
+            # htop's IOKit/CoreFoundation.) We feed the SDK ourselves rather than letting
+            # nixpkgs' darwin wrapper auto-inject it, because that wrapper also pulls
+            # Csu/crt + ld64 + cctools and re-issues -isysroot/-syslibroot, which would
+            # fight the engine's own crt-less Mach-O link — so `apple-sdk = null` (below)
+            # suppresses the wrapper's auto-fill while SDKROOT supplies the SDK cleanly.
+            # See docs/platforms/darwin.md and mega-multiplatform-design.md §4.1.
             isDarwinTarget =
               nixpkgs.lib.hasInfix "darwin" target || nixpkgs.lib.hasInfix "macos" target;
-            # Only darwin needs the `apple-sdk = null` override; on every other target
-            # the attr is absent from the package set so callPackage never injects it,
-            # and passing it would be inert — but keep it gated for clarity.
+            # `apple-sdk = null` stops callPackage auto-filling the cc/bintools wrapper's
+            # `apple-sdk` param from the darwin set (which would re-inject a conflicting
+            # SDK setup); the engine gets the SDK via SDKROOT instead. Inert off darwin
+            # (the attr is absent there), but kept gated for clarity.
             appleSdkOverride = nixpkgs.lib.optionalAttrs isDarwinTarget { apple-sdk = null; };
-            # Legacy darwin headers the engine's minimal sysroot (zig-derived Apple
-            # open-source headers + libSystem.tbd) doesn't ship, but gnulib's
-            # stackvma-mach.c (pulled by grep/sed/coreutils via the c-stack module)
-            # `#include`s on macOS: `<libc.h>` (a legacy umbrella — the code only
-            # needs getpagesize, which is in <unistd.h>) and `<nlist.h>` (included
-            # but unused on the mach path; `struct nlist` lives in <mach-o/nlist.h>,
-            # which the sysroot HAS). Inject both as thin shims on the include path
-            # via `-idirafter` (last in the search order, so a real SDK header — if
-            # one ever appeared — would still win and these never shadow anything).
-            # Without them every gnulib-heavy darwin build dies on `'libc.h' not
-            # found`. Darwin-only; the shim is empty elsewhere.
-            # ncurses' tinfo/lib_baudrate.c `#include`s <sys/ttydev.h> on __APPLE__
-            # for the small USE_OLD_TTY baud indices; recent apple-sdk dropped that
-            # legacy header. Any ncurses COMPILED in the engine sandbox (readline's
-            # for bash, the embedded-fallback for bc/dash, every tier-1 TUI) dies
-            # 'sys/ttydev.h not found' — the stock SDK build only escapes it via the
-            # cache. Apple's verbatim copy goes in here, not on the ncurses recipe:
-            # it's a sysroot gap (same class as libc.h/nlist.h), so one -idirafter
-            # stub fixes every consumer without re-hashing apple-sdk.
+            # Legacy darwin headers that even the packaged macOS SDK no longer ships
+            # but gnulib + ncurses still `#include` on __APPLE__: `<libc.h>` (a legacy
+            # umbrella; gnulib's stackvma-mach.c, pulled by grep/sed/coreutils via the
+            # c-stack module, needs only getpagesize from it), `<nlist.h>` (included by
+            # the same path, `struct nlist` actually lives in <mach-o/nlist.h>, which
+            # the SDK HAS) and `<sys/ttydev.h>` (ncurses' lib_baudrate.c wants it for
+            # USE_OLD_TTY baud indices; recent SDKs dropped it). Inject all three as
+            # thin shims via `-idirafter` (last in the search order, so the real SDK
+            # header wins whenever it exists and these never shadow anything). Kept
+            # off the ncurses recipe so the fix is sysroot-wide and never re-hashes
+            # apple-sdk. Without them every gnulib-heavy / ncurses darwin build dies on
+            # `'libc.h' / 'sys/ttydev.h' not found`. Darwin-only; empty elsewhere.
             darwinHeaderStubs = pkgs.runCommand "unpin-darwin-hdr-stubs" { } ''
               mkdir -p $out/include/sys
               printf '#ifndef _UNPIN_LIBC_H\n#define _UNPIN_LIBC_H\n#include <unistd.h>\n#include <stdlib.h>\n#endif\n' > $out/include/libc.h
@@ -529,21 +526,9 @@
             '';
             darwinStubFlag =
               nixpkgs.lib.optionalString isDarwinTarget " -idirafter ${darwinHeaderStubs}/include";
-            # macOS folds libm/libpthread/libdl/librt/libutil/libresolv into
-            # libSystem; a real SDK ships them as reexport stubs so `-lm` &c.
-            # resolve. The engine's minimal sysroot has only libSystem.tbd, so a
-            # package whose configure adds `-lm` (file's libmagic) fails to link
-            # IN THE SANDBOX (no host SDK to fall back on). Empty archives on the
-            # search path fix it: `-lm` finds libm.a, pulls no objects, and the
-            # math symbols resolve from libSystem. An empty ar archive is exactly
-            # the 8-byte `!<arch>\n` header (zero members), so write it directly —
-            # no `ar` in the bare runCommand stdenv, and it's arch-independent.
-            darwinStubLibs = pkgs.runCommand "unpin-darwin-stub-libs" { } ''
-              mkdir -p $out/lib
-              for L in m pthread dl rt util resolv; do
-                printf '!<arch>\n' > $out/lib/lib$L.a
-              done
-            '';
+            # (No `-lm`/`-lpthread` stub libs: SDK-always means the engine adds
+            # `-L <sdk>/usr/lib` at link, where the SDK's libm.tbd/libpthread.tbd/…
+            # reexport stubs resolve them — exactly as a stock macOS clang link does.)
             winImportLibs = pkgs.runCommand "unpin-win-implibs-${target}" { } ''
               mkdir -p $out/lib
               for L in bcrypt ws2_32 userenv secur32 crypt32 shlwapi; do
@@ -580,13 +565,6 @@
                 # file's own LIBS, but the mega-link only knows depArchives, so add
                 # it here too (no-op for packages that don't reference it).
                 echo "-lbcrypt -lws2_32 -luserenv -lsecur32 -lcrypt32 -lshlwapi" >> $out/nix-support/cc-ldflags
-              ''
-              + nixpkgs.lib.optionalString isDarwinTarget ''
-                # Empty libm/libpthread/… on the search path so a package's own
-                # `-lm` (file) resolves in the sandbox; symbols come from
-                # libSystem. Just the -L (available), NOT force-linked — packages
-                # that reference none are unaffected. See darwinStubLibs.
-                echo "-L${darwinStubLibs}/lib" >> $out/nix-support/cc-ldflags
               '';
             bintools = staticBuild.wrapBintoolsWith ({
               bintools = bintoolsUnwrapped; libc = null; extraBuildCommands = unprefixAliases;
@@ -631,13 +609,13 @@
                 ++ nixpkgs.lib.optional captureLinks captureHook;
               # The darwin stdenv bakes `apple-sdk` into its `extraBuildInputs`
               # (generic stdenv: defaultBuildInputs = extraBuildInputs), so EVERY
-              # mkDerivation pulls the Apple SDK — and apple-sdk itself only builds
-              # on a real darwin host (its Csu crt needs a native darwin clang), so
-              # the closure fails on this Linux box. The engine carries its own
-              # darwin sysroot (vendored headers + libSystem.tbd), so drop the SDK
-              # from the default inputs on darwin. Untouched elsewhere (musl/mingw
-              # extraBuildInputs are already empty). Framework-dependent packages
-              # would need the SDK back, but the catalog's core tools don't link any.
+              # mkDerivation pulls in the SDK's setup hooks (which re-export SDKROOT,
+              # add -isysroot/-syslibroot, the Csu crt, …) and fight the engine's own
+              # crt-less Mach-O link. We supply the SDK ourselves via SDKROOT
+              # (darwinEnvSetup), so drop apple-sdk from the default inputs on darwin —
+              # the headers/libs/frameworks all still come from that same SDK, just
+              # through the engine front. Untouched elsewhere (musl/mingw
+              # extraBuildInputs are already empty).
               extraBuildInputs =
                 if isDarwinTarget then [ ] else (old.extraBuildInputs or [ ]);
             }));
@@ -1248,40 +1226,6 @@
           } // (if old ? env && old.env ? NIX_LDFLAGS
                 then { env = old.env // { NIX_LDFLAGS = old.env.NIX_LDFLAGS + " -liconv"; }; }
                 else { NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " -liconv"; }));
-
-        # Build a darwin package against the packaged macOS SDK instead of the
-        # engine's minimal embedded sysroot, for platform code that needs real SDK
-        # headers/frameworks the on-demand sysroot doesn't carry (htop: net/*,
-        # mach/*, IOKit, CoreFoundation; future tier-1 TUIs likewise). The engine
-        # cc is plain clang, so `-isysroot <sdk>` (headers) + `-F <sdk>/…/Frameworks`
-        # (framework search) is all it takes — the package's own build adds the
-        # matching `-framework` flags. CRUCIAL: `-isysroot` rides the COMPILE only;
-        # at the LINK it would override the engine's own libSystem sysroot and break
-        # it ("C compiler cannot create executables"), so the link gets just `-F`.
-        # The resulting binary links the named frameworks + libSystem (allowed by
-        # the darwin allow-list), not libSystem-only. No-op off darwin.
-        withDarwinSdk = pkgs: drv:
-          if !(pkgs.stdenv.hostPlatform.isDarwin or false) then drv
-          else
-            let
-              sdk = pkgs.apple-sdk.sdkroot;
-              cflags = " -isysroot ${sdk}";
-              ldflags = " -F ${sdk}/System/Library/Frameworks";
-            in
-            drv.overrideAttrs (old:
-              # structuredAttrs drvs keep NIX_* in `env`; setting them top-level too
-              # is a hard collision (see withDarwinIconv). Route to env there.
-              if old ? env && (old.env ? NIX_CFLAGS_COMPILE || old.env ? NIX_LDFLAGS)
-              then {
-                env = old.env // {
-                  NIX_CFLAGS_COMPILE = (old.env.NIX_CFLAGS_COMPILE or "") + cflags;
-                  NIX_LDFLAGS = (old.env.NIX_LDFLAGS or "") + ldflags;
-                };
-              }
-              else {
-                NIX_CFLAGS_COMPILE = (old.NIX_CFLAGS_COMPILE or "") + cflags;
-                NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + ldflags;
-              });
 
         # Embed a package's multi-call alias list into `$out/bin/<primary>` as a
         # `unpin/aliases` entry of the binary's embedded ZIP, so unpin's
@@ -2548,6 +2492,20 @@ CBODY
               && (anyGroup || depArchives != [ ] || depInputDirs != [ ] || nativeArchives != [ ]);
             groupOpen = nixpkgs.lib.optionalString needGroup "-Wl,--start-group";
             groupClose = nixpkgs.lib.optionalString needGroup "-Wl,--end-group";
+            # darwin frameworks a folded module references (htop → IOKit /
+            # CoreFoundation). The per-package build linked them via its own
+            # configure, but the mega relinks every module from bitcode, so it must
+            # name them itself. Union across modules; darwin-only, on demand.
+            darwinFrameworks = nixpkgs.lib.unique
+              (nixpkgs.lib.concatMap (m: (m.requires or { }).frameworks or [ ]) modules);
+            # Just the `-framework <each>` flags. The engine adapter (SDK-always:
+            # SDKROOT points the darwin front at the packaged SDK) already adds
+            # `-F <sdk>/System/Library/Frameworks`, `-L <sdk>/usr/lib` and `-lSystem`
+            # to every darwin link, so the frameworks and CoreFoundation's re-export
+            # of libobjc resolve from there — the mega only names the frameworks.
+            darwinFrameworkFlags = nixpkgs.lib.optionalString
+              (isDarwinHost && darwinFrameworks != [ ])
+              (nixpkgs.lib.concatMapStringsSep " " (f: "-framework ${f}") darwinFrameworks);
             adapter = unpinAdapterStdenv {
               inherit pkgs toolchain target;
               # Cross mega: when pkgs is a cross set the link runs through the
@@ -2580,7 +2538,8 @@ CBODY
                 ${face} -fuse-ld=lld ${stripLinkFlag} -o ${binFile} \
                   multicall/dispatcher.c \
                   ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
-                  ${groupOpen} ${nixpkgs.lib.concatStringsSep " " nativeArchives} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose}
+                  ${groupOpen} ${nixpkgs.lib.concatStringsSep " " nativeArchives} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose} \
+                  ${darwinFrameworkFlags}
                 runHook postBuild
               '';
               installPhase = ''
