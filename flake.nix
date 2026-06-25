@@ -2691,9 +2691,11 @@ CBODY
                 # most by hand and would double-apply). The next breaking dep here.
                 engineBashAttrs = [ "bash" "bashInteractive" "bashNonInteractive" ];
                 # Engine DEPS whose native-overlay fix must be wired in —
-                # transitive deps no consumer closure fixes by hand. libcap: drop
-                # the go input the engine cc can't build (see Layer C).
-                engineDepFixAttrs = [ "libcap" ];
+                # transitive deps no consumer closure fixes by hand (see Layer C).
+                # libcap: drop the go input the engine cc can't build. ncurses:
+                # un-pin the default terminfo dir (store-path leak in libtinfo).
+                # attr: un-pin libattr's xattr.conf path (store-path leak).
+                engineDepFixAttrs = [ "libcap" "ncurses" "attr" ];
                 enginePkgsStatic =
                   if !useEngine then pkgs.pkgsStatic
                   else
