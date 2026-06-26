@@ -2695,7 +2695,11 @@ CBODY
                 # libcap: drop the go input the engine cc can't build. ncurses:
                 # un-pin the default terminfo dir (store-path leak in libtinfo).
                 # attr: un-pin libattr's xattr.conf path (store-path leak).
-                engineDepFixAttrs = [ "libcap" "ncurses" "attr" ];
+                # mbedtls: drop the GCC-only -fzero-init-padding-bits=unions cmake
+                # flag clang rejects + exclude the pem-suite test (engine codegen
+                # quirk in a path libarchive never uses). All linux-only (isMusl);
+                # tar uses mbedtls only on linux.
+                engineDepFixAttrs = [ "libcap" "ncurses" "attr" "mbedtls" ];
                 enginePkgsStatic =
                   if !useEngine then pkgs.pkgsStatic
                   else
