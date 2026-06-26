@@ -20,14 +20,16 @@
 # nixpkgs-mbedtls + non-linux engine-cc combos don't build cleanly), so this fix
 # is never needed off-linux.
 { lib }:
-scope:
-scope.mbedtls.overrideAttrs (oa: {
-  cmakeFlags = builtins.filter
-    (f: !(lib.hasInfix "zero-init-padding-bits" (toString f)))
-    (oa.cmakeFlags or [ ]);
-  checkPhase = ''
-    runHook preCheck
-    ctest --output-on-failure --exclude-regex '^pem-suite$'
-    runHook postCheck
-  '';
-})
+{
+  autoWire = "musl";
+  apply = scope: scope.mbedtls.overrideAttrs (oa: {
+    cmakeFlags = builtins.filter
+      (f: !(lib.hasInfix "zero-init-padding-bits" (toString f)))
+      (oa.cmakeFlags or [ ]);
+    checkPhase = ''
+      runHook preCheck
+      ctest --output-on-failure --exclude-regex '^pem-suite$'
+      runHook postCheck
+    '';
+  });
+}

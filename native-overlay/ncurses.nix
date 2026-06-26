@@ -19,10 +19,12 @@
 # and makes the build deterministic everywhere. The .a libs are unaffected → the
 # folded mega binary stays byte-identical.
 { lib }:
-scope:
-scope.ncurses.overrideAttrs (oa: {
-  configureFlags = (oa.configureFlags or [ ]) ++ [
-    "--with-default-terminfo-dir=/usr/share/terminfo"
-    "--disable-db-install"
-  ];
-})
+{
+  autoWire = "musl";
+  apply = scope: scope.ncurses.overrideAttrs (oa: {
+    configureFlags = (oa.configureFlags or [ ]) ++ [
+      "--with-default-terminfo-dir=/usr/share/terminfo"
+      "--disable-db-install"
+    ];
+  });
+}

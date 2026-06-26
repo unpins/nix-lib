@@ -10,7 +10,10 @@
 # fixpoint and re-hash the cached macOS SDK. Self-gates to darwin so the linux
 # static host is a no-op (byte-identical).
 { lib }:
-pkgs:
-if pkgs.stdenv.hostPlatform.isDarwin
-then pkgs.atf.overrideAttrs (_: { doInstallCheck = false; })
-else pkgs.atf
+{
+  autoWire = "static";
+  apply = pkgs:
+    if pkgs.stdenv.hostPlatform.isDarwin
+    then pkgs.atf.overrideAttrs (_: { doInstallCheck = false; })
+    else pkgs.atf;
+}

@@ -9,8 +9,10 @@
 # the portable behavior. Wired as an engine DEP fix (coreutils → acl → attr;
 # see flake.nix Layer C).
 { lib }:
-scope:
-scope.attr.overrideAttrs (oa: {
-  makeFlags = (oa.makeFlags or [ ]) ++ [ "sysconfdir=/etc" ];
-  installFlags = (oa.installFlags or [ ]) ++ [ "sysconfdir=${placeholder "out"}/etc" ];
-})
+{
+  autoWire = "musl";
+  apply = scope: scope.attr.overrideAttrs (oa: {
+    makeFlags = (oa.makeFlags or [ ]) ++ [ "sysconfdir=/etc" ];
+    installFlags = (oa.installFlags or [ ]) ++ [ "sysconfdir=${placeholder "out"}/etc" ];
+  });
+}

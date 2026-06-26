@@ -2690,16 +2690,6 @@ CBODY
                 # Explicit (NOT a blanket nativeFixes pass — consumers already apply
                 # most by hand and would double-apply). The next breaking dep here.
                 engineBashAttrs = [ "bash" "bashInteractive" "bashNonInteractive" ];
-                # Engine DEPS whose native-overlay fix must be wired in —
-                # transitive deps no consumer closure fixes by hand (see Layer C).
-                # libcap: drop the go input the engine cc can't build. ncurses:
-                # un-pin the default terminfo dir (store-path leak in libtinfo).
-                # attr: un-pin libattr's xattr.conf path (store-path leak).
-                # mbedtls: drop the GCC-only -fzero-init-padding-bits=unions cmake
-                # flag clang rejects + exclude the pem-suite test (engine codegen
-                # quirk in a path libarchive never uses). All linux-only (isMusl);
-                # tar uses mbedtls only on linux.
-                engineDepFixAttrs = [ "libcap" "ncurses" "attr" "mbedtls" ];
                 enginePkgsStatic =
                   if !useEngine then pkgs.pkgsStatic
                   else
@@ -2722,32 +2712,37 @@ CBODY
                             (map (n: { name = n; value = unpinBashBuildFix prev prev.${n}; })
                               (builtins.filter (n: prev ? ${n}) engineBashAttrs))
                           else { });
-                      # Layer C: per-package native fixes for engine DEPS
-                      # (engineDepFixAttrs above), e.g. libcap drops the `go`
-                      # input the engine cc can't build.
+                      # Layer C: transitive engine-DEP fixes that self-declare
+                      # `autoWire` in native-overlay (collected as autoWiredFixes).
+                      # Each is folded into pkgsStatic so the dep is fixed wherever
+                      # it appears in a closure — no consumer applies these by hand.
+                      # The host gate comes from the declaration: "musl" = linux
+                      # static-musl deps (libcap drops the go input the engine cc
+                      # can't build; ncurses/attr un-pin store-path leaks; mbedtls
+                      # drops a clang-rejected cmake flag + a flaky test; libxcrypt
+                      # skips its symbol-lint test-suite); "static" = any static
+                      # host incl. darwin (atf's flaky darwin installCheck — its
+                      # file self-gates to darwin, so the linux static host is a
+                      # no-op and byte-identical). A LEAF overlay on pkgsStatic, NOT
+                      # the nixpkgs import (which would join the stdenv-bootstrap
+                      # fixpoint and re-hash the cached macOS SDK). Order-independent:
+                      # each fix overrides a distinct attr and reads only that attr,
+                      # so the alphabetical fold matches any order byte-for-byte.
                       withDepFixes = builtins.foldl'
-                        (acc: n: acc.extend
-                          (_final: prev:
-                            if prev.stdenv.hostPlatform.isMusl && prev ? ${n}
-                            then { ${n} = nativeFixes.${n} prev; }
-                            else { }))
+                        (acc: name:
+                          let entry = autoWiredFixes.${name}; in
+                          acc.extend
+                            (_final: prev:
+                              if (if entry.autoWire == "static"
+                                  then (prev.stdenv.hostPlatform.isStatic or false)
+                                  else prev.stdenv.hostPlatform.isMusl)
+                                 && prev ? ${name}
+                              then { ${name} = entry.apply prev; }
+                              else { }))
                         withBashFix
-                        engineDepFixAttrs;
+                        (builtins.attrNames autoWiredFixes);
                     in
-                    # Layer D: atf self-test fix, DARWIN-only. atf is a checkInput
-                    # of Apple libiconv, which our static gnugrep pulls in every
-                    # engine darwin build; its flaky installCheck
-                    # (dynstr_test:init_rep) breaks the build on a cache miss. This
-                    # is a LEAF overlay on pkgsStatic — NOT the nixpkgs import,
-                    # which would join the stdenv-bootstrap fixpoint and re-hash the
-                    # cached macOS SDK. Gated on isStatic (the engine target host);
-                    # native-overlay/atf.nix self-gates to darwin, so the linux
-                    # static host is a no-op and stays byte-identical.
-                    withDepFixes.extend
-                      (_final: prev:
-                        if (prev.stdenv.hostPlatform.isStatic or false) && prev ? atf
-                        then { atf = nativeFixes.atf prev; }
-                        else { });
+                    withDepFixes;
                 enginePkgs = pkgs // { pkgsStatic = enginePkgsStatic; };
               in
               if build != null
@@ -3509,7 +3504,22 @@ CBODY
       # `lib.nativeFixes.libevent`). Safe under laziness — cross-fix references
       # resolve only when the consumer calls with `pkgs`.
       fixLibBase = nixpkgs.lib // lib;
-      nativeFixes = import ./native-overlay { lib = fixLibBase // { inherit nativeFixes; }; };
+      # A native-overlay file is EITHER a bare `pkgs: drv` fix (applied by name —
+      # in defaultRawBuild, or by a consumer's own build closure) OR a self-
+      # declaring `{ autoWire = "musl" | "static"; apply = pkgs: drv; }` for a
+      # transitive engine DEP that no consumer fixes by hand. The latter are
+      # folded into the pkgsStatic engine overlay automatically (autoWiredFixes,
+      # consumed in mkStandaloneFlake) — replacing the old hand-kept
+      # engineDepFixAttrs list. Either shape, `nativeFixes.<n>` normalizes to the
+      # `pkgs: drv` function so every existing consumer is unchanged; the
+      # {autoWire, apply} metadata is carried only by autoWiredFixes.
+      rawNativeFixes = import ./native-overlay { lib = fixLibBase // { inherit nativeFixes; }; };
+      nativeFixes = builtins.mapAttrs
+        (_: v: if builtins.isFunction v then v else v.apply)
+        rawNativeFixes;
+      autoWiredFixes = nixpkgs.lib.filterAttrs
+        (_: v: builtins.isAttrs v && v ? autoWire)
+        rawNativeFixes;
       mingwOverlayFixes = import ./mingw-overlay { lib = fixLibBase; };
     in
     {
