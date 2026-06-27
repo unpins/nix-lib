@@ -2681,7 +2681,9 @@ CBODY
                       # static-musl deps (libcap drops the go input the engine cc
                       # can't build; ncurses/attr un-pin store-path leaks; mbedtls
                       # drops a clang-rejected cmake flag + a flaky test; libxcrypt
-                      # skips its symbol-lint test-suite); "static" = any static
+                      # skips its symbol-lint test-suite; libsepol forces
+                      # HAVE_REALLOCARRAY past a stdin probe the engine cc fails);
+                      # "static" = any static
                       # host incl. darwin (atf's flaky darwin installCheck — its
                       # file self-gates to darwin, so the linux static host is a
                       # no-op and byte-identical). A LEAF overlay on pkgsStatic, NOT
