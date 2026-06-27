@@ -18,10 +18,22 @@
 # never use the in-output db, so suppressing the db install is behavior-neutral
 # and makes the build deterministic everywhere. The .a libs are unaffected → the
 # folded mega binary stays byte-identical.
+#
+# `embedFallbackTerminfo` is folded in here too (not per-package): it compiles a
+# curated terminal set into libtinfo.a as a C array so every static tool stays
+# portable without a host /usr/share/terminfo (db lookup stays ON — host terminfo
+# still wins at runtime; the array is pure additive fallback). Baking it at the
+# overlay level — the Linux mirror of cosmo/mingw's embedFallbackTerminfoOnly —
+# means EVERY engine-Linux build links the SAME ncurses .a, so the mega dedups to
+# one copy automatically and no consumer flake mentions ncurses.
 { lib }:
 {
-  autoWire = "musl";
-  apply = scope: scope.ncurses.overrideAttrs (oa: {
+  # "static" (not "musl"): apply to darwin's static host too, so darwin engine
+  # builds converge on the SAME fallback-embedded ncurses and no consumer flake
+  # mentions ncurses on any native platform. macOS ships /usr/share/terminfo, so
+  # the default-terminfo-dir pin + --disable-db-install are valid there as well.
+  autoWire = "static";
+  apply = scope: (lib.embedFallbackTerminfo scope.ncurses).overrideAttrs (oa: {
     configureFlags = (oa.configureFlags or [ ]) ++ [
       "--with-default-terminfo-dir=/usr/share/terminfo"
       "--disable-db-install"
