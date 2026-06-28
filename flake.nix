@@ -1108,9 +1108,16 @@
           }
         '';
 
-        # withUnpinEmbed: the ONE call that builds a package's embedded
-        # container. Stages every payload into a single ZIP-root tree and packs
-        # the binary's EOF ZIP once:
+        # withUnpinEmbed: the IN-BUILD embed (overrideAttrs postFixup). Most
+        # packages embed POST-BUILD via unpinEmbedWrap (the runCommand below) —
+        # standalone CLIs, the mega/self-fold, and the VFS packages (via
+        # mkStandaloneFlake's `runtimeEmbed`). withUnpinEmbed is retained for the
+        # recipe-A hand-rolled multicall packages (bzip2, aom, …) that build a
+        # multicall binary mid-recipe and must embed the applet aliases INTO that
+        # binary during the build (`lib.withAliases`), where a post-build wrap can't
+        # reach. It stages every payload into a single ZIP-root tree and packs the
+        # binary's EOF ZIP once, sharing the same primitives (unpinEmbedSh +
+        # mkmeta.py) as unpinEmbedWrap:
         #
         #   * aliases       → `unpin/aliases` (explicit list or symlink harvest)
         #   * man pages     → `unpin/man/*` via mkmeta.py (`man = true`, or an
@@ -1356,27 +1363,43 @@
         withRuntimeData = pkgs: { primary, stage }: drv:
           withUnpinEmbed pkgs { inherit primary; runtimeStage = stage; } drv;
 
-        # unpinEmbedWrap — POST-BUILD embed for the lib+binary case. withUnpinEmbed
-        # overrideAttrs the build's postFixup, which FORKS the compile: a library
-        # consumer (dnsutils linking openssl's libcrypto.a) would then link a
-        # DIFFERENT openssl than this package ships. unpinEmbedWrap instead embeds
-        # into a pristine `base` in a cheap runCommand, so the base build is shared
-        # verbatim with library consumers — ONE derivation per package.
+        # unpinEmbedWrap — the SINGLE post-build embed for every shipped binary
+        # (native single-binary, mega/self-fold, windows mingw/cosmo, and the
+        # build-coupled VFS packages vim/perl). It replaces the older overrideAttrs
+        # embed (withUnpinEmbed and its thin wrappers): rather than fork the build's
+        # postFixup — which would make a library consumer link a DIFFERENT artifact
+        # than the package ships — it copies the pristine `base` binary into a cheap
+        # runCommand and embeds there, so the base build is shared byte-for-byte with
+        # library consumers (ONE derivation per package: openssl as a shipped CLI vs
+        # as dnsutils' libcrypto dep).
         #
-        # The base's binary output is UNSTRIPPED (the engine adapter defers strip
-        # to strippedOrJoined); we strip just the copied binary with the engine's
-        # own llvm-strip (proven byte-identical to that fixup strip) and never touch
-        # the base's lib/dev outputs, so a consumer still links full symbols.
+        # The base binary is UNSTRIPPED (the engine adapter defers strip); we strip
+        # the copy with `stripCmd` (default = the engine's own llvm-strip, proven
+        # byte-identical to the fixup strip on engine targets; windows/cosmo pass
+        # their own) and never touch the base's lib/dev outputs, so consumers still
+        # link full symbols.
         #
-        # Payloads are AUTO-DISCOVERED from the base outputs, like the multicall .a
-        # glob — man from share/man, aliases from sibling symlinks in the bin dir —
-        # so a package declares nothing. `runtimeStage` is the one DECLARED payload
-        # (an arbitrary tree; the snippet populates `$__unpin_stage`). All three
-        # compose into the single EOF ZIP via the shared unpinEmbedSh.
+        # Payloads (all compose into the single EOF ZIP via unpinEmbedSh):
+        #   * aliases   — explicit list, else AUTO-DISCOVERED from sibling symlinks
+        #                 in the bin dir (like the multicall `.a` glob)
+        #   * man       — `manRoot`/share/man if given, else auto from the base
+        #                 outputs; `manFallback` borrows a man-bearing build when the
+        #                 build ships none (windows graft). `man = false` skips it.
+        #   * runtime   — the one DECLARED arbitrary tree (vim/perl @INC, file magic);
+        #                 the snippet populates `$__unpin_stage`.
+        #
+        # `cosmoSymtabTrim` drops cosmo's unused `.symtab.amd64` ZIP member. Every
+        # binary variant the build produced (`<primary>`, `.exe`, `.ape`) is copied,
+        # stripped, and gets the container embedded.
         unpinEmbedWrap = pkgs:
           { primary
+          , aliases ? null
+          , man ? true
+          , manRoot ? null
           , manFallback ? null
           , runtimeStage ? null
+          , stripCmd ? null
+          , cosmoSymtabTrim ? false
           }: base:
           let
             outs = base.outputs or [ "out" ];
@@ -1386,7 +1409,12 @@
               else builtins.head outs;
             binOut = base.${binOutputName};
             manOut = base.man or binOut;
-            strip = "${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm llvm-strip --strip-all";
+            outOut = base.out or binOut;
+            strip =
+              if stripCmd != null then stripCmd
+              else "${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm llvm-strip --strip-all";
+            hasExplicitAliases = aliases != null;
+            explicitCsv = if hasExplicitAliases then nixpkgs.lib.concatStringsSep "," aliases else "";
           in
           pkgs.runCommand (base.name or "${base.pname or primary}-${base.version or "0"}")
             {
@@ -1394,8 +1422,9 @@
                 pkgs.buildPackages.unzip
                 (unpinPackTool pkgs)
                 pkgs.buildPackages.zstd
-                pkgs.buildPackages.python3Minimal
-              ];
+              ]
+              ++ nixpkgs.lib.optional man pkgs.buildPackages.python3Minimal
+              ++ nixpkgs.lib.optional cosmoSymtabTrim pkgs.buildPackages.zip;
               # Carry the base passthru (notably `module` for a multicall fold and
               # version/pname) so the mega manifest and withLicense/withDescription
               # still resolve against the shipped drv.
@@ -1409,12 +1438,24 @@
             }
             ''
               mkdir -p "$out/bin"
-              cp "${binOut}/bin/${primary}" "$out/bin/${primary}"
-              chmod +w "$out/bin/${primary}"
-              ${strip} "$out/bin/${primary}"
-              # strippedOrJoined's symlinkJoin kept share/man alongside the binary;
-              # mirror it so the result tree is unchanged (the ZIP is the canonical
-              # copy, this is redundant but preserved for tooling).
+              # The shipped binary may be <primary> (native), <primary>.exe (mingw /
+              # cosmo PE) and/or <primary>.ape (cosmo fat APE). Copy+strip every
+              # variant the build produced; the container is embedded into each.
+              __unpin_bins=()
+              for __unpin_v in "${primary}" "${primary}.exe" "${primary}.ape"; do
+                if [ -f "${binOut}/bin/$__unpin_v" ]; then
+                  cp "${binOut}/bin/$__unpin_v" "$out/bin/$__unpin_v"
+                  chmod +w "$out/bin/$__unpin_v"
+                  ${strip} "$out/bin/$__unpin_v"
+                  __unpin_bins+=("$out/bin/$__unpin_v")
+                fi
+              done
+              if [ "''${#__unpin_bins[@]}" = 0 ]; then
+                echo "unpinEmbedWrap: no binary <${primary}>[.exe|.ape] in ${binOut}/bin" >&2
+                exit 1
+              fi
+              # Mirror share/man into the result tree (the ZIP is the canonical copy;
+              # this is redundant but preserved for tooling).
               if [ -d "${manOut}/share/man" ]; then
                 mkdir -p "$out/share"
                 cp -R "${manOut}/share/man" "$out/share/man"
@@ -1424,27 +1465,36 @@
               ${unpinEmbedSh}
               __unpin_stage="$(mktemp -d)"
 
-              # aliases: every multicall symlink sitting next to the primary.
+              # aliases: explicit list, else harvest sibling symlinks of the primary.
+              ${if hasExplicitAliases then ''
+              __unpin_al='${explicitCsv}'
+              '' else ''
+              __unpin_al=""
               if [ -d "${binOut}/bin" ]; then
-                __unpin_al=""
                 for f in "${binOut}/bin"/*; do
                   [ -L "$f" ] || continue
                   __unpin_n="$(basename "$f")"
                   [ "$__unpin_n" = "${primary}" ] && continue
                   __unpin_al="''${__unpin_al:+$__unpin_al,}$__unpin_n"
                 done
-                if [ -n "$__unpin_al" ]; then
-                  mkdir -p "$__unpin_stage/unpin"
-                  printf '%s' "$__unpin_al" | tr ',' '\n' > "$__unpin_stage/unpin/aliases"
-                fi
+              fi
+              ''}
+              if [ -n "$__unpin_al" ]; then
+                mkdir -p "$__unpin_stage/unpin"
+                printf '%s' "$__unpin_al" | tr ',' '\n' > "$__unpin_stage/unpin/aliases"
               fi
 
-              # man: harvest share/man from the base outputs, mkmeta -> unpin/man/*.
+              ${nixpkgs.lib.optionalString man ''
+              # man: explicit manRoot, else harvest share/man from the base outputs.
+              ${if manRoot != null then ''
+              __unpin_manroot="${manRoot}"
+              [ -d "$__unpin_manroot/share/man" ] || __unpin_manroot=""
+              '' else ''
               __unpin_manroot=""
-              for __unpin_d in "${manOut}" "${binOut}" "${base.out or binOut}"; do
+              for __unpin_d in "${manOut}" "${binOut}" "${outOut}"; do
                 if [ -d "$__unpin_d/share/man" ]; then __unpin_manroot="$__unpin_d"; break; fi
-              done${nixpkgs.lib.optionalString (manFallback != null) ''
-
+              done
+              ''}${nixpkgs.lib.optionalString (manFallback != null) ''
               if [ -d "${manFallback}/share/man" ] \
                  && { [ -z "$__unpin_manroot" ] \
                       || [ -z "$(find "$__unpin_manroot/share/man" \( -type f -o -type l \) -print -quit 2>/dev/null)" ]; }; then
@@ -1460,14 +1510,26 @@
                 fi
                 rm -rf "$__unpin_ms"
               fi
+              ''}
 
               # runtime-data: the one DECLARED payload (arbitrary tree).
               ${nixpkgs.lib.optionalString (runtimeStage != null) runtimeStage}
 
               if [ -n "$(find "$__unpin_stage" -mindepth 1 \( -type f -o -type l \) -print -quit)" ]; then
-                __unpin_embed_subtree "$out/bin/${primary}" "$__unpin_stage"
+                for __unpin_b in "''${__unpin_bins[@]}"; do
+                  __unpin_embed_subtree "$__unpin_b" "$__unpin_stage"
+                done
               fi
               rm -rf "$__unpin_stage"
+              ${nixpkgs.lib.optionalString cosmoSymtabTrim ''
+              # cosmo only: drop the unused .symtab.amd64 ZIP member (stdenv strip
+              # can't reach a ZIP entry; zip -d removes just it, preserving the APE).
+              for __unpin_b in "''${__unpin_bins[@]}"; do
+                if unzip -Z1 "$__unpin_b" 2>/dev/null | grep -xF '.symtab.amd64' >/dev/null; then
+                  zip -d "$__unpin_b" .symtab.amd64 >/dev/null
+                fi
+              done
+              ''}
             '';
 
         # Drop Cosmopolitan's `.symtab.amd64` (apelink's crash-backtrace symtab,
@@ -2350,11 +2412,15 @@ CBODY
             throw ("mkMegaMulticall: applet name collision across packages: "
               + nixpkgs.lib.concatStringsSep ", " dups
               + " — pass nameOverrides to rename");
-          # withAliases embeds UNPIN_META into the primary binary (cosmo resolves
-          # `${name}` → `${name}.exe`). Man MERGE: per-package withMan embeds man
-          # into each tool's OWN binary, which the mega never ships, so re-stage
-          # every folded package's share/man into one tree and run withMan once
-          # over the mega. No-op when no module carries man.
+          # ONE post-build embed over the linked mega (unpinEmbedWrap, the same
+          # primitive every shipped binary uses). aliases = every applet name except
+          # the primary (which IS the binary). Man MERGE: per-package man embeds into
+          # each tool's OWN binary, which the mega never ships, so re-stage every
+          # folded package's share/man into one tree and embed once over the mega.
+          # Same for RUNTIME DATA (file's magic.mgc). The mega binary is already
+          # stripped at link (`-Wl,-s` on ELF; cosmo APEs ship unstripped), so the
+          # wrap's strip is a no-op (stripCmd = ":"); cosmo emits `${name}.exe`/`.ape`
+          # and the wrap embeds into each variant it finds.
           let
             manRoots = nixpkgs.lib.unique
               (nixpkgs.lib.filter (x: x != null) (map (m: m.manRoot or null) modules));
@@ -2370,18 +2436,6 @@ CBODY
                   cp -rL --no-preserve=mode "$r/share/man/." "$out/share/man/" 2>/dev/null || true
                 done
               '';
-            # Drop the primary's own name from the alias set (the binary IS
-            # `${name}`). Load-bearing for the N=1 self-fold whose package name is
-            # itself an applet (flac+metaflac → binary `flac`, alias `metaflac`).
-            aliased = withAliases pkgs { primary = name; aliases = nixpkgs.lib.filter (n: n != name) names; }
-              (if cosmoMode then megaCosmoDrv else megaElfDrv);
-            withManDrv =
-              if combinedMan == null then aliased
-              else withMan pkgs { primary = name; manRoot = combinedMan; } aliased;
-
-            # Same merge for embedded RUNTIME DATA (file's magic.mgc): re-stage
-            # every runtimeDataRoot into one ZIP-root tree, embedded once over the
-            # mega. No-op when no module carries runtime data.
             rtRoots = nixpkgs.lib.unique
               (nixpkgs.lib.filter (x: x != null) (map (m: m.runtimeDataRoot or null) modules));
             combinedRt =
@@ -2394,14 +2448,21 @@ CBODY
                 done
               '';
           in
-          if combinedRt == null then withManDrv
-          else withRuntimeData pkgs {
+          unpinEmbedWrap pkgs {
             primary = name;
-            stage = ''
-              cp -rL --no-preserve=mode ${combinedRt}/. "$__unpin_stage/"
-              chmod -R u+w "$__unpin_stage" 2>/dev/null || true
-            '';
-          } withManDrv;
+            # Load-bearing filter for the N=1 self-fold whose package name is itself
+            # an applet (flac+metaflac → binary `flac`, alias `metaflac`).
+            aliases = nixpkgs.lib.filter (n: n != name) names;
+            man = combinedMan != null;
+            manRoot = combinedMan;
+            stripCmd = ":";
+            runtimeStage =
+              if combinedRt == null then null
+              else ''
+                cp -rL --no-preserve=mode ${combinedRt}/. "$__unpin_stage/"
+                chmod -R u+w "$__unpin_stage" 2>/dev/null || true
+              '';
+          } (if cosmoMode then megaCosmoDrv else megaElfDrv);
 
         # Why not overlays for per-package fixes? `appendOverlays` invalidates
         # `pkgsBuildHost.stdenv` → cascade rebuild of compiler-rt-libc-static etc.
@@ -2702,8 +2763,26 @@ CBODY
           #                  those overlays wrap); nixpkgsFor falls back to plain
           #                  nixpkgs here.
           , engine ? "default"
+          # Declarative embed for build-coupled VFS / runtime-data packages
+          # (vim/perl/file/zsh/gvim/python/xvfb/xvnc/biber). Their `build` returns a
+          # PRISTINE compiled base (injectVfs/win32-wrap applied, NO embed) so the
+          # mkStandaloneFlake hooks reach the compile; the embed then runs once,
+          # post-build, via unpinEmbedWrap — the single embed path every package
+          # uses. Shape (each entry a function `pkgs: base: { … }` returning embed
+          # opts, minus `primary`, which is `binName`):
+          #   runtimeEmbed = {
+          #     native  = pkgs: base: { man = true; runtimeStage = …; aliases = …; };
+          #     windows = pkgs: base: { runtimeStage = …; manRoot = "…"; };
+          #   };
+          # `native` covers linux+darwin (branch on pkgs.stdenv.hostPlatform.isDarwin
+          # inside if needed). Opts override the platform defaults (man = embedMan,
+          # windows man graft, stripCmd, cosmoSymtabTrim). null → no custom embed
+          # (man+aliases auto-discovered, the standard single-binary case).
+          , runtimeEmbed ? null
           }:
           let
+            runtimeEmbedNative = if runtimeEmbed == null then null else runtimeEmbed.native or null;
+            runtimeEmbedWindows = if runtimeEmbed == null then null else runtimeEmbed.windows or null;
             optimize_ = { lto = false; opt = null; ssp = true; gc = true; } // optimize;
             inherit (optimize_) lto opt ssp gc;
             ltoOpt = if opt == null then "-O2" else opt;
@@ -2930,20 +3009,25 @@ CBODY
                 # darwin/windows via withDnsFallback directly.
                 base = if dnsFallback && pkgs.stdenv.hostPlatform.isLinux
                        then withDnsFallback pkgs.pkgsStatic core else core;
-                # Ship by embedding man/aliases into the PRISTINE base in a
+                # Ship by embedding man/aliases/runtime into the PRISTINE base in a
                 # post-build runCommand (unpinEmbedWrap): the base build is then
                 # shared byte-for-byte with library consumers, so there is ONE
                 # derivation per package — openssl as a shipped CLI vs as dnsutils'
-                # libcrypto dep. Standard single-binary case. Packages that already
-                # embedded in their own build (unpinEmbedsMan — vim's VFS),
-                # self-folding multi-program packages (the mega path), and no-man
-                # builds keep the legacy in-build embed + strippedOrJoined.
-                useEmbedWrap = embedMan && !(base.unpinEmbedsMan or false) && !selfFold;
-                # Legacy in-build man embed (FORKS the build — the divergence
-                # unpinEmbedWrap avoids). withMan must run on the underlying drv
-                # (edits the bin output, reads the man output) BEFORE
-                # strippedOrJoined collapses multi-output drvs. Skipped when the
-                # build already embedded man (passthru.unpinEmbedsMan).
+                # libcrypto dep. This is the single embed path: standard single
+                # binaries (man+aliases auto-discovered) and VFS/runtime packages
+                # (`runtimeEmbed.native` supplies runtimeStage/explicit aliases/man)
+                # alike. Self-folding multi-program packages take the mega path
+                # (which also embeds via unpinEmbedWrap). The only remaining legacy
+                # branch is a not-yet-migrated flake that still embeds in its own
+                # build (passthru.unpinEmbedsMan) — kept working during the migration.
+                useEmbedWrap = !selfFold && !(base.unpinEmbedsMan or false)
+                  && (embedMan || runtimeEmbedNative != null);
+                nativeEmbedOpts = { primary = binName; man = embedMan; }
+                  // (if runtimeEmbedNative != null then runtimeEmbedNative pkgs base else { });
+                # Legacy in-build man embed, retained ONLY for un-migrated
+                # unpinEmbedsMan flakes during the migration (deleted once all 9 VFS
+                # flakes declare runtimeEmbed). withMan FORKS the build — the
+                # divergence unpinEmbedWrap avoids.
                 legacyMaybeMan0 =
                   if embedMan && !(base.unpinEmbedsMan or false)
                   then withMan pkgs { primary = binName; } base
@@ -2978,7 +3062,7 @@ CBODY
                   defaultApplet = selfFoldDefault;
                 };
                 shipped =
-                  if useEmbedWrap then unpinEmbedWrap pkgs { primary = binName; } base
+                  if useEmbedWrap then unpinEmbedWrap pkgs nativeEmbedOpts base
                   else if selfFold then strippedOrJoined pkgs name selfFolded
                   else strippedOrJoined pkgs name legacyMaybeMan;
                 result = withLicense (withDescription shipped);
@@ -3178,27 +3262,33 @@ CBODY
               in if p == null then null else (p.man or p.out or p);
             windowsBase = dropSharedLibs (applyOptSsp (windowsRawHooked
               (if wantWindowsModule then windowsEnginePkgs else windowsPkgs)));
-            windowsWithMan =
-              # Skip when the consumer's windowsBuild already embedded man via
-              # its own withUnpinEmbed call (passthru.unpinEmbedsMan).
-              if !embedMan || windowsBase.unpinEmbedsMan or false then windowsBase
-              else if winManRoot != null
-              then withMan windowsPkgs { primary = binName; manRoot = "${winManRoot}"; } windowsBase
-              else withMan windowsPkgs {
-                primary = binName;
-                manFallback = if winManGraft == null then null else "${winManGraft}";
-              } windowsBase;
-            # Trim cosmo's unused `.symtab.amd64` (no-op on mingw). After withMan.
-            windowsTrimmed0 = withCosmoStrip windowsPkgs { primary = binName; } windowsWithMan;
-            # When a `module` output rides along, force the SAME `[bin out]` strip
-            # selection strippedOrJoined applies, so `windowsTrimmed.module` is the
-            # very build the shipped binary comes from — no second cosmo build.
-            # Same trick as the linux path.
-            windowsTrimmed =
-              if wantCosmoModule || wantWindowsModule
-              then windowsTrimmed0.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
-              else windowsTrimmed0;
-            windowsPkg0 = withLicense (strippedOrJoined windowsPkgs name windowsTrimmed);
+            # Force a full [bin out] strip in the cross build itself — the cosmo /
+            # mingw stdenv's OWN strip (APE-aware) — so unpinEmbedWrap copies an
+            # already-stripped binary (stripCmd = ":") and never runs the engine
+            # llvm-strip on a cosmo APE. The `module` output rides in this same
+            # build, so the manifests reference the very build the binary ships from
+            # (the [bin out] forcing the linux path used for the same reason).
+            windowsForEmbed = windowsBase.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; });
+            # Windows embed defaults; a VFS flake's `runtimeEmbed.windows` overrides
+            # (manRoot graft, runtimeStage, explicit aliases). The cross build ships
+            # no man, so the man source is `winManRoot` (explicit) or the
+            # version-locked nixpkgs graft (`winManGraft`). cosmoSymtabTrim drops
+            # cosmo's `.symtab.amd64` ZIP member (no-op on mingw).
+            windowsEmbedOpts = {
+              primary = binName;
+              man = embedMan;
+              manRoot = if winManRoot != null then "${winManRoot}" else null;
+              manFallback = if winManGraft == null then null else "${winManGraft}";
+              stripCmd = ":";
+              cosmoSymtabTrim = true;
+            } // (if runtimeEmbedWindows != null then runtimeEmbedWindows windowsPkgs windowsForEmbed else { });
+            windowsPkg0 = withLicense (
+              # Un-migrated flake that still embeds in its own windowsBuild keeps the
+              # legacy in-build embed + strippedOrJoined (deleted post-migration).
+              if windowsBase.unpinEmbedsMan or false
+              then strippedOrJoined windowsPkgs name
+                (withCosmoStrip windowsPkgs { primary = binName; } windowsForEmbed)
+              else unpinEmbedWrap windowsPkgs windowsEmbedOpts windowsForEmbed);
             # The manifest the mega-builder's cosmoMode consumes. The module
             # buckets reference the same built drv's `module` output; external
             # depArchives are verbatim store paths (passthru, NOT linked into the
@@ -3207,15 +3297,15 @@ CBODY
               let entry = "unpin__${sanMcW name}__${sanMcW multicallCosmo.program}_main";
               in {
                 moduleFormat = "cosmo-elf";
-                moduleObjs = "${windowsTrimmed.module}/objs";
-                appletDir = "${windowsTrimmed.module}/applet";
-                gnulibDir = "${windowsTrimmed.module}/gnulib";
+                moduleObjs = "${windowsForEmbed.module}/objs";
+                appletDir = "${windowsForEmbed.module}/applet";
+                gnulibDir = "${windowsForEmbed.module}/gnulib";
                 depArchives =
                   let d = multicallCosmo.depArchives or [ ];
                   in if builtins.isFunction d then d windowsPkgs else d;
                 # Auto-derived from the cosmo cross build's input closure
                 # (e.g. bash → cosmo readline/ncurses); globbed at build time.
-                depInputDirs = multicallExternalDepDirs windowsTrimmed;
+                depInputDirs = multicallExternalDepDirs windowsForEmbed;
                 applets =
                   [{ name = multicallCosmo.program; inherit entry; }]
                   ++ map (al: { name = al; inherit entry; }) (multicallCosmo.aliases or [ ]);
@@ -3228,12 +3318,12 @@ CBODY
             windowsMulticallManifest = {
               package = name;
               moduleFormat = "bitcode";
-              moduleArchive = "${windowsTrimmed.module}/lib/module.bc";
-              nativeArchive = "${windowsTrimmed.module}/lib/module_native.a";
+              moduleArchive = "${windowsForEmbed.module}/lib/module.bc";
+              nativeArchive = "${windowsForEmbed.module}/lib/module_native.a";
               depArchives =
                 let d = multicall.depArchives or [ ];
                 in if builtins.isFunction d then d windowsEnginePkgs else d;
-              depInputDirs = multicallExternalDepDirs windowsTrimmed;
+              depInputDirs = multicallExternalDepDirs windowsForEmbed;
               applets = nixpkgs.lib.concatMap
                 (p:
                   let entry = "unpin__${sanMcW name}__${sanMcW p.name}_main"; in
@@ -3242,7 +3332,7 @@ CBODY
                 multicall.programs;
               requires = { cxx = false; group = true; } // (multicall.requires or { });
               manRoot =
-                if embedMan then "${windowsTrimmed.man or windowsTrimmed}" else null;
+                if embedMan then "${windowsForEmbed.man or windowsForEmbed}" else null;
               runtimeDataRoot =
                 let r = multicall.runtimeDataRoot or null;
                 in
