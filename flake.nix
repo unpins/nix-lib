@@ -2624,6 +2624,89 @@ CBODY
               (drv.meta or { });
           };
 
+        # The engine adapter stdenv for a (pkgs, toolchain) — lifted out of
+        # mkStandaloneFlake so the catalog mega can build it ONCE and share it.
+        engineStdenvForShared = { pkgs, toolchain }: unpinAdapterStdenv {
+          inherit pkgs toolchain;
+          target = pkgs.pkgsStatic.stdenv.hostPlatform.config;
+          native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
+          cxx = true;
+          lto = true;
+          captureLinks = true;
+        };
+
+        # The set-level engine stdenv swap on pkgsStatic (Layers A/B/C), as a pure
+        # function of (pkgs, toolchain). This is the heaviest per-package fixpoint
+        # (a full pkgsStatic re-instantiation), but it is package-INDEPENDENT given
+        # a fixed pkgs+toolchain — so the mega computes it ONCE and threads it
+        # through every fold (sharedEnginePkgsStatic), collapsing the slope. The
+        # standalone path calls it the same way → byte-identical .drv.
+        enginePkgsStaticFor = { pkgs, toolchain }:
+          let
+            engStdenv = engineStdenvForShared { inherit pkgs toolchain; };
+            engineBashAttrs = [ "bash" "bashInteractive" "bashNonInteractive" ];
+            withEngineStdenv = pkgs.pkgsStatic.extend
+              (_final: prev:
+                if prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic
+                then { stdenv = engStdenv; }
+                else { });
+            withBashFix = withEngineStdenv.extend
+              (_final: prev:
+                if prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic
+                then builtins.listToAttrs
+                  (map (n: { name = n; value = unpinBashBuildFix prev prev.${n}; })
+                    (builtins.filter (n: prev ? ${n}) engineBashAttrs))
+                else { });
+            withDepFixes = builtins.foldl'
+              (acc: name:
+                let entry = autoWiredFixes.${name}; in
+                acc.extend
+                  (_final: prev:
+                    if (if entry.autoWire == "static"
+                        then (prev.stdenv.hostPlatform.isStatic or false)
+                        else prev.stdenv.hostPlatform.isMusl)
+                       && prev ? ${name}
+                    then { ${name} = entry.apply prev; }
+                    else { }))
+              withBashFix
+              (builtins.attrNames autoWiredFixes);
+          in
+          withDepFixes;
+
+        # mkMegaFromRecipes: fold N catalog packages into one mega WITHOUT paying
+        # N nixpkgs+toolchain instantiations. Each package re-exposes its recipe as
+        # the lazy `unpinRecipe` output (reading it never forces `packages.*`, so no
+        # per-flake nixpkgs cost). Here we instantiate the base nixpkgs and the
+        # unpin-llvm toolchain ONCE, then rebuild every module by re-running
+        # mkStandaloneFlake with those shared instances threaded in (sharedPkgs /
+        # sharedToolchain) — so the N module builds share one fixpoint and eval is
+        # flat in N instead of linear. Each produced module is byte-identical to the
+        # package's own (same pkgs value, same toolchain), so the mega is unchanged.
+        mkMegaFromRecipes =
+          { pkgs
+          , recipes                       # [ <pkg>.unpinRecipe, … ]
+          , system ? pkgs.stdenv.hostPlatform.system
+          , moduleAttr ? "default"        # which packages.<sys> attr carries the module
+          , toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
+          , nameOverrides ? { }
+          , defaultApplet ? null
+          }:
+          let
+            # Build the heavy engine-swapped pkgsStatic ONCE for the whole fold.
+            sharedEnginePkgsStatic = enginePkgsStaticFor { inherit pkgs toolchain; };
+            moduleOf = recipe:
+              (mkStandaloneFlake (recipe // {
+                sharedPkgs = pkgs;
+                sharedToolchain = toolchain;
+                inherit sharedEnginePkgsStatic;
+              }))
+              .packages.${system}.${moduleAttr}.multicallModule;
+          in
+          mkMegaMulticall {
+            inherit pkgs toolchain nameOverrides defaultApplet;
+            modules = map moduleOf recipes;
+          };
+
         # Standalone-binary flake template. Returns:
         #   packages.<system>.default                = native build (pkgsStatic)
         #   packages.aarch64-darwin."darwin-x86_64"  = cross x86_64-darwin
@@ -2635,7 +2718,7 @@ CBODY
         # `links`). `binName` overrides when bin name ≠ name. `nativeBuild = false`
         # → windows-only (gvim). `linuxOnly = true` → suppresses every darwin attr,
         # for Linux-kernel-only tools (kmod, util-linux, shadow, procps-ng).
-        mkStandaloneFlake =
+        mkStandaloneFlake = args@
           { self
           , name
           , build ? null
@@ -2777,8 +2860,27 @@ CBODY
           # windows man graft, stripCmd, cosmoSymtabTrim). null → no custom embed
           # (man+aliases auto-discovered, the standard single-binary case).
           , runtimeEmbed ? null
+          # Shared-infra injection for the catalog mega (mkMegaFromRecipes). When
+          # the mega folds N packages it instantiates nixpkgs + the unpin-llvm
+          # toolchain ONCE and threads them through here, so the N module builds
+          # reuse one fixpoint instead of each re-instantiating its own (the eval
+          # OOM fix). null → standalone behaviour: instantiate per-flake as before
+          # (byte-identical .drv — both are `import nixpkgs {system}` / the same
+          # vendored toolchain). Only the NATIVE-linux module path reads these.
+          , sharedPkgs ? null
+          , sharedToolchain ? null
+          # The engine-swapped pkgsStatic set, prebuilt once by the mega and shared
+          # across the fold (the heaviest per-package fixpoint). null → build it
+          # per-flake as before. Only consumed on the NATIVE host (host == build).
+          , sharedEnginePkgsStatic ? null
           }:
           let
+            # Re-expose the caller's recipe (exactly what the package author wrote,
+            # minus the injection knobs) so the mega can refold it against shared
+            # infra via `inputs.<pkg>.unpinRecipe` — a LAZY output that never forces
+            # `packages.*`, so reading it costs ~nothing (no nixpkgs instantiation).
+            unpinRecipe = builtins.removeAttrs args [ "sharedPkgs" "sharedToolchain" ];
+            tc = system: if sharedToolchain != null then sharedToolchain else unpinToolchain system;
             runtimeEmbedNative = if runtimeEmbed == null then null else runtimeEmbed.native or null;
             runtimeEmbedWindows = if runtimeEmbed == null then null else runtimeEmbed.windows or null;
             optimize_ = { lto = false; opt = null; ssp = true; gc = true; } // optimize;
@@ -2791,7 +2893,8 @@ CBODY
             # stdenv-bootstrap fixpoint and re-hashes the whole darwin base closure
             # (uncached → full rebuild). A leaf-wrapper fix goes there instead (the
             # ncurses <sys/ttydev.h> fix rides inside embedFallbackTerminfoOnly).
-            importNixpkgs = system: import nixpkgs { inherit system; };
+            importNixpkgs = system:
+              if sharedPkgs != null then sharedPkgs else import nixpkgs { inherit system; };
             nixpkgsFor = forAllNative (system:
               # unpin-llvm replaces the whole stdenv, so the gc/lto overlays would
               # be silent no-ops; use plain nixpkgs.
@@ -2834,28 +2937,15 @@ CBODY
             # pkgsStatic.<pkgsAttr> is already on the engine stdenv, so the recipe
             # reads as off-engine with no per-package plumbing. linux-static host
             # only; darwin/cross/off-engine untouched (byte-identical).
-            engineStdenvFor = pkgs: unpinAdapterStdenv {
+            # Delegates to the lifted lib-level helper, threading the shared
+            # toolchain. (Construction unchanged → byte-identical .drv.) The
+            # engine swap is set-wide on pkgsStatic + unconditional lto/capture so
+            # a dep is byte-identical whether it ships standalone or folded into a
+            # multicall consumer; the capture shim is runtime-gated on
+            # $UNPIN_CAPTURE_LINKS and inert for non-multicall builds.
+            engineStdenvFor = pkgs: engineStdenvForShared {
               inherit pkgs;
-              target = pkgs.pkgsStatic.stdenv.hostPlatform.config;
-              # `native` only gates the sysroot's sanity RUN. For a cross pkgs the
-              # wrapped stdenv stays a REAL cross stdenv (clang swaps `-target`), so
-              # configure runs cross mode (AC_RUN_IFELSE off); no exec-format error.
-              native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
-              cxx = true;
-              # lto + capture are UNCONDITIONAL for the engine stdenv (not gated on
-              # multicall). The engine swap is set-wide on pkgsStatic, so a multicall
-              # package's deps inherit this stdenv too. Gating on `wantBitcodeModule`
-              # used to give a multicall consumer's dep (e.g. dnsutils' openssl,
-              # built -flto+capture) a DIFFERENT derivation than the same dep as a
-              # standalone package (built -O2 ELF) — two store paths for one package.
-              # Making both unconditional means every engine build shares ONE stdenv,
-              # so a dep is byte-identical whether it ships standalone or is folded
-              # into a multicall consumer. Single binaries LTO their own bitcode at
-              # the final link (the shipped multicall binaries already do); the
-              # capture shim is runtime-gated on $UNPIN_CAPTURE_LINKS and writes only
-              # a build-temp sidecar, so it is inert for non-multicall builds.
-              lto = true;
-              captureLinks = true;
+              toolchain = tc pkgs.stdenv.buildPlatform.system;
             };
             rawBuild = pkgs:
               let
@@ -2865,9 +2955,6 @@ CBODY
                 # (Layer A below).
                 useEngine = engine == "unpin-llvm"
                   && (pkgs.stdenv.hostPlatform.isLinux || pkgs.stdenv.hostPlatform.isDarwin);
-                # Built from the ORIGINAL pkgs (un-extended) so it never sees the
-                # overlay below — no recursion.
-                engStdenv = if useEngine then engineStdenvFor pkgs else null;
                 # SET-LEVEL stdenv swap so the top package AND its whole link
                 # closure compile on the engine (all-deps-bitcode; a shallow `//`
                 # would leave deps gcc ELF). The `isMusl || isStatic` guard is
@@ -2878,65 +2965,21 @@ CBODY
                 # (buildPackages/bootstrap aren't), so isStatic selects it.
                 # Byte-identical on linux.
                 #
-                # engineBashAttrs: recipe fixes for engine DEPS, layered on top.
-                # Explicit (NOT a blanket nativeFixes pass — consumers already apply
-                # most by hand and would double-apply). The next breaking dep here.
-                engineBashAttrs = [ "bash" "bashInteractive" "bashNonInteractive" ];
+                # The engine-swapped pkgsStatic (Layers A/B/C). Now a lib-level
+                # helper (enginePkgsStaticFor) so the catalog mega can build it ONCE
+                # and inject it (sharedEnginePkgsStatic) — the heaviest per-package
+                # fixpoint, shared. Standalone calls the helper directly (identical
+                # construction → byte-identical .drv). The shared set is only valid
+                # on the native host (host == build); cross targets always rebuild.
+                nativeHost = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
                 enginePkgsStatic =
                   if !useEngine then pkgs.pkgsStatic
-                  else
-                    # Layer A: swap stdenv → engine across the whole musl host set.
-                    let
-                      withEngineStdenv = pkgs.pkgsStatic.extend
-                        (_final: prev:
-                          if prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic
-                          then { stdenv = engStdenv; }
-                          else { });
-                      # Layer B: bash build fix in a SEPARATE extend so `prev.<n>`
-                      # already carries the engine stdenv (one overlay would still
-                      # see gcc). `prev` not `final` → no cycle.
-                      # prev.buildPackages.stdenv.cc stays vanilla, which
-                      # CC_FOR_BUILD needs (see unpinBashBuildFix).
-                      withBashFix = withEngineStdenv.extend
-                        (_final: prev:
-                          if prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic
-                          then builtins.listToAttrs
-                            (map (n: { name = n; value = unpinBashBuildFix prev prev.${n}; })
-                              (builtins.filter (n: prev ? ${n}) engineBashAttrs))
-                          else { });
-                      # Layer C: transitive engine-DEP fixes that self-declare
-                      # `autoWire` in native-overlay (collected as autoWiredFixes).
-                      # Each is folded into pkgsStatic so the dep is fixed wherever
-                      # it appears in a closure — no consumer applies these by hand.
-                      # The host gate comes from the declaration: "musl" = linux
-                      # static-musl deps (libcap drops the go input the engine cc
-                      # can't build; ncurses/attr un-pin store-path leaks; mbedtls
-                      # drops a clang-rejected cmake flag + a flaky test; libxcrypt
-                      # skips its symbol-lint test-suite; libsepol forces
-                      # HAVE_REALLOCARRAY past a stdin probe the engine cc fails);
-                      # "static" = any static
-                      # host incl. darwin (atf's flaky darwin installCheck — its
-                      # file self-gates to darwin, so the linux static host is a
-                      # no-op and byte-identical). A LEAF overlay on pkgsStatic, NOT
-                      # the nixpkgs import (which would join the stdenv-bootstrap
-                      # fixpoint and re-hash the cached macOS SDK). Order-independent:
-                      # each fix overrides a distinct attr and reads only that attr,
-                      # so the alphabetical fold matches any order byte-for-byte.
-                      withDepFixes = builtins.foldl'
-                        (acc: name:
-                          let entry = autoWiredFixes.${name}; in
-                          acc.extend
-                            (_final: prev:
-                              if (if entry.autoWire == "static"
-                                  then (prev.stdenv.hostPlatform.isStatic or false)
-                                  else prev.stdenv.hostPlatform.isMusl)
-                                 && prev ? ${name}
-                              then { ${name} = entry.apply prev; }
-                              else { }))
-                        withBashFix
-                        (builtins.attrNames autoWiredFixes);
-                    in
-                    withDepFixes;
+                  else if sharedEnginePkgsStatic != null && nativeHost
+                  then sharedEnginePkgsStatic
+                  else enginePkgsStaticFor {
+                    inherit pkgs;
+                    toolchain = tc pkgs.stdenv.buildPlatform.system;
+                  };
                 enginePkgs = pkgs // { pkgsStatic = enginePkgsStatic; };
               in
               if build != null
@@ -2969,7 +3012,7 @@ CBODY
                       inherit (multicall) programs;
                       internalArchives = multicall.internalArchives or [ ];
                       inferLinkInputs = multicall.inferLinkInputs or true;
-                      llvm = "${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm";
+                      llvm = "${tc pkgs.stdenv.buildPlatform.system}/bin/llvm";
                     }
                     (rawBuild pkgs)
                   else if wantModule
@@ -3515,6 +3558,7 @@ CBODY
               # Per-package darwin portability exception (PrivateFramework names).
               darwin_allow_private_frameworks = darwinAllowPrivateFrameworks;
             };
+            inherit unpinRecipe;
           };
 
         # Rust-crate flake template. A thin wrapper over mkStandaloneFlake
