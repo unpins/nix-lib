@@ -1108,6 +1108,89 @@
           }
         '';
 
+        # Shared man-tree staging, used by BOTH embed paths (in-build
+        # withUnpinEmbed and post-build unpinEmbedWrap). Locates a `share/man`
+        # root and runs mkmeta.py into $__unpin_stage. `candidates` is a bash
+        # word-list probed in order when no explicit `manRoot` is given — the
+        # in-build path passes its build-env output vars (`$man`/`$out`/…), the
+        # post-build path passes resolved store paths; both reduce to "first dir
+        # with share/man wins". `manFallback` borrows a man-bearing build (the
+        # windows graft) when the chosen root has no actual pages. mkmeta.py
+        # populates its OWN temp dir, merged into $__unpin_stage only on success,
+        # so an exit-3 skip leaves no partial `unpin/man`. exit 3 = no pages
+        # (legit skip); any other nonzero = fail the build (never silently ship
+        # man-less).
+        unpinManStageSh = { tag, manRoot ? null, manFallback ? null, candidates ? [ ] }: ''
+          ${if manRoot != null then ''
+          # Externally supplied man source (windows/cosmo graft, or a curated tree).
+          __unpin_manroot="${manRoot}"
+          [ -d "$__unpin_manroot/share/man" ] || __unpin_manroot=""
+          '' else ''
+          # Harvest from the build/base outputs: first candidate with share/man.
+          __unpin_manroot=""
+          for __unpin_d in ${builtins.toString candidates}; do
+            if [ -n "$__unpin_d" ] && [ -d "$__unpin_d/share/man" ]; then
+              __unpin_manroot="$__unpin_d"; break
+            fi
+          done
+          ''}${nixpkgs.lib.optionalString (manFallback != null) ''
+          # No man of our own (no share/man, or a pruned-empty one) → borrow the
+          # version-locked pages from a man-bearing build. -print -quit: no pipe
+          # (stdenv runs `set -o pipefail`; `find | grep -q` SIGPIPEs grep on any
+          # tree bigger than the pipe buffer, misreading it as empty).
+          if [ -d "${manFallback}/share/man" ] \
+             && { [ -z "$__unpin_manroot" ] \
+                  || [ -z "$(find "$__unpin_manroot/share/man" \( -type f -o -type l \) -print -quit 2>/dev/null)" ]; }; then
+            __unpin_manroot="${manFallback}"
+          fi''}
+          if [ -z "$__unpin_manroot" ]; then
+            echo "${tag}: no share/man found, skipping" >&2
+          else
+            __unpin_ms="$(mktemp -d)"; __unpin_rc=0
+            python3 ${./mkmeta.py} "$__unpin_manroot" "$__unpin_ms" || __unpin_rc=$?
+            if [ "$__unpin_rc" = 3 ]; then
+              echo "${tag}: no man pages, skipping" >&2
+            elif [ "$__unpin_rc" != 0 ]; then
+              echo "${tag}: mkmeta.py failed (exit $__unpin_rc)" >&2
+              exit "$__unpin_rc"
+            else
+              cp -a "$__unpin_ms/." "$__unpin_stage/"
+            fi
+            rm -rf "$__unpin_ms"
+          fi
+        '';
+
+        # Shared stage population, used by BOTH embed paths. Given a created
+        # $__unpin_stage and (for aliases) the CSV pre-set in $__unpin_al, writes
+        # the runtime tree, `unpin/aliases`, and the man tree. The runtime tree
+        # goes in FIRST, into the still-empty stage, so its "produced nothing"
+        # guard is exact (a declared runtimeStage that stages no files is broken,
+        # not degraded → hard fail). ZIP entry order is independent of staging
+        # order (the packer sorts), so aliases/man order is free.
+        #
+        # What stays in the callers — because it genuinely differs — is binary
+        # discovery + the missing-primary policy (in-build: one bin, fail for
+        # aliases/runtime but warn-skip for man-only; post-build: N bin variants),
+        # and WHERE $__unpin_al / the man candidates come from (build-env symlinks
+        # & output vars vs. resolved store paths).
+        unpinStageSh =
+          { tag, manEnabled, manRoot ? null, manFallback ? null
+          , manCandidates ? [ ], runtimeStage ? null }: ''
+          ${nixpkgs.lib.optionalString (runtimeStage != null) ''
+          ${runtimeStage}
+          if [ -z "$(find "$__unpin_stage" -mindepth 1 \( -type f -o -type l \) -print -quit)" ]; then
+            echo "${tag}: runtime stage produced no files" >&2
+            exit 1
+          fi
+          ''}
+          if [ -n "''${__unpin_al:-}" ]; then
+            mkdir -p "$__unpin_stage/unpin"
+            printf '%s' "$__unpin_al" | tr ',' '\n' > "$__unpin_stage/unpin/aliases"
+          fi
+          ${nixpkgs.lib.optionalString manEnabled
+            (unpinManStageSh { inherit tag manRoot manFallback; candidates = manCandidates; })}
+        '';
+
         # withUnpinEmbed: the IN-BUILD embed (overrideAttrs postFixup). Most
         # packages embed POST-BUILD via unpinEmbedWrap (the runCommand below) —
         # standalone CLIs, the mega/self-fold, and the VFS packages (via
@@ -1116,8 +1199,10 @@
         # multicall binary mid-recipe and must embed the applet aliases INTO that
         # binary during the build (`lib.withAliases`), where a post-build wrap can't
         # reach. It stages every payload into a single ZIP-root tree and packs the
-        # binary's EOF ZIP once, sharing the same primitives (unpinEmbedSh +
-        # mkmeta.py) as unpinEmbedWrap:
+        # binary's EOF ZIP once, sharing the same staging logic (unpinStageSh +
+        # unpinManStageSh) and pack primitive (unpinEmbedSh + mkmeta.py) as
+        # unpinEmbedWrap — only the binary discovery and missing-primary policy
+        # differ:
         #
         #   * aliases       → `unpin/aliases` (explicit list or symlink harvest)
         #   * man pages     → `unpin/man/*` via mkmeta.py (`man = true`, or an
@@ -1232,89 +1317,27 @@
                   # ONE staging dir = the ZIP root; every payload lands here
                   # and a single __unpin_embed_subtree packs it all.
                   __unpin_stage="$(mktemp -d)"
-                  ${nixpkgs.lib.optionalString (runtimeStage != null) ''
-                  ${runtimeStage}
-                  # -print -quit: no pipe — stdenv phases run `set -o pipefail`,
-                  # and a `find | grep -q` would die of grep's early-exit
-                  # SIGPIPE on any tree bigger than the pipe buffer,
-                  # misreading it as empty.
-                  if [ -z "$(find "$__unpin_stage" -mindepth 1 \( -type f -o -type l \) -print -quit)" ]; then
-                    echo "withUnpinEmbed: runtime stage produced no files for ${primary}" >&2
-                    exit 1
-                  fi
-                  ''}
                   ${nixpkgs.lib.optionalString aliasesActive ''
+                  # Source the alias CSV — explicit list, or the names harvested
+                  # in postInstall (symlinks deleted there, so a file carries
+                  # them forward). The shared stage snippet writes unpin/aliases.
+                  # No name filtering: alias policy lives in unpin and runs at
+                  # install time (validate_alias in unpin/src/aliases.rs).
                   ${if hasExplicit
-                    then "__unpin_aliases='${explicitCsv}'"
-                    else ''__unpin_aliases="$(cat "$NIX_BUILD_TOP/.unpin-aliases")"''}
-                  # Short-circuit: nothing to stage when the collected list
-                  # ended up empty (auto-mode: no symlinks matched the
-                  # validator). Aliases are a security boundary, but that is
-                  # enforced at install time (catalog-owner gate + blocklist),
-                  # not here — we just ship the declared list.
-                  if [ -z "$__unpin_aliases" ]; then
-                    echo "withAliases: no aliases to embed for ${primary}, skipping" >&2
-                  else
-                    mkdir -p "$__unpin_stage/unpin"
-                    printf '%s' "$__unpin_aliases" | tr ',' '\n' > "$__unpin_stage/unpin/aliases"
-                  fi
+                    then "__unpin_al='${explicitCsv}'"
+                    else ''__unpin_al="$(cat "$NIX_BUILD_TOP/.unpin-aliases")"''}
+                  [ -n "$__unpin_al" ] \
+                    || echo "withUnpinEmbed: no aliases to embed for ${primary}, skipping" >&2
                   ''}
-                  ${nixpkgs.lib.optionalString manEnabled ''
-                  # Locate the man tree to embed.
-                  ${if manRoot != null then ''
-                  # Externally supplied man source (windows/cosmo path).
-                  __unpin_manroot="${manRoot}"
-                  if [ ! -d "$__unpin_manroot/share/man" ]; then
-                    echo "withMan: manRoot ${manRoot} has no share/man" >&2
-                    __unpin_manroot=""
-                  fi
-                  '' else ''
-                  # Harvest from the drv's own outputs (native path). nixpkgs
-                  # puts man in the `man` output when present; pkgsStatic
-                  # single-output drvs keep it in `out`/the bin output under
-                  # share/man.
-                  __unpin_manroot=""
-                  for __unpin_d in "''${man:-}" "''${${binOutputName}}" "''${out:-}"; do
-                    if [ -n "$__unpin_d" ] && [ -d "$__unpin_d/share/man" ]; then
-                      __unpin_manroot="$__unpin_d"; break
-                    fi
-                  done${nixpkgs.lib.optionalString (manFallback != null) ''
-
-                  # Cross build shipped no man pages of its own — either no
-                  # share/man at all, or a share/man with no actual pages
-                  # (e.g. a prune emptied man1/ and left only an empty tree).
-                  # Borrow the version-locked pages from a man-bearing build
-                  # (windows graft). -print -quit: no pipe (pipefail/SIGPIPE,
-                  # see above).
-                  if [ -d "${manFallback}/share/man" ] \
-                     && { [ -z "$__unpin_manroot" ] \
-                          || [ -z "$(find "$__unpin_manroot/share/man" \( -type f -o -type l \) -print -quit 2>/dev/null)" ]; }; then
-                    __unpin_manroot="${manFallback}"
-                  fi''}
-                  ''}
-                  if [ -z "$__unpin_manroot" ]; then
-                    echo "withMan: no share/man found for ${primary}, skipping" >&2
-                  else
-                    # mkmeta.py populates a staging `unpin/man/` tree (roff
-                    # files + symlinks for `.so`) in its OWN temp dir — merged
-                    # into the shared stage only on success, so an exit-3 skip
-                    # leaves no partial unpin/man behind. Exit 3 = no man pages
-                    # (legit skip); any other nonzero = real failure → fail the
-                    # build (don't silently ship man-less).
-                    __unpin_manstage="$(mktemp -d)"
-                    __unpin_rc=0
-                    python3 ${./mkmeta.py} "$__unpin_manroot" "$__unpin_manstage" || __unpin_rc=$?
-                    if [ "$__unpin_rc" = 3 ]; then
-                      echo "withMan: no man pages for ${primary}, skipping" >&2
-                    elif [ "$__unpin_rc" != 0 ]; then
-                      echo "withMan: mkmeta.py failed (exit $__unpin_rc) for ${primary}" >&2
-                      exit "$__unpin_rc"
-                    else
-                      cp -a "$__unpin_manstage/." "$__unpin_stage/"
-                    fi
-                    rm -rf "$__unpin_manstage"
-                  fi
-                  ''}
+                  # Stage runtime tree + aliases + man into $__unpin_stage. The
+                  # man candidates are this build's OUTPUT ENV VARS ($man/$out/the
+                  # bin output) — resolved at build time, unlike the post-build
+                  # wrap's store paths.
+                  ${unpinStageSh {
+                    tag = "withUnpinEmbed";
+                    inherit manEnabled manRoot manFallback runtimeStage;
+                    manCandidates = [ ''"''${man:-}"'' ''"''${${binOutputName}}"'' ''"''${out:-}"'' ];
+                  }}
                   # A man-only call may legitimately have staged nothing
                   # (no man found / exit-3 skip) — embed only when something
                   # is there. Runtime emptiness already failed hard above.
@@ -1465,7 +1488,8 @@
               ${unpinEmbedSh}
               __unpin_stage="$(mktemp -d)"
 
-              # aliases: explicit list, else harvest sibling symlinks of the primary.
+              # aliases: explicit list, else harvest sibling symlinks of the
+              # primary. Sets $__unpin_al for the shared stage snippet to write.
               ${if hasExplicitAliases then ''
               __unpin_al='${explicitCsv}'
               '' else ''
@@ -1479,41 +1503,15 @@
                 done
               fi
               ''}
-              if [ -n "$__unpin_al" ]; then
-                mkdir -p "$__unpin_stage/unpin"
-                printf '%s' "$__unpin_al" | tr ',' '\n' > "$__unpin_stage/unpin/aliases"
-              fi
-
-              ${nixpkgs.lib.optionalString man ''
-              # man: explicit manRoot, else harvest share/man from the base outputs.
-              ${if manRoot != null then ''
-              __unpin_manroot="${manRoot}"
-              [ -d "$__unpin_manroot/share/man" ] || __unpin_manroot=""
-              '' else ''
-              __unpin_manroot=""
-              for __unpin_d in "${manOut}" "${binOut}" "${outOut}"; do
-                if [ -d "$__unpin_d/share/man" ]; then __unpin_manroot="$__unpin_d"; break; fi
-              done
-              ''}${nixpkgs.lib.optionalString (manFallback != null) ''
-              if [ -d "${manFallback}/share/man" ] \
-                 && { [ -z "$__unpin_manroot" ] \
-                      || [ -z "$(find "$__unpin_manroot/share/man" \( -type f -o -type l \) -print -quit 2>/dev/null)" ]; }; then
-                __unpin_manroot="${manFallback}"
-              fi''}
-              if [ -n "$__unpin_manroot" ]; then
-                __unpin_ms="$(mktemp -d)"; __unpin_rc=0
-                python3 ${./mkmeta.py} "$__unpin_manroot" "$__unpin_ms" || __unpin_rc=$?
-                if [ "$__unpin_rc" = 0 ]; then cp -a "$__unpin_ms/." "$__unpin_stage/"
-                elif [ "$__unpin_rc" != 3 ]; then
-                  echo "unpinEmbedWrap: mkmeta failed (exit $__unpin_rc) for ${primary}" >&2
-                  exit "$__unpin_rc"
-                fi
-                rm -rf "$__unpin_ms"
-              fi
-              ''}
-
-              # runtime-data: the one DECLARED payload (arbitrary tree).
-              ${nixpkgs.lib.optionalString (runtimeStage != null) runtimeStage}
+              # Stage runtime tree + aliases + man into $__unpin_stage. The man
+              # candidates are RESOLVED STORE PATHS (manOut/binOut/outOut),
+              # unlike the in-build path's build-env output vars.
+              ${unpinStageSh {
+                tag = "unpinEmbedWrap";
+                manEnabled = man;
+                inherit manRoot manFallback runtimeStage;
+                manCandidates = [ ''"${manOut}"'' ''"${binOut}"'' ''"${outOut}"'' ];
+              }}
 
               if [ -n "$(find "$__unpin_stage" -mindepth 1 \( -type f -o -type l \) -print -quit)" ]; then
                 for __unpin_b in "''${__unpin_bins[@]}"; do
