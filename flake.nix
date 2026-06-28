@@ -908,6 +908,37 @@
         inherit (import ./ncurses-fallback.nix)
           fallbackTerminals embedFallbackTerminfo embedFallbackTerminfoOnly;
 
+        # openssl's packaging delta, single-sourced so the standalone `openssl`
+        # package, its Windows build, and every engine consumer (native-overlay/
+        # openssl.nix) apply the identical recipe instead of each re-rolling it.
+        # nixpkgs compiles OPENSSLDIR/ENGINESDIR/MODULESDIR as paths into the static
+        # libcrypto; left alone they point at the /nix/store output (a store ref in a
+        # self-contained binary, and a path that doesn't exist on the user's host).
+        # Retarget the three to the conventional system locations (sslDir = /etc/ssl
+        # natively, C:/ssl on Windows) so the binary stays 0-ref and consults the
+        # host's openssl.cnf + trust store like a distro openssl. nixpkgs adds `no-ct`
+        # for static builds solely because CT bakes a /nix/store CTLOG_FILE; with
+        # OPENSSLDIR retargeted that follows to sslDir/ct_log_list.cnf, so drop the
+        # flag and ship CT. c_rehash is a legacy perl-equivalent shim wrapped via
+        # makeWrapper; we delete it, but makeBinaryWrapper *compiles* it first with
+        # `cc -x c -` (C on stdin) — under the unpin-llvm engine the cc-wrapper
+        # appends crt1.o while -x c is active and clang parses the ELF crt as C
+        # (-Werror,-Wnull-character). Stub makeWrapper so the shim is never built
+        # (non-engine builds compiled it fine but deleted it anyway — pure waste).
+        retargetOpenssl = sslDir: enginesDir: modulesDir: old: {
+          configureFlags = builtins.filter (f: f != "no-ct") (old.configureFlags or [ ]);
+          buildFlags = (old.buildFlags or [ ]) ++ [
+            "OPENSSLDIR=${sslDir}"
+            "ENGINESDIR=${enginesDir}"
+            "MODULESDIR=${modulesDir}"
+          ];
+          postInstall = ''
+            makeWrapper() { :; }
+          '' + (old.postInstall or "") + ''
+            rm -f "''${bin:-$out}/bin/c_rehash"
+          '';
+        };
+
         # Strip `--enable-static`/`--disable-shared` from configureFlags on
         # darwin. Many GNU-ish configure.ac (dash, htop) translate
         # `--enable-static` into `LDFLAGS=-static`, which breaks every subsequent
@@ -1324,6 +1355,120 @@
         # fails the build (a missing runtime tree is broken, not degraded).
         withRuntimeData = pkgs: { primary, stage }: drv:
           withUnpinEmbed pkgs { inherit primary; runtimeStage = stage; } drv;
+
+        # unpinEmbedWrap — POST-BUILD embed for the lib+binary case. withUnpinEmbed
+        # overrideAttrs the build's postFixup, which FORKS the compile: a library
+        # consumer (dnsutils linking openssl's libcrypto.a) would then link a
+        # DIFFERENT openssl than this package ships. unpinEmbedWrap instead embeds
+        # into a pristine `base` in a cheap runCommand, so the base build is shared
+        # verbatim with library consumers — ONE derivation per package.
+        #
+        # The base's binary output is UNSTRIPPED (the engine adapter defers strip
+        # to strippedOrJoined); we strip just the copied binary with the engine's
+        # own llvm-strip (proven byte-identical to that fixup strip) and never touch
+        # the base's lib/dev outputs, so a consumer still links full symbols.
+        #
+        # Payloads are AUTO-DISCOVERED from the base outputs, like the multicall .a
+        # glob — man from share/man, aliases from sibling symlinks in the bin dir —
+        # so a package declares nothing. `runtimeStage` is the one DECLARED payload
+        # (an arbitrary tree; the snippet populates `$__unpin_stage`). All three
+        # compose into the single EOF ZIP via the shared unpinEmbedSh.
+        unpinEmbedWrap = pkgs:
+          { primary
+          , manFallback ? null
+          , runtimeStage ? null
+          }: base:
+          let
+            outs = base.outputs or [ "out" ];
+            binOutputName =
+              if builtins.elem "bin" outs then "bin"
+              else if builtins.elem "out" outs then "out"
+              else builtins.head outs;
+            binOut = base.${binOutputName};
+            manOut = base.man or binOut;
+            strip = "${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm llvm-strip --strip-all";
+          in
+          pkgs.runCommand (base.name or "${base.pname or primary}-${base.version or "0"}")
+            {
+              nativeBuildInputs = [
+                pkgs.buildPackages.unzip
+                (unpinPackTool pkgs)
+                pkgs.buildPackages.zstd
+                pkgs.buildPackages.python3Minimal
+              ];
+              # Carry the base passthru (notably `module` for a multicall fold and
+              # version/pname) so the mega manifest and withLicense/withDescription
+              # still resolve against the shipped drv.
+              passthru = (base.passthru or { })
+                // nixpkgs.lib.optionalAttrs (base ? module) { inherit (base) module; };
+              # Carry upstream meta (license/description) but pin outputsToInstall to
+              # this runCommand's single `out` — base.meta lists the multi-output
+              # openssl's `[bin man …]`, which `nix build` would otherwise try to
+              # realize on a drv that only has `out`.
+              meta = (base.meta or { }) // { outputsToInstall = [ "out" ]; };
+            }
+            ''
+              mkdir -p "$out/bin"
+              cp "${binOut}/bin/${primary}" "$out/bin/${primary}"
+              chmod +w "$out/bin/${primary}"
+              ${strip} "$out/bin/${primary}"
+              # strippedOrJoined's symlinkJoin kept share/man alongside the binary;
+              # mirror it so the result tree is unchanged (the ZIP is the canonical
+              # copy, this is redundant but preserved for tooling).
+              if [ -d "${manOut}/share/man" ]; then
+                mkdir -p "$out/share"
+                cp -R "${manOut}/share/man" "$out/share/man"
+                chmod -R u+w "$out/share/man"
+              fi
+
+              ${unpinEmbedSh}
+              __unpin_stage="$(mktemp -d)"
+
+              # aliases: every multicall symlink sitting next to the primary.
+              if [ -d "${binOut}/bin" ]; then
+                __unpin_al=""
+                for f in "${binOut}/bin"/*; do
+                  [ -L "$f" ] || continue
+                  __unpin_n="$(basename "$f")"
+                  [ "$__unpin_n" = "${primary}" ] && continue
+                  __unpin_al="''${__unpin_al:+$__unpin_al,}$__unpin_n"
+                done
+                if [ -n "$__unpin_al" ]; then
+                  mkdir -p "$__unpin_stage/unpin"
+                  printf '%s' "$__unpin_al" | tr ',' '\n' > "$__unpin_stage/unpin/aliases"
+                fi
+              fi
+
+              # man: harvest share/man from the base outputs, mkmeta -> unpin/man/*.
+              __unpin_manroot=""
+              for __unpin_d in "${manOut}" "${binOut}" "${base.out or binOut}"; do
+                if [ -d "$__unpin_d/share/man" ]; then __unpin_manroot="$__unpin_d"; break; fi
+              done${nixpkgs.lib.optionalString (manFallback != null) ''
+
+              if [ -d "${manFallback}/share/man" ] \
+                 && { [ -z "$__unpin_manroot" ] \
+                      || [ -z "$(find "$__unpin_manroot/share/man" \( -type f -o -type l \) -print -quit 2>/dev/null)" ]; }; then
+                __unpin_manroot="${manFallback}"
+              fi''}
+              if [ -n "$__unpin_manroot" ]; then
+                __unpin_ms="$(mktemp -d)"; __unpin_rc=0
+                python3 ${./mkmeta.py} "$__unpin_manroot" "$__unpin_ms" || __unpin_rc=$?
+                if [ "$__unpin_rc" = 0 ]; then cp -a "$__unpin_ms/." "$__unpin_stage/"
+                elif [ "$__unpin_rc" != 3 ]; then
+                  echo "unpinEmbedWrap: mkmeta failed (exit $__unpin_rc) for ${primary}" >&2
+                  exit "$__unpin_rc"
+                fi
+                rm -rf "$__unpin_ms"
+              fi
+
+              # runtime-data: the one DECLARED payload (arbitrary tree).
+              ${nixpkgs.lib.optionalString (runtimeStage != null) runtimeStage}
+
+              if [ -n "$(find "$__unpin_stage" -mindepth 1 \( -type f -o -type l \) -print -quit)" ]; then
+                __unpin_embed_subtree "$out/bin/${primary}" "$__unpin_stage"
+              fi
+              rm -rf "$__unpin_stage"
+            '';
 
         # Drop Cosmopolitan's `.symtab.amd64` (apelink's crash-backtrace symtab,
         # ~30-80 KB, unused at runtime) from a cosmo APE's tail-ZIP — stdenv strip
@@ -2611,10 +2756,7 @@ CBODY
             # A CUSTOM `build` (opaque closure) instead gets a `pkgs` whose
             # pkgsStatic.<pkgsAttr> is already on the engine stdenv, so the recipe
             # reads as off-engine with no per-package plumbing. linux-static host
-            # only; darwin/cross/off-engine untouched (byte-identical). A
-            # bitcode-LTO module (engine + multicall) needs bitcode, so the adapter
-            # gets lto = true ONLY then.
-            wantBitcodeModule = engine == "unpin-llvm" && multicall != null;
+            # only; darwin/cross/off-engine untouched (byte-identical).
             engineStdenvFor = pkgs: unpinAdapterStdenv {
               inherit pkgs;
               target = pkgs.pkgsStatic.stdenv.hostPlatform.config;
@@ -2623,8 +2765,20 @@ CBODY
               # configure runs cross mode (AC_RUN_IFELSE off); no exec-format error.
               native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
               cxx = true;
-              lto = wantBitcodeModule;
-              captureLinks = wantBitcodeModule;
+              # lto + capture are UNCONDITIONAL for the engine stdenv (not gated on
+              # multicall). The engine swap is set-wide on pkgsStatic, so a multicall
+              # package's deps inherit this stdenv too. Gating on `wantBitcodeModule`
+              # used to give a multicall consumer's dep (e.g. dnsutils' openssl,
+              # built -flto+capture) a DIFFERENT derivation than the same dep as a
+              # standalone package (built -O2 ELF) — two store paths for one package.
+              # Making both unconditional means every engine build shares ONE stdenv,
+              # so a dep is byte-identical whether it ships standalone or is folded
+              # into a multicall consumer. Single binaries LTO their own bitcode at
+              # the final link (the shipped multicall binaries already do); the
+              # capture shim is runtime-gated on $UNPIN_CAPTURE_LINKS and writes only
+              # a build-temp sidecar, so it is inert for non-multicall builds.
+              lto = true;
+              captureLinks = true;
             };
             rawBuild = pkgs:
               let
@@ -2776,11 +2930,21 @@ CBODY
                 # darwin/windows via withDnsFallback directly.
                 base = if dnsFallback && pkgs.stdenv.hostPlatform.isLinux
                        then withDnsFallback pkgs.pkgsStatic core else core;
-                # withMan must run on the underlying drv (edits the bin output,
-                # reads the man output) BEFORE strippedOrJoined collapses
-                # multi-output drvs. Skipped when the consumer's withUnpinEmbed
-                # already included man (passthru.unpinEmbedsMan).
-                withMaybeMan0 =
+                # Ship by embedding man/aliases into the PRISTINE base in a
+                # post-build runCommand (unpinEmbedWrap): the base build is then
+                # shared byte-for-byte with library consumers, so there is ONE
+                # derivation per package — openssl as a shipped CLI vs as dnsutils'
+                # libcrypto dep. Standard single-binary case. Packages that already
+                # embedded in their own build (unpinEmbedsMan — vim's VFS),
+                # self-folding multi-program packages (the mega path), and no-man
+                # builds keep the legacy in-build embed + strippedOrJoined.
+                useEmbedWrap = embedMan && !(base.unpinEmbedsMan or false) && !selfFold;
+                # Legacy in-build man embed (FORKS the build — the divergence
+                # unpinEmbedWrap avoids). withMan must run on the underlying drv
+                # (edits the bin output, reads the man output) BEFORE
+                # strippedOrJoined collapses multi-output drvs. Skipped when the
+                # build already embedded man (passthru.unpinEmbedsMan).
+                legacyMaybeMan0 =
                   if embedMan && !(base.unpinEmbedsMan or false)
                   then withMan pkgs { primary = binName; } base
                   else base;
@@ -2789,10 +2953,15 @@ CBODY
                 # downstream, so their internal strip is a no-op (identical .drv)
                 # and the `module` we reference is the very build the shipped binary
                 # comes from — no second build. Shipped bytes unchanged.
-                withMaybeMan =
+                legacyMaybeMan =
                   if wantModule
-                  then withMaybeMan0.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
-                  else withMaybeMan0;
+                  then legacyMaybeMan0.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
+                  else legacyMaybeMan0;
+                # The module-bearing drv the manifest references. unpinEmbedWrap:
+                # the pristine `base` (the shipped binary is base's bin stripped —
+                # the SAME build as base.module). Legacy: the [bin out]-forced fork
+                # the shipped binary comes from.
+                moduleSource = if useEmbedWrap then base else legacyMaybeMan;
                 # SELF-FOLD: a multi-program package (find+xargs, flac+metaflac)
                 # must still ship ONE binary, so apply the mega fold to its single
                 # module (N=1). Drops extra upstream binaries not in `programs`.
@@ -2808,8 +2977,11 @@ CBODY
                   modules = [ multicallManifest ];
                   defaultApplet = selfFoldDefault;
                 };
-                shipped = if selfFold then selfFolded else withMaybeMan;
-                result = withLicense (withDescription (strippedOrJoined pkgs name shipped));
+                shipped =
+                  if useEmbedWrap then unpinEmbedWrap pkgs { primary = binName; } base
+                  else if selfFold then strippedOrJoined pkgs name selfFolded
+                  else strippedOrJoined pkgs name legacyMaybeMan;
+                result = withLicense (withDescription shipped);
                 # The manifest the mega-builder consumes. moduleArchive/gnulib
                 # depArchives reference the `module` output of the same built drv;
                 # external depArchives are verbatim store paths (passthru, NOT
@@ -2821,18 +2993,18 @@ CBODY
                   moduleFormat = if useBitcodeModule then "bitcode" else "elf-archive";
                   moduleArchive =
                     if useBitcodeModule
-                    then "${withMaybeMan.module}/lib/module.bc"
-                    else "${withMaybeMan.module}/lib/module.a";
+                    then "${moduleSource.module}/lib/module.bc"
+                    else "${moduleSource.module}/lib/module.a";
                   # Native (asm/SIMD) objects the bitcode link dropped, rescued into
                   # a sidecar the mega-link adds alongside module.bc. Always present
                   # (possibly empty) on the bitcode path; null otherwise.
                   nativeArchive =
                     if useBitcodeModule
-                    then "${withMaybeMan.module}/lib/module_native.a"
+                    then "${moduleSource.module}/lib/module_native.a"
                     else null;
                   depArchives =
                     (if useBitcodeModule then [ ]
-                     else map (a: "${withMaybeMan.module}/lib/${baseNameOf a}") (multicall.internalArchives or [ ]))
+                     else map (a: "${moduleSource.module}/lib/${baseNameOf a}") (multicall.internalArchives or [ ]))
                     ++ (let d = multicall.depArchives or [ ];
                         in if builtins.isFunction d then d pkgs else d);
                   applets = nixpkgs.lib.concatMap
@@ -2845,13 +3017,13 @@ CBODY
                   # Auto-derived external dep DIRS (pure store paths, no IFD); the
                   # mega builder globs <dir>/lib/*.a at build time. `depArchives`
                   # stays as an additive override for archives not in the closure.
-                  depInputDirs = multicallExternalDepDirs withMaybeMan;
+                  depInputDirs = multicallExternalDepDirs moduleSource;
                   # Man source for the mega to MERGE: the built drv's man-bearing
                   # output (split `man`, else out). null when this build ships no
                   # man; the merge skips nulls.
                   manRoot =
                     if embedMan
-                    then "${withMaybeMan.man or withMaybeMan}"
+                    then "${moduleSource.man or moduleSource}"
                     else null;
                   # Runtime-data source for the mega to MERGE (file's magic.mgc).
                   # `multicall.runtimeDataRoot` is a store path or a `pkgs:` function
