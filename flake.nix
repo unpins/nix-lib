@@ -2673,37 +2673,122 @@ CBODY
           in
           withDepFixes;
 
+        # The Windows (mingw + cosmo) root nixpkgs and its engine-swapped variant,
+        # lifted to lib-level thunks. They are PACKAGE-INDEPENDENT (no pkgsAttr, no
+        # per-recipe input), so a catalog mega that refolds N recipes through ONE
+        # lib instance shares this single evaluation across the whole fold — the
+        # windows counterpart of the enginePkgsStatic sharing, but free (no
+        # injection knob needed; the shared thunk IS the sharing). mkStandaloneFlake
+        # just references these instead of rebuilding them inline → byte-identical.
+        windowsPkgsShared =
+          let
+            basePkgs = nixpkgs.legacyPackages.${"x86_64-linux"};
+            nixpkgsPatched = basePkgs.applyPatches {
+              name = "nixpkgs-cosmo";
+              src = nixpkgs.outPath;
+              patches = [ ./cosmo-lib-systems.patch ];
+            };
+            cosmoOverlay = import ./cosmo { lib = nixpkgs.lib // lib; };
+          in
+          import nixpkgsPatched {
+            system = "x86_64-linux";
+            overlays = [ cosmoOverlay ];
+            config = {
+              allowUnsupportedSystem = true;
+              replaceCrossStdenv = { buildPackages, baseStdenv }:
+                if baseStdenv.hostPlatform.isCosmo or false
+                then
+                  let
+                    cs = import ./cosmocc.nix { pkgs = buildPackages; };
+                    wiring = cs.mkCrossWiring {
+                      inherit buildPackages baseStdenv;
+                      targetArch = baseStdenv.hostPlatform.parsed.cpu.name;
+                      targetPrefix = "${baseStdenv.hostPlatform.config}-";
+                    };
+                  in
+                  wiring.stdenv
+                else baseStdenv;
+            };
+          };
+        # Engine adapter for the mingw cross host (bitcode). Built from the ORIGINAL
+        # un-swapped mingwW64 so it never sees the overlay below — no recursion.
+        windowsEngineStdenvShared =
+          let mc = windowsPkgsShared.pkgsCross.mingwW64;
+          in unpinAdapterStdenv {
+            pkgs = mc;
+            hostPkgs = mc;
+            target = mc.stdenv.hostPlatform.config;
+            native = false;
+            cxx = true;
+            lto = true;
+            captureLinks = true;
+          };
+        # windowsPkgsShared with the mingw cross stdenv swapped to the engine adapter
+        # (set-level, guarded on isMinGW so the glibc build host is untouched).
+        windowsEnginePkgsShared = windowsPkgsShared.extend (_final: prev: {
+          pkgsCross = prev.pkgsCross // {
+            mingwW64 = prev.pkgsCross.mingwW64.extend (_f: p:
+              if p.stdenv.hostPlatform.isMinGW or false
+              then { stdenv = windowsEngineStdenvShared; } else { });
+          };
+        });
+
         # mkMegaFromRecipes: fold N catalog packages into one mega WITHOUT paying
         # N nixpkgs+toolchain instantiations. Each package re-exposes its recipe as
         # the lazy `unpinRecipe` output (reading it never forces `packages.*`, so no
-        # per-flake nixpkgs cost). Here we instantiate the base nixpkgs and the
-        # unpin-llvm toolchain ONCE, then rebuild every module by re-running
-        # mkStandaloneFlake with those shared instances threaded in (sharedPkgs /
-        # sharedToolchain) — so the N module builds share one fixpoint and eval is
-        # flat in N instead of linear. Each produced module is byte-identical to the
-        # package's own (same pkgs value, same toolchain), so the mega is unchanged.
+        # per-flake nixpkgs cost). Here we instantiate the base (or cross) nixpkgs +
+        # the engine-swapped pkgsStatic + the toolchain ONCE, then rebuild every
+        # module by re-running mkStandaloneFlake with those shared instances threaded
+        # in — so the N module builds share one fixpoint and eval is flat in N
+        # instead of linear. Each produced module is byte-identical to the package's
+        # own (same pkgs value, same toolchain), so the mega is unchanged.
+        #
+        # Targets (the mega forces exactly ONE per call):
+        #   native linux  : pkgs = the native set; moduleAttr = "default".
+        #   linux cross   : pkgs = the native BUILD set; crossPkgs = the cross set;
+        #                   system = build system; moduleAttr = "linux-<arch>".
+        #   native darwin : pkgs = the darwin set; moduleAttr = "default"; toolchain
+        #                   defaults to the darwin unpinToolchain.
+        #   windows mingw : pkgs = the native build set; moduleAttr = "windows-x86_64";
+        #                   moduleField = "windowsMulticallModule"; linkPkgs = the
+        #                   mingw cross set the PE links for. Its heavy infra
+        #                   (windowsPkgsShared / windowsEnginePkgsShared) is shared
+        #                   for free via lib-level thunks, so no crossPkgs is needed.
         mkMegaFromRecipes =
-          { pkgs
-          , recipes                       # [ <pkg>.unpinRecipe, … ]
+          { pkgs                           # base/native nixpkgs (importNixpkgs + toolchain build host)
+          , recipes                        # [ <pkg>.unpinRecipe, … ]
+          , crossPkgs ? null               # cross set for a linux cross mega (else null)
+          , linkPkgs ? null                # set the mega LINKS for (mingw PE); defaults below
           , system ? pkgs.stdenv.hostPlatform.system
-          , moduleAttr ? "default"        # which packages.<sys> attr carries the module
+          , moduleAttr ? "default"         # which packages.<sys> attr carries the module
+          , moduleField ? "multicallModule"
           , toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
           , nameOverrides ? { }
           , defaultApplet ? null
           }:
           let
-            # Build the heavy engine-swapped pkgsStatic ONCE for the whole fold.
-            sharedEnginePkgsStatic = enginePkgsStaticFor { inherit pkgs toolchain; };
+            # The set whose pkgsStatic feeds the engine swap (linux/darwin path): the
+            # cross set on a cross mega, else the native set. Windows ignores it (its
+            # engine set is the shared lib thunk) — the built thunk just stays unforced.
+            engineHostPkgs = if crossPkgs != null then crossPkgs else pkgs;
+            # The set the mega links for. Cross/native: engineHostPkgs. Windows: the
+            # mingw cross set (linkPkgs).
+            megaLinkPkgs = if linkPkgs != null then linkPkgs else engineHostPkgs;
+            # Build the heavy engine-swapped pkgsStatic ONCE for the whole fold (a
+            # thunk; the windows path never forces it).
+            sharedEnginePkgsStatic = enginePkgsStaticFor { pkgs = engineHostPkgs; inherit toolchain; };
+            sharedCrossPkgs = if crossPkgs != null then { ${moduleAttr} = crossPkgs; } else { };
             moduleOf = recipe:
               (mkStandaloneFlake (recipe // {
                 sharedPkgs = pkgs;
                 sharedToolchain = toolchain;
-                inherit sharedEnginePkgsStatic;
+                inherit sharedEnginePkgsStatic sharedCrossPkgs;
               }))
-              .packages.${system}.${moduleAttr}.multicallModule;
+              .packages.${system}.${moduleAttr}.${moduleField};
           in
           mkMegaMulticall {
-            inherit pkgs toolchain nameOverrides defaultApplet;
+            pkgs = megaLinkPkgs;
+            inherit toolchain nameOverrides defaultApplet;
             modules = map moduleOf recipes;
           };
 
@@ -2866,20 +2951,29 @@ CBODY
           # reuse one fixpoint instead of each re-instantiating its own (the eval
           # OOM fix). null → standalone behaviour: instantiate per-flake as before
           # (byte-identical .drv — both are `import nixpkgs {system}` / the same
-          # vendored toolchain). Only the NATIVE-linux module path reads these.
+          # vendored toolchain).
           , sharedPkgs ? null
           , sharedToolchain ? null
           # The engine-swapped pkgsStatic set, prebuilt once by the mega and shared
           # across the fold (the heaviest per-package fixpoint). null → build it
-          # per-flake as before. Only consumed on the NATIVE host (host == build).
+          # per-flake as before. Consumed by WHICHEVER target's host config matches
+          # this set's (native default, a cross arch, or a darwin host) — the mega
+          # forces exactly one target, so the match is unambiguous; other (unforced)
+          # targets rebuild fresh for free.
           , sharedEnginePkgsStatic ? null
+          # Cross-arch nixpkgs sets prebuilt once by the mega, keyed by the cross
+          # module attr ("linux-riscv64", "linux-armv7l", …). null/{} → each cross
+          # attr imports its own nixpkgs as before. Lets a cross mega share the one
+          # cross fixpoint across the fold (the cross counterpart of sharedPkgs).
+          , sharedCrossPkgs ? { }
           }:
           let
             # Re-expose the caller's recipe (exactly what the package author wrote,
             # minus the injection knobs) so the mega can refold it against shared
             # infra via `inputs.<pkg>.unpinRecipe` — a LAZY output that never forces
             # `packages.*`, so reading it costs ~nothing (no nixpkgs instantiation).
-            unpinRecipe = builtins.removeAttrs args [ "sharedPkgs" "sharedToolchain" ];
+            unpinRecipe = builtins.removeAttrs args
+              [ "sharedPkgs" "sharedToolchain" "sharedEnginePkgsStatic" "sharedCrossPkgs" ];
             tc = system: if sharedToolchain != null then sharedToolchain else unpinToolchain system;
             runtimeEmbedNative = if runtimeEmbed == null then null else runtimeEmbed.native or null;
             runtimeEmbedWindows = if runtimeEmbed == null then null else runtimeEmbed.windows or null;
@@ -2969,12 +3063,18 @@ CBODY
                 # helper (enginePkgsStaticFor) so the catalog mega can build it ONCE
                 # and inject it (sharedEnginePkgsStatic) — the heaviest per-package
                 # fixpoint, shared. Standalone calls the helper directly (identical
-                # construction → byte-identical .drv). The shared set is only valid
-                # on the native host (host == build); cross targets always rebuild.
-                nativeHost = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
+                # construction → byte-identical .drv). Match by HOST CONFIG so the
+                # injected set is reused by whichever target it was built for —
+                # native default, a cross arch (riscv64/…), or a darwin host — and
+                # ignored by the others (which the mega never forces). The cross
+                # attr's `withLLDLink` wrapper is a no-op under the engine adapter
+                # stdenv (its isLLDTarget gate fails), so sharing the unwrapped set
+                # is byte-identical to the per-flake wrapped build (proven).
                 enginePkgsStatic =
                   if !useEngine then pkgs.pkgsStatic
-                  else if sharedEnginePkgsStatic != null && nativeHost
+                  else if sharedEnginePkgsStatic != null
+                       && sharedEnginePkgsStatic.stdenv.hostPlatform.config
+                          == pkgs.pkgsStatic.stdenv.hostPlatform.config
                   then sharedEnginePkgsStatic
                   else enginePkgsStaticFor {
                     inherit pkgs;
@@ -3181,38 +3281,9 @@ CBODY
             # applyPatches registers `cosmo` as a kernel + example crossSystem
             # (./cosmo-lib-systems.patch). Both the overlay and replaceCrossStdenv
             # self-guard on `isCosmo`, so vanilla mingw drvs are unchanged.
-            windowsPkgs =
-              let
-                basePkgs = nixpkgs.legacyPackages.${"x86_64-linux"};
-                nixpkgsPatched = basePkgs.applyPatches {
-                  name = "nixpkgs-cosmo";
-                  src = nixpkgs.outPath;
-                  patches = [ ./cosmo-lib-systems.patch ];
-                };
-                # Pass fixLib so cosmo overlay fragments can call
-                # `lib.withAliases` (defined in nix-lib's lib).
-                cosmoOverlay = import ./cosmo { lib = nixpkgs.lib // lib; };
-              in
-              import nixpkgsPatched {
-                system = "x86_64-linux";
-                overlays = [ cosmoOverlay ];
-                config = {
-                  allowUnsupportedSystem = true;
-                  replaceCrossStdenv = { buildPackages, baseStdenv }:
-                    if baseStdenv.hostPlatform.isCosmo or false
-                    then
-                      let
-                        cs = import ./cosmocc.nix { pkgs = buildPackages; };
-                        wiring = cs.mkCrossWiring {
-                          inherit buildPackages baseStdenv;
-                          targetArch = baseStdenv.hostPlatform.parsed.cpu.name;
-                          targetPrefix = "${baseStdenv.hostPlatform.config}-";
-                        };
-                      in
-                      wiring.stdenv
-                    else baseStdenv;
-                };
-              };
+            # Lifted to a lib-level thunk (windowsPkgsShared) so a catalog mega's
+            # refolds share one evaluation. Byte-identical (same expression).
+            windowsPkgs = windowsPkgsShared;
             windowsRawBuild =
               if windowsBuild != null then windowsBuild
               else if windowsCosmo then (pkgs: (cosmoStaticCross pkgs).${pkgsAttr})
@@ -3237,37 +3308,12 @@ CBODY
             wantWindowsModule =
               engine == "unpin-llvm" && multicall != null && (multicall.windows or false)
               && multicallCosmo == null && windowsEnabled;
-            # Engine adapter for the mingw cross host (bitcode). Built from the
-            # ORIGINAL un-swapped mingwW64 so it never sees the overlay below — no
-            # recursion. `target` = the mingw config string.
-            windowsEngineStdenv =
-              let mc = windowsPkgs.pkgsCross.mingwW64;
-              in unpinAdapterStdenv {
-                pkgs = mc;
-                # Base on the mingw cross set (config x86_64-w64-mingw32), NOT its
-                # pkgsStatic whose `…-windows-gnu` string breaks autotools
-                # config.sub. static-ness comes from mingwStaticCross.
-                hostPkgs = mc;
-                target = mc.stdenv.hostPlatform.config;
-                native = false;
-                cxx = true;
-                lto = true;
-                captureLinks = true;
-              };
-            # windowsPkgs with the mingw cross stdenv swapped to the engine adapter
-            # (set-level, guarded on isMinGW so the glibc build host is untouched —
-            # mirror of enginePkgsStatic's isMusl guard). The consumer's windowsBuild
-            # reads it via mingwStaticCross, so the whole mingw closure is
-            # engine-compiled (bitcode).
+            # Lifted to lib-level thunks (windowsEnginePkgsShared, built on
+            # windowsEngineStdenvShared) so a catalog mega's refolds share one
+            # evaluation. The per-package gate (wantWindowsModule) stays here; the
+            # heavy engine-swapped set is the shared thunk. Byte-identical.
             windowsEnginePkgs =
-              if !wantWindowsModule then windowsPkgs
-              else windowsPkgs.extend (_final: prev: {
-                pkgsCross = prev.pkgsCross // {
-                  mingwW64 = prev.pkgsCross.mingwW64.extend (_f: p:
-                    if p.stdenv.hostPlatform.isMinGW or false
-                    then { stdenv = windowsEngineStdenv; } else { });
-                };
-              });
+              if !wantWindowsModule then windowsPkgs else windowsEnginePkgsShared;
             windowsRawHooked = pkgs:
               if wantCosmoModule
               then multicallModuleHookCosmo
@@ -3404,18 +3450,23 @@ CBODY
               // nixpkgs.lib.optionalAttrs (nativeBuild && system == "x86_64-linux") {
                 # withLLDLink: the gc overlay is Linux-native only, so the cross
                 # scopes get the standard lld link via NIX_CFLAGS_LINK here — keeps
-                # the linker uniform across every non-mac target.
-                "linux-i686" = stripped (withLLDLink pkgsAttr pkgs.pkgsCross.musl32);
+                # the linker uniform across every non-mac target. The cross nixpkgs
+                # set is `sharedCrossPkgs.<attr>` when the catalog mega prebuilt it
+                # (one fixpoint shared across the fold), else imported per-flake.
+                "linux-i686" = stripped (withLLDLink pkgsAttr
+                  (sharedCrossPkgs."linux-i686" or pkgs.pkgsCross.musl32));
                 # musl-power = powerpc64le-unknown-linux-musl. Debian calls it
                 # "ppc64el" but uname returns "ppc64le" and the Rust ecosystem
                 # (rustup, binstall) labels it the same way — we follow uname.
-                "linux-ppc64le" = stripped (withLLDLink pkgsAttr pkgs.pkgsCross.musl-power);
+                "linux-ppc64le" = stripped (withLLDLink pkgsAttr
+                  (sharedCrossPkgs."linux-ppc64le" or pkgs.pkgsCross.musl-power));
                 # riscv64 has no pre-cooked musl variant in nixpkgs.pkgsCross
                 # (only glibc). Spell the crossSystem out by triple.
-                "linux-riscv64" = stripped (withLLDLink pkgsAttr (import nixpkgs {
-                  inherit system;
-                  crossSystem = { config = "riscv64-unknown-linux-musl"; };
-                }));
+                "linux-riscv64" = stripped (withLLDLink pkgsAttr
+                  (sharedCrossPkgs."linux-riscv64" or (import nixpkgs {
+                    inherit system;
+                    crossSystem = { config = "riscv64-unknown-linux-musl"; };
+                  })));
               }
               // nixpkgs.lib.optionalAttrs (nativeBuild && system == "aarch64-linux") {
                 # armv7l-unknown-linux-musleabihf: pkgsCross has no musl example
@@ -3429,10 +3480,11 @@ CBODY
                 # Rust convention. Drops armv6 (Pi 1/Zero) — worth it, since 64-bit
                 # atomics (libssh2, glib ≥ 2.68) fail to link on armv6 (musl ships
                 # no libatomic in pkgsStatic).
-                "linux-armv7l" = stripped (withLLDLink pkgsAttr (import nixpkgs {
-                  inherit system;
-                  crossSystem = { config = "armv7l-unknown-linux-musleabihf"; };
-                }));
+                "linux-armv7l" = stripped (withLLDLink pkgsAttr
+                  (sharedCrossPkgs."linux-armv7l" or (import nixpkgs {
+                    inherit system;
+                    crossSystem = { config = "armv7l-unknown-linux-musleabihf"; };
+                  })));
               }
               // nixpkgs.lib.optionalAttrs (windowsEnabled && system == "x86_64-linux") {
                 "windows-x86_64" = windowsPkg;
