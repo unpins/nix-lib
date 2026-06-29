@@ -1831,6 +1831,18 @@ CBODY
                   if infer
                   then ''_unpin_collect "$module/lib/module_native.a" $__objs $__arch''
                   else ''_unpin_collect "$module/lib/module_native.a" ${spaceSep (p.objs or [ ])} ${spaceSep internalArchives}'';
+                # Just the program OBJECTS (no archives) — used to decide which
+                # asm-referenced symbols must be kept external (see body). A symbol
+                # an asm object references is kept external ONLY if it's defined in
+                # an own object (gzip's deflate.o → window: lives solely in
+                # module.bc, so internalize orphans the asm). Symbols that come from
+                # an archive (xz's lzma_crc32_table, in liblzma.a) are left
+                # internalized: the same archive is also an external depArchive at
+                # the mega-link, so the asm resolves there — keeping module.bc's
+                # copy external instead would duplicate it (ld.lld: duplicate
+                # symbol). Restricting to objects fixes gzip and is a no-op for xz.
+                progObjs =
+                  if infer then "$__objs" else "${spaceSep (p.objs or [ ])}";
                 # mingw compiles a package's public API (and the gnulib getline/
                 # getdelim it ships) with __declspec(dllexport). opt -internalize
                 # PRESERVES dllexport symbols by design (they are a DLL's export
@@ -1868,8 +1880,37 @@ CBODY
                 ${nixpkgs.lib.optionalString infer inferSetup}
                 ${linkLine}
                 ${natCollect}
+                # asm→bitcode rescue (the reverse of the SIMD case above): a native
+                # object (e.g. gzip's i386 match.o) may REFERENCE a global DEFINED in
+                # one of this program's own objects (deflate.c's window/strstart/…,
+                # which then live solely in module.bc). The default keep-list is just
+                # the entry trampoline, so opt -internalize makes those globals local
+                # → the native object goes undefined at the mega-link. Preserve them
+                # by adding `undefined(module_native.a) ∩ defined(progObjs)` to the
+                # keep-list. Restricted to OWN OBJECTS (not archives) so xz's
+                # lzma_crc32_table — which comes from liblzma.a and is also an
+                # external depArchive at the mega — is left internalized and resolved
+                # there (keeping it external would duplicate it). Empty — hence
+                # byte-identical — for self-contained asm (zstd, whose asm only
+                # DEFINES symbols) and asm-free packages; natCollect above is
+                # unchanged, so module_native.a stays byte-identical too. Single-
+                # program packages only isolate cleanly here (the shared archive ==
+                # this program's natives); all catalog asm packages are single-prog.
+                keeplist='${entryOf p}'
+                if ${llvm} llvm-ar t "$module/lib/module_native.a" >/dev/null 2>&1 \
+                   && [ -n "$(${llvm} llvm-ar t "$module/lib/module_native.a" 2>/dev/null)" ]; then
+                  ${llvm} llvm-nm --undefined-only "$module/lib/module_native.a" 2>/dev/null \
+                    | awk '$1=="U"{print $2}' | sort -u > multicall/nat_${san p.name}.u
+                  # defined externals of the OWN OBJECTS only (skip the "file:"
+                  # headers llvm-nm prints when handed several files).
+                  ${llvm} llvm-nm --defined-only --extern-only ${progObjs} 2>/dev/null \
+                    | awk '$NF ~ /:$/ {next} {print $NF}' | sort -u > multicall/obj_${san p.name}.d
+                  __extra=$(comm -12 multicall/nat_${san p.name}.u multicall/obj_${san p.name}.d)
+                  for __s in $__extra; do keeplist="$keeplist,$__s"; done
+                  [ -n "$__extra" ] && echo "multicall(${p.name}): keeping asm-referenced bitcode syms external:" $__extra >&2 || true
+                fi
                 ${stripStep}
-                ${llvm} opt -passes=internalize -internalize-public-api-list=${entryOf p} \
+                ${llvm} opt -passes=internalize -internalize-public-api-list="$keeplist" \
                   ${internalizeIn} -o multicall/mod_${san p.name}.bc
               '';
           in
