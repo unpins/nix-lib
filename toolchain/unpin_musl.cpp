@@ -172,6 +172,13 @@ struct Variant {
                      // crt1.o. NOT a hash axis: all three CRTs are always built,
                      // and a -fPIC libc is identical with or without -pie, so
                      // pie shares the pic variant's cache entry.
+  bool lto = false;  // build the libc objects as LLVM BITCODE (-flto) so the
+                     // consuming link folds libc into its whole-program LTO —
+                     // uniform with every other engine object (standardization)
+                     // and lets LTO inline/specialize hot libc paths (perf).
+                     // Follows the link's own -flto: real engine links carry it
+                     // (→ bitcode); autoconf conftest probes drop it (→ native,
+                     // honest + fast). HASH axis: both libc.a's coexist in cache.
 };
 
 // 16-hex cache-dir token for a variant. Non-crypto xxh3 is plenty for a cache
@@ -187,6 +194,8 @@ std::string variantHash(const Variant &V) {
   s += V.fast ? "fast" : "small";
   sep();
   s += V.pic ? "pic" : "nopic";
+  sep();
+  s += V.lto ? "lto" : "nolto";
   uint64_t h = xxh3_64bits(
       ArrayRef<uint8_t>(reinterpret_cast<const uint8_t *>(s.data()), s.size()));
   return utohexstr(h, /*LowerCase=*/true, /*Width=*/16);
@@ -413,6 +422,11 @@ bool buildLibc(const std::string &self, const std::string &triple,
         objs[i] = obj;
         std::vector<std::string> args = {"clang"};
         addCcArgs(args, muslArch, headerTriple, isO3Path(sel[i]), V);
+        // Bitcode libc: -flto makes each object LLVM bitcode so the consuming
+        // engine link folds libc into its whole-program LTO. asm/.s/.S sources and
+        // the CRTs (buildCrt) stay native — LTO of CRTs is unsupported (llvm#43698)
+        // and the linker resolves asm↔bitcode at the final link regardless.
+        if (V.lto && StringRef(sel[i]).ends_with(".c")) args.push_back("-flto");
         args.push_back("-target");
         args.push_back(triple);
         args.push_back("-c");
@@ -1288,6 +1302,7 @@ Variant parseVariant(ArrayRef<const char *> Args, const std::string &triple) {
   std::string march, mcpu, mtune, mabi, optLast;
   int pic = 0; // 0 unset, 1 pic, -1 no-pic
   int pie = 0; // 0 unset, 1 -pie, -1 -no-pie
+  int lto = 0; // 0 unset, 1 -flto, -1 -fno-lto
   for (size_t i = 1; i < Args.size(); ++i) {
     StringRef a = Args[i];
     if (a.starts_with("-march=")) march = a.str();
@@ -1305,6 +1320,10 @@ Variant parseVariant(ArrayRef<const char *> Args, const std::string &triple) {
       pic = -1;
     else if (a == "-pie") pie = 1;
     else if (a == "-no-pie" || a == "-nopie") pie = -1;
+    else if (a == "-flto" || a == "-flto=full" || a == "-flto=thin" ||
+             a.starts_with("-flto="))
+      lto = 1;
+    else if (a == "-fno-lto") lto = -1;
   }
   for (auto *s : {&march, &mcpu, &mtune, &mabi})
     if (!s->empty()) V.cpuFlags.push_back(*s);
@@ -1313,6 +1332,11 @@ Variant parseVariant(ArrayRef<const char *> Args, const std::string &triple) {
   // A -pie link needs position-independent objects, so it implies pic unless the
   // user explicitly disabled it.
   V.pic = (pic == 1) || (V.pie && pic != -1);
+  // Bitcode libc follows the link's own -flto: every real engine link is -flto
+  // (the cc-shim appends it), so libc is bitcode and folds into the whole-program
+  // LTO — uniform with all other engine objects. Autoconf conftest probes have
+  // -flto stripped by the shim, so they fall to the native libc (honest + fast).
+  V.lto = (lto == 1);
   return V;
 }
 
