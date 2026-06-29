@@ -2341,6 +2341,19 @@ CBODY
             # darwin drops the groups and swaps `-Wl,-s`→`-Wl,-x`. No-op off darwin.
             isDarwinHost = pkgs.stdenv.hostPlatform.isDarwin or false;
             stripLinkFlag = if isDarwinHost then "-Wl,-x" else "-Wl,-s";
+            # Bitcode libc: musl's `malloc` is a WEAK alias of the strong
+            # `__libc_malloc`. When a mega's modules are NATIVE objects (elf-archive,
+            # the cross megas) their references to `malloc` are invisible to the
+            # `-flto` link's LTO, so it internalizes/drops the weak `malloc` from the
+            # codegen'd libc → `undefined symbol: malloc` at final resolution. (Megas
+            # with BITCODE modules — x86_64 native — escape it: LTO sees the use.)
+            # `-u malloc` both pulls the defining object AND adds `malloc` to the LTO
+            # preserve set so it survives into the output for the native objects to
+            # bind. Gate on a linux host (every linux engine mega links the bitcode
+            # libc); exclude darwin/windows (libSystem/mingw, no weak-musl-malloc).
+            bitcodeLibcForce = nixpkgs.lib.optionalString
+              (!isDarwinHost && !pkgs.stdenv.hostPlatform.isWindows)
+              "-Wl,-u,malloc ";
             # A group is needed when there is more than one archive to back-ref
             # across — explicit depArchives OR auto-derived dirs both count. Never on
             # darwin (ld64 has no --start-group and doesn't need it).
@@ -2388,7 +2401,7 @@ CBODY
                 # UNPIN_META ZIP is embedded post-link by withAliases, so it survives
                 # the strip. Explicit depArchives + auto-derived (autodeps) ride in
                 # one group (empty on darwin — ld64 resolves back-refs multi-pass).
-                ${face} -fuse-ld=lld ${stripLinkFlag} -o ${binFile} \
+                ${face} -fuse-ld=lld ${stripLinkFlag} ${bitcodeLibcForce}-o ${binFile} \
                   multicall/dispatcher.c \
                   ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
                   ${groupOpen} ${nixpkgs.lib.concatStringsSep " " nativeArchives} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose} \
