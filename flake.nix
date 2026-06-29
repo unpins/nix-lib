@@ -1786,14 +1786,6 @@ CBODY
                                     # hand-listed objs/internalArchives
           , stripDllexport ? false  # mingw: strip __declspec(dllexport) before
                                     # internalize (see stripStep) — off elsewhere
-          , linkData ? [ ]          # builddir-relative files the mega-link must
-                                    # stage in CWD before LTO codegen (tcc's
-                                    # `incblob`: a `.incbin` the darwin module
-                                    # leaves unresolved in bitcode). Copied into
-                                    # $module/data/; the manifest's linkData
-                                    # points here. Empty on linux/windows, where
-                                    # `.incbin` is resolved at compile time into a
-                                    # native object in module_native.a.
           }: drv:
           let
             san = n: nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ] n;
@@ -1946,16 +1938,7 @@ CBODY
               fi
               ${llvm} llvm-link ${spaceSep (map (p: "multicall/mod_${san p.name}.bc") programs)} \
                 -o "$module/lib/module.bc"
-            ''
-            # Link-time data (tcc's incblob): carry the builddir file into the module
-            # so mkMegaMulticall can stage it in the mega-link CWD, where the
-            # still-unresolved `.incbin` codegens — same bytes the standalone link
-            # embedded. Appended (not inlined) so the empty case is byte-identical to
-            # the old postBuild for every non-linkData package.
-            + nixpkgs.lib.optionalString (linkData != [ ]) (''
-              mkdir -p "$module/data"
-            '' + nixpkgs.lib.concatMapStringsSep "\n"
-              (f: ''cp "${f}" "$module/data/${baseNameOf f}"'') linkData);
+            '';
           });
 
         # Cosmo (APE) multicall MODULE emitter for engine = "cosmocc". ld.lld
@@ -2285,17 +2268,6 @@ CBODY
               (map (m: m.nativeArchive or null) modules);
             depArchives = nixpkgs.lib.unique
               (nixpkgs.lib.concatMap (m: m.depArchives) modules);
-            # Link-time data files (tcc's incblob) the LTO codegen resolves via a
-            # relative `.incbin`. Staged into the link CWD by basename — the name
-            # the `.incbin` spells — so collisions across modules are fatal.
-            linkDataFiles = nixpkgs.lib.concatMap (m: m.linkData or [ ]) modules;
-            linkDataBases = map baseNameOf linkDataFiles;
-            linkDataDups = nixpkgs.lib.unique
-              (nixpkgs.lib.filter
-                (n: builtins.length (nixpkgs.lib.filter (x: x == n) linkDataBases) > 1)
-                linkDataBases);
-            linkDataStage = nixpkgs.lib.concatMapStringsSep "\n"
-              (f: ''cp "${f}" "${baseNameOf f}"'') linkDataFiles;
             # Auto-derived external dep dirs. The builder globs <dir>/lib/*.a and
             # skips libc-family archives (the engine/cosmo provides libc; a deep
             # closure surfacing musl's libc.a must not clash with it).
@@ -2369,9 +2341,6 @@ CBODY
                 printf '${nixpkgs.lib.concatStringsSep "\\n" appletLines}\n' > multicall/applets.list
                 ${multicallTableDispatcherC { inherit name; defaultApplet = defaultSan; }}
                 ${autoDepsPrelude}
-                # Stage link-time data into the CWD so a module's relative `.incbin`
-                # (tcc's incblob) resolves when the LTO codegen runs the link.
-                ${linkDataStage}
                 # stripLinkFlag (-Wl,-s on ELF/PE, -Wl,-x on Mach-O) strips at link
                 # (after LTO codegen bound the entries) — the entries are dead in the
                 # symtab once linked, so the shipped binary carries none. The
@@ -2441,10 +2410,6 @@ CBODY
             throw ("mkMegaMulticall: applet name collision across packages: "
               + nixpkgs.lib.concatStringsSep ", " dups
               + " — pass nameOverrides to rename");
-          assert (linkDataDups == [ ]) ||
-            throw ("mkMegaMulticall: link-data basename collision across packages: "
-              + nixpkgs.lib.concatStringsSep ", " linkDataDups
-              + " — two modules stage the same .incbin name into the link CWD");
           # ONE post-build embed over the linked mega (unpinEmbedWrap, the same
           # primitive every shipped binary uses). aliases = every applet name except
           # the primary (which IS the binary). Man MERGE: per-package man embeds into
@@ -3148,11 +3113,6 @@ CBODY
                       internalArchives = multicall.internalArchives or [ ];
                       inferLinkInputs = multicall.inferLinkInputs or true;
                       llvm = "${tc pkgs.stdenv.buildPlatform.system}/bin/llvm";
-                      # darwin keeps tcc's `.incbin` in bitcode → carry the data
-                      # file for the mega-link. linux/windows resolve it at compile
-                      # time, so nothing to stage there.
-                      linkData = nixpkgs.lib.optionals
-                        pkgs.stdenv.hostPlatform.isDarwin (multicall.linkData or [ ]);
                     }
                     (rawBuild pkgs)
                   else if wantModule
@@ -3290,18 +3250,6 @@ CBODY
                     if embedMan
                     then "${moduleSource.man or moduleSource}"
                     else null;
-                  # Link-time data files the mega-link must stage in CWD before LTO
-                  # codegen: a darwin module can leave an unresolved `.incbin` (tcc's
-                  # sysroot `incblob`) in its bitcode — that path resolves relative to
-                  # the link CWD, which on the mega is not the package build dir.
-                  # Carried in $module/data (see the hook), staged by mkMegaMulticall.
-                  # darwin-only: linux/windows bake the bytes into module_native.a at
-                  # compile time, so this is empty and the mega stages nothing.
-                  linkData =
-                    if useBitcodeModule && pkgs.stdenv.hostPlatform.isDarwin
-                    then map (n: "${moduleSource.module}/data/${baseNameOf n}")
-                      (multicall.linkData or [ ])
-                    else [ ];
                   # Runtime-data source for the mega to MERGE (file's magic.mgc).
                   # `multicall.runtimeDataRoot` is a store path or a `pkgs:` function
                   # for cross. null when the package ships none.
