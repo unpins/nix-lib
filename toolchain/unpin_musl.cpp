@@ -443,7 +443,24 @@ bool buildLibc(const std::string &self, const std::string &triple,
         // engine link folds libc into its whole-program LTO. asm/.s/.S sources and
         // the CRTs (buildCrt) stay native — LTO of CRTs is unsupported (llvm#43698)
         // and the linker resolves asm↔bitcode at the final link regardless.
-        if (V.lto && StringRef(sel[i]).ends_with(".c")) args.push_back("-flto");
+        //
+        // RISC-V carve-out: the native riscv64/vfork.s tail-jumps to __syscall_ret
+        // with a bare `j` — a fixed-range R_RISCV_JAL (±1 MiB) that ld.lld cannot
+        // range-extend (no JAL thunk in LLVM 21/22/main, by design: RISC-V expects
+        // the ±2 GiB auipc+jalr form + relax-down). __syscall_ret lives in the .c
+        // helper syscall_ret.c; as bitcode it folds into a large program's LTO
+        // image >1 MiB from the native vfork stub and the jal overflows. Keep that
+        // one helper NATIVE on riscv so __syscall_ret clusters with the other libc
+        // asm objects, intra-native and in range; the other ~1333 libc .c stay
+        // bitcode. (syscall_cp.s bare-jal's __cp_cancel too, but that label is
+        // defined in the SAME asm object — a fixed +0x1c offset, never overflows —
+        // so it needs no carve-out.) A future musl bump adding a new external
+        // asm→.c jal edge fails loud at link with the exact undefined symbol.
+        bool riscv = muslArch == "riscv64" || muslArch == "riscv32";
+        bool asmJalTarget = riscv && StringRef(sel[i]).ends_with("/syscall_ret.c");
+        if (V.lto && StringRef(sel[i]).ends_with(".c") && !asmJalTarget) {
+          args.push_back("-flto");
+        }
         args.push_back("-target");
         args.push_back(triple);
         args.push_back("-c");
