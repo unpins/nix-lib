@@ -621,6 +621,12 @@ bool buildBuiltins(const std::string &self, const std::string &triple,
         std::vector<std::string> args = {"clang", "-I", root};
         if (isCpp) args.push_back("-std=c++17");
         else if (!isAsm) args.push_back("-std=c11");
+        // Release builtins: drop assert(). arm32's __clear_cache asserts, so
+        // clear_cache.o (native) pulls __assert_fail; under bitcode libc that
+        // helper (assert.c) is bitcode and isn't selected to satisfy a native
+        // archive ref discovered post-LTO, so the program link fails undefined.
+        // NDEBUG is standard for a release compiler-rt and kills the ref at src.
+        if (!isAsm) args.push_back("-DNDEBUG");
         for (const char *f : {"-fno-builtin", "-fomit-frame-pointer",
                               "-fvisibility=hidden", "-Qunused-arguments", "-w"})
           args.push_back(f);
