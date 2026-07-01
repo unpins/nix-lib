@@ -342,6 +342,24 @@ int runSelf(const std::string &self, const std::vector<std::string> &args) {
   return rc;
 }
 
+// Worker count for the internal compile pools (each thread re-execs one clang).
+// Honor NIX_BUILD_CORES (nix's --cores) when set non-zero so the toolchain's
+// parallelism is throttleable from the derivation: without this every sysroot
+// build always fans out to min(hw,8) clang re-execs regardless of the core
+// budget, so --cores can't throttle it and concurrent cold-cache builds
+// overcommit RAM. NIX_BUILD_CORES=0 means "all" → fall back to
+// hardware_concurrency capped at 8 (memory backstop + diminishing returns for
+// these small TUs); an explicit non-zero budget is honored uncapped.
+unsigned poolSize() {
+  if (const char *c = ::getenv("NIX_BUILD_CORES"); c && c[0]) {
+    int v = ::atoi(c);
+    if (v > 0) return (unsigned)v;
+  }
+  unsigned n = std::thread::hardware_concurrency();
+  if (n == 0) n = 1;
+  return n > 8 ? 8 : n;
+}
+
 // Compile the selected musl sources -> objDir/*.o (parallel), then `llvm-ar`.
 bool buildLibc(const std::string &self, const std::string &triple,
                const std::string &muslArch, const std::string &headerTriple,
@@ -410,8 +428,7 @@ bool buildLibc(const std::string &self, const std::string &triple,
   std::atomic<size_t> next{0};
   std::atomic<bool> ok{true};
   std::vector<std::string> objs(sel.size());
-  unsigned n = std::max(1u, std::thread::hardware_concurrency());
-  if (n > 8) n = 8;
+  unsigned n = poolSize();
   std::vector<std::thread> pool;
   for (unsigned w = 0; w < n; ++w) {
     pool.emplace_back([&] {
@@ -572,8 +589,7 @@ bool buildBuiltins(const std::string &self, const std::string &triple,
   std::atomic<size_t> next{0};
   std::atomic<bool> ok{true};
   std::vector<std::string> objs(jobs.size());
-  unsigned n = std::max(1u, std::thread::hardware_concurrency());
-  if (n > 8) n = 8;
+  unsigned n = poolSize();
   std::vector<std::thread> pool;
   for (unsigned w = 0; w < n; ++w) {
     pool.emplace_back([&] {
@@ -671,7 +687,7 @@ bool buildArchive(const std::string &self,
   std::atomic<size_t> next{0};
   std::atomic<bool> ok{true};
   std::vector<std::string> objs(jobs.size());
-  unsigned n = std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
+  unsigned n = poolSize();
   std::vector<std::thread> pool;
   for (unsigned w = 0; w < n; ++w) {
     pool.emplace_back([&] {
@@ -1038,7 +1054,7 @@ bool buildMingwArchive(const std::string &self, const std::string &triple,
   std::atomic<size_t> next{0};
   std::atomic<bool> ok{true};
   std::vector<std::string> objs(jobs.size());
-  unsigned n = std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
+  unsigned n = poolSize();
   std::vector<std::thread> pool;
   for (unsigned w = 0; w < n; ++w) {
     pool.emplace_back([&] {
