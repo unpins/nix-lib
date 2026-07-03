@@ -3148,6 +3148,21 @@ CBODY
                 # already compiled (no recompile), riding the same builder as
                 # the shipped binary. No-op when `multicall == null` or off-Linux.
                 sanMc = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
+                # Per-platform program set. Most packages ship the same programs
+                # everywhere, so `multicall.programs` is authoritative. A package
+                # whose darwin build is a genuine SUBSET (no /proc analogue, so it
+                # ships fewer applets — e.g. procps-ng's watch/uptime/tload) sets
+                # `multicall.darwinPrograms` to that subset; the module hook,
+                # selfFold and manifest then fold exactly those on a darwin host.
+                # This is the engine-self-fold replacement for `darwin = false`:
+                # instead of opting darwin OUT of the module, it opts it in with
+                # the right (smaller) list. Windows keeps `multicall.programs`.
+                mcPrograms =
+                  if multicall != null
+                     && pkgs.stdenv.hostPlatform.isDarwin
+                     && multicall ? darwinPrograms
+                  then multicall.darwinPrograms
+                  else (if multicall == null then [ ] else multicall.programs);
                 # The bitcode module rides the engine's -flto objects. Linux and
                 # darwin both default-on (the darwin standalone already builds
                 # regardless); a package sets multicall.darwin = false to opt out.
@@ -3163,7 +3178,7 @@ CBODY
                   then multicallModuleHookLTO
                     {
                       package = name;
-                      inherit (multicall) programs;
+                      programs = mcPrograms;
                       internalArchives = multicall.internalArchives or [ ];
                       inferLinkInputs = multicall.inferLinkInputs or true;
                       llvm = "${tc pkgs.stdenv.buildPlatform.system}/bin/llvm";
@@ -3173,7 +3188,7 @@ CBODY
                   then multicallModuleHook
                     {
                       package = name;
-                      inherit (multicall) programs;
+                      programs = mcPrograms;
                       internalArchives = multicall.internalArchives or [ ];
                       isTargetDarwin = false;
                     }
@@ -3246,7 +3261,7 @@ CBODY
                 # module (N=1). Drops extra upstream binaries not in `programs`.
                 # `defaultProgram` runs on a bare invocation (default = binName if
                 # an applet, else null → dispatcher lists programs).
-                selfFold = wantModule && builtins.length multicall.programs > 1;
+                selfFold = wantModule && builtins.length mcPrograms > 1;
                 selfFoldDefault =
                   let dp = multicall.defaultProgram or binName;
                   in if builtins.elem dp (map (a: a.name) multicallManifest.applets)
@@ -3291,7 +3306,7 @@ CBODY
                       let entry = "unpin__${sanMc name}__${sanMc p.name}_main"; in
                       [{ name = p.name; inherit entry; }]
                       ++ map (al: { name = al; inherit entry; }) (p.aliases or [ ]))
-                    multicall.programs;
+                    mcPrograms;
                   requires = { cxx = false; group = true; } // (multicall.requires or { });
                   # Auto-derived external dep DIRS (pure store paths, no IFD); the
                   # mega builder globs <dir>/lib/*.a at build time. `depArchives`
