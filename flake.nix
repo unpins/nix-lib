@@ -939,6 +939,85 @@
           '';
         };
 
+        # Canonical libarchive for the catalog: ONE derivation shared by every
+        # unpin that links libarchive (tar ships bsdtar over it; e2fsprogs uses
+        # it for `mke2fs -d <archive>`). Because both consumers link this exact
+        # store `.a` as an EXTERNAL depArchive, the catalog mega folds a SINGLE
+        # copy (STOREA, deduped by path) instead of one baked into each package's
+        # module.bc. Curated lean + dependency-symmetric so the shared drv suits
+        # every consumer:
+        #   * xarSupport=false → no libxml2 (XAR is Apple .pkg legacy). Drops the
+        #     libxml2 store-ref AND its darwin xmlIconvConvert iconv reference.
+        #   * --without-openssl always: nixpkgs keeps openssl an unconditional
+        #     buildInput AND names it in preFixup, so under the engine cc OpenSSL
+        #     would build with -flto (tens of minutes/arch) for a lib nothing
+        #     links — filter it out and rewrite preFixup to keep only the lzo .la
+        #     fixup. libarchive's crypto (encrypted ZIP/7z, mtree digests) instead
+        #     comes from **mbedtls on linux** (~500 KB, not OpenSSL 3.x's ~4 MB).
+        #   * The crypto backend does NOT force itself on every consumer, because
+        #     `archive_read_support_format_all()` is explicit calls (not ctors) and
+        #     only the zip/7z/mtree/xar handlers reference the digest/cryptor layer.
+        #     A static `.a` pulls a member only if referenced: bsdtar calls
+        #     format_all → pulls the crypto members → keeps the feature; e2fsprogs
+        #     is patched to register only format_tar (see its flake) → never
+        #     references crypto → mbedtls stays OUT of e2fsprogs even though it
+        #     links this same crypto-enabled `.a`. So one shared libarchive serves
+        #     both without dragging crypto into the fs tools.
+        #   * darwin: --without-mbedtls (nixpkgs-mbedtls + darwin engine-cc don't
+        #     build cleanly — clang-detected-as-GNU cmake flags, -static-libgcc in
+        #     the test link, a threading postConfigure that can't find its script).
+        #     darwin tar therefore has no encrypted-archive/digest support, as
+        #     before this convergence; core formats + compression are unaffected.
+        #     archive_string.c calls iconv, which GNU libiconvReal (the
+        #     engine-darwin swap) renames to libiconv(); bake libiconvReal into
+        #     buildInputs so the object references libiconv() — the consumer's
+        #     final link carries libiconvReal via darwinIconvFixed. --disable-shared
+        #     via configureFlagsArray (ld64.lld rejects the -soname libtool would
+        #     otherwise pass for the dylib; a plain flag is stripped on darwin).
+        unpinLibarchive = pkgs:
+          let
+            l = nixpkgs.lib;
+            isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
+            isLinux = pkgs.stdenv.hostPlatform.isLinux;
+            static = pkgs.pkgsStatic;
+            noOpenssl = l.filter (d: !(l.hasInfix "openssl" (d.name or "")));
+          in
+          (static.libarchive.override { xarSupport = false; }).overrideAttrs (o: {
+            doCheck = false;
+            buildInputs = noOpenssl (o.buildInputs or [ ])
+              ++ l.optional isDarwin static.libiconvReal;
+            # mbedtls is PROPAGATED (not a plain buildInput) so every consumer's
+            # link environment carries its -L: e2fsprogs' configure copies
+            # libarchive's `-lmbedcrypto` into its own Makefiles (it doesn't read
+            # the .la via libtool at link), so the search path must reach it that
+            # way. Propagation also lands mbedcrypto.a in each consumer's manifest
+            # depInputDirs, so the mega has it available — tar's applet references
+            # it (pulled), e2fsprogs' format_tar-only applet does not (left out).
+            propagatedBuildInputs = noOpenssl (o.propagatedBuildInputs or [ ])
+              ++ l.optional isLinux static.mbedtls;
+            configureFlags = (o.configureFlags or [ ]) ++ [ "--without-openssl" ]
+              ++ [ (if isLinux then "--with-mbedtls" else "--without-mbedtls") ];
+            # libtool records libarchive's optional deps in the installed .la's
+            # dependency_libs as bare `-l` flags with no `-L`; a consumer that
+            # links this store .la (bsdtar, e2fsprogs' debugfs) then hits
+            # "unable to find library" unless it happens to carry that dep in its
+            # own buildInputs. Bake the search paths into the .la so it is
+            # self-contained for every consumer. mbedcrypto only on linux (the
+            # only place --with-mbedtls added it; gating the interpolation keeps
+            # darwin from realising pkgsStatic.mbedtls, which doesn't build there).
+            preFixup = ''
+              sed -i $lib/lib/libarchive.la \
+                -e 's|-llzo2|-L${static.lzo}/lib -llzo2|'
+            '' + l.optionalString isLinux ''
+              sed -i $lib/lib/libarchive.la \
+                -e 's|-lmbedcrypto|-L${l.getLib static.mbedtls}/lib -lmbedcrypto|'
+            '';
+          } // l.optionalAttrs isDarwin {
+            preConfigure = (o.preConfigure or "") + ''
+              configureFlagsArray+=("--disable-shared")
+            '';
+          });
+
         # Strip `--enable-static`/`--disable-shared` from configureFlags on
         # darwin. Many GNU-ish configure.ac (dash, htop) translate
         # `--enable-static` into `LDFLAGS=-static`, which breaks every subsequent
