@@ -1502,8 +1502,15 @@
           , runtimeStage ? null
           , stripCmd ? null
           , cosmoSymtabTrim ? false
+          , removeReferences ? [ ]  # name-substring patterns whose store refs are
+                                    # DEAD baked datadir/helper paths (never reached
+                                    # at runtime in the standalone binary); scrub them
+                                    # so the 0-ref invariant holds. Opt-in — [] leaves
+                                    # the drv byte-identical. See mkStandaloneFlake's
+                                    # `multicall.removeReferences`.
           }: base:
           let
+            nukeRefs = removeReferences != [ ];
             outs = base.outputs or [ "out" ];
             binOutputName =
               if builtins.elem "bin" outs then "bin"
@@ -1526,7 +1533,8 @@
                 pkgs.buildPackages.zstd
               ]
               ++ nixpkgs.lib.optional man pkgs.buildPackages.python3Minimal
-              ++ nixpkgs.lib.optional cosmoSymtabTrim pkgs.buildPackages.zip;
+              ++ nixpkgs.lib.optional cosmoSymtabTrim pkgs.buildPackages.zip
+              ++ nixpkgs.lib.optional nukeRefs pkgs.buildPackages.removeReferencesTo;
               # Carry the base passthru (notably `module` for a multicall fold and
               # version/pname) so the mega manifest and withLicense/withDescription
               # still resolve against the shipped drv.
@@ -1548,7 +1556,31 @@
                 if [ -f "${binOut}/bin/$__unpin_v" ]; then
                   cp "${binOut}/bin/$__unpin_v" "$out/bin/$__unpin_v"
                   chmod +w "$out/bin/$__unpin_v"
-                  ${strip} "$out/bin/$__unpin_v"
+                  ${strip} "$out/bin/$__unpin_v"${nixpkgs.lib.optionalString nukeRefs ''
+
+                    # Scrub DEAD store refs: these are baked datadir/helper path
+                    # constants (glib localedir, libX11 compose/locale, dbus-launch,
+                    # the package's own install libdir) inlined from the deps — the
+                    # code is statically linked in, so the strings are never reached
+                    # at runtime in this self-contained binary, yet Nix counts them as
+                    # runtime refs and drags their whole (build) closure. Discover the
+                    # matching store paths IN the binary and rewrite their hash so the
+                    # ref (and its closure) drops, leaving behaviour unchanged. Runs
+                    # BEFORE the man/alias ZIP embed (that data carries no store paths).
+                    # This whole block is gated by `optionalString nukeRefs` glued to
+                    # the strip line above: with removeReferences = [] it is "", so the
+                    # buildPhase — and the drv — is byte-identical to before.
+                    for __unpin_p in $(grep -aoE '/nix/store/[a-z0-9]{32}-[^ "'"'"'()]*' "$out/bin/$__unpin_v" \
+                         | sed -E 's#(/nix/store/[a-z0-9]{32}-[a-zA-Z0-9._+-]+).*#\1#' | sort -u); do
+                      for __unpin_pat in ${nixpkgs.lib.concatMapStringsSep " " nixpkgs.lib.escapeShellArg removeReferences}; do
+                        case "$__unpin_p" in
+                          *"$__unpin_pat"*)
+                            remove-references-to -t "$__unpin_p" "$out/bin/$__unpin_v" \
+                              && echo "unpinEmbedWrap: scrubbed dead ref $__unpin_p (matched '$__unpin_pat')" >&2
+                            break ;;
+                        esac
+                      done
+                    done''}
                   __unpin_bins+=("$out/bin/$__unpin_v")
                 fi
               done
@@ -2393,6 +2425,10 @@ CBODY
             # closure surfacing musl's libc.a must not clash with it).
             depInputDirs = nixpkgs.lib.unique
               (nixpkgs.lib.concatMap (m: m.depInputDirs or [ ]) modules);
+            # Union of dead-ref scrub patterns across folded modules (see
+            # unpinEmbedWrap's removeReferences). Applied to the mega binary.
+            removeReferences = nixpkgs.lib.unique
+              (nixpkgs.lib.concatMap (m: m.removeReferences or [ ]) modules);
             # Shell prelude (shared by both builders) that fills a `autodeps`
             # array from depInputDirs, filtering the libc split archives.
             autoDepsPrelude = ''
@@ -2586,6 +2622,7 @@ CBODY
             aliases = nixpkgs.lib.filter (n: n != name) names;
             man = combinedMan != null;
             manRoot = combinedMan;
+            inherit removeReferences;
             stripCmd = ":";
             runtimeStage =
               if combinedRt == null then null
@@ -3311,7 +3348,7 @@ CBODY
                 # build (passthru.unpinEmbedsMan) — kept working during the migration.
                 useEmbedWrap = !selfFold && !(base.unpinEmbedsMan or false)
                   && (embedMan || runtimeEmbedNative != null);
-                nativeEmbedOpts = { primary = binName; man = embedMan; }
+                nativeEmbedOpts = { primary = binName; man = embedMan; removeReferences = if multicall == null then [ ] else multicall.removeReferences or [ ]; }
                   // (if runtimeEmbedNative != null then runtimeEmbedNative pkgs base else { });
                 # Legacy in-build man embed, retained ONLY for un-migrated
                 # unpinEmbedsMan flakes during the migration (deleted once all 9 VFS
@@ -3407,6 +3444,11 @@ CBODY
                     if r == null then null
                     else if builtins.isFunction r then r pkgs
                     else r;
+                  # Name-substring patterns whose store refs are DEAD baked paths to
+                  # scrub from the shipped binary (single-program via unpinEmbedWrap;
+                  # multi-program/mega via mkMegaMulticall's embed). Empty by default
+                  # → no scrub, drv byte-identical.
+                  removeReferences = multicall.removeReferences or [ ];
                 };
               in
               if wantModule then result // { multicallModule = multicallManifest; } else result;
