@@ -819,7 +819,13 @@
               lib = "${dnsFallbackLib staticPkgs}/lib";
           in if (h.isLinux && (h.isStatic or false))
              then appendLdFlags drv
-               ("--wrap=getaddrinfo --wrap=freeaddrinfo -L${lib} -l:libunpindns.a -lc")
+               # Short `-lunpindns`, NOT `-l:libunpindns.a`. The cc-wrapper
+               # `-Wl,`-wraps each NIX_LDFLAGS token; the engine clang lowers the
+               # short `-Wl,-l<name>` form (like `-Wl,-lc`) correctly, but drops
+               # the `-l:` colon exact-file form (and bare abs paths) onto ld.lld
+               # verbatim → `cannot open …-Wl,-l:libunpindns.a`. The dns dir is
+               # static-only so `-lunpindns` resolves to libunpindns.a.
+               ("--wrap=getaddrinfo --wrap=freeaddrinfo -L${lib} -lunpindns -lc")
              else if h.isWindows
              then appendLdFlags drv
                # -lws2_32 for the socket calls, -lkernel32 for GetCurrentProcessId,
