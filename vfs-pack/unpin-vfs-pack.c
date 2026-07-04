@@ -63,6 +63,27 @@ static int wants_deflate(const char *rel) {
     return 0;
 }
 
+/* nftw yields entries in readdir order, which is filesystem-dependent -- so the
+ * packed ZIP (and hence the whole self-EOF binary that carries it) would not be
+ * reproducible across build hosts / filesystems. Collect during the walk, then
+ * emit sorted by the ROOTDIR-relative path in LC_ALL=C (strcmp / unsigned-byte)
+ * order. Lexicographic order places a parent dir before its children ("a" <
+ * "a/b"), which is a valid ZIP add order. */
+struct entry { char *fpath; int is_dir; };
+static struct entry *g_ents;
+static size_t g_nents, g_cap;
+
+static const char *rel_of(const char *fpath) {
+    const char *rel = fpath + g_root_len;
+    while (*rel == '/') rel++;
+    return rel;
+}
+
+static int ent_cmp(const void *a, const void *b) {
+    const struct entry *ea = a, *eb = b;
+    return strcmp(rel_of(ea->fpath), rel_of(eb->fpath));
+}
+
 static void *slurp(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -92,22 +113,38 @@ static int add_file(const char *name, const void *data, size_t len) {
     return ok ? 0 : -1;
 }
 
+/* Collect one path during the walk (emit is deferred until after the sort). */
 static int visit(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftw) {
     (void)sb; (void)ftw;
-    const char *rel = fpath + g_root_len;
-    while (*rel == '/') rel++;
-    if (!*rel) return 0;  /* the root itself */
-    if (typeflag == FTW_D) {
+    if (!*rel_of(fpath)) return 0;             /* the root itself */
+    if (typeflag != FTW_D && typeflag != FTW_F) return 0;  /* skip symlinks/specials */
+    if (g_nents == g_cap) {
+        size_t ncap = g_cap ? g_cap * 2 : 64;
+        struct entry *n = realloc(g_ents, ncap * sizeof *n);
+        if (!n) { fprintf(stderr, "oom collecting entries\n"); return 1; }
+        g_ents = n; g_cap = ncap;
+    }
+    char *dup = strdup(fpath);
+    if (!dup) { fprintf(stderr, "oom\n"); return 1; }
+    g_ents[g_nents].fpath = dup;
+    g_ents[g_nents].is_dir = (typeflag == FTW_D);
+    g_nents++;
+    return 0;
+}
+
+/* Add one collected entry to the archive. */
+static int emit_entry(const struct entry *e) {
+    const char *rel = rel_of(e->fpath);
+    if (e->is_dir) {
         /* directory entry (trailing slash, empty) -- lets readdir enumerate */
         char dir[4096];
         snprintf(dir, sizeof dir, "%s/", rel);
         mz_zip_writer_add_mem(&g_zip, dir, "", 0, MZ_NO_COMPRESSION);
         return 0;
     }
-    if (typeflag != FTW_F) return 0;  /* skip symlinks/specials */
     size_t len = 0;
-    void *data = slurp(fpath, &len);
-    if (!data) { fprintf(stderr, "read failed: %s\n", fpath); return 1; }
+    void *data = slurp(e->fpath, &len);
+    if (!data) { fprintf(stderr, "read failed: %s\n", e->fpath); return -1; }
     int rc;
     if (wants_deflate(rel)) {
         rc = mz_zip_writer_add_mem(&g_zip, rel, data, len, MZ_BEST_COMPRESSION) ? 0 : -1;
@@ -116,7 +153,7 @@ static int visit(const char *fpath, const struct stat *sb, int typeflag, struct 
         rc = add_file(rel, data, len);
     }
     free(data);
-    if (rc) { fprintf(stderr, "add failed: %s\n", rel); return 1; }
+    if (rc) { fprintf(stderr, "add failed: %s\n", rel); return -1; }
     return 0;
 }
 
@@ -267,6 +304,12 @@ int main(int argc, char **argv) {
     if (nftw(root, visit, 16, FTW_PHYS) != 0) {
         fprintf(stderr, "walk failed\n"); return 1;
     }
+    qsort(g_ents, g_nents, sizeof *g_ents, ent_cmp);
+    for (size_t i = 0; i < g_nents; i++) {
+        if (emit_entry(&g_ents[i]) != 0) { fprintf(stderr, "walk failed\n"); return 1; }
+        free(g_ents[i].fpath);
+    }
+    free(g_ents);
 
     if (!mz_zip_writer_finalize_archive(&g_zip)) {
         fprintf(stderr, "finalize failed\n"); return 1;
