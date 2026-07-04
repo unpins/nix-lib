@@ -2,10 +2,14 @@
 //
 // Transcribed from compiler-rt/lib/builtins/CMakeLists.txt (LLVM 21.1.8) for
 // the de-risk config: Linux / musl, NOT Apple / Windows / MSVC / Android /
-// Fuchsia / baremetal / GPU; COMPILER_RT_EXCLUDE_ATOMIC_BUILTIN=ON (default,
-// so atomic.c is omitted); COMPILER_RT_ENABLE_SOFTWARE_INT128=OFF. BF16, SME,
+// Fuchsia / baremetal / GPU; COMPILER_RT_ENABLE_SOFTWARE_INT128=OFF. BF16, SME,
 // emupac and the int128-software path are omitted (niche; their absence only
-// yields an undefined ref if actually used, never a miscompile).
+// yields an undefined ref if actually used, never a miscompile). atomic.c IS
+// included (compiler-rt EXCLUDE_ATOMIC_BUILTIN=ON omits it by default): as the
+// sole static runtime we must provide the generic __atomic_load/store libcalls
+// that 32-bit targets emit for 8-byte/misaligned atomics (openssl on
+// i686/armv7l). Dead in the archive on 64-bit, where those atomics are
+// lock-free inline — so 64-bit output stays byte-identical.
 //
 // The per-arch list is GENERIC + GENERIC_TF (+ x86 80-bit) + arch-specific
 // files; the CMake `filter_builtin_sources` rule (an arch-subdir <stem>.{c,S}
@@ -51,6 +55,9 @@ static const char *const kBuiltinsGeneric[] = {
     // non-Apple / non-Fuchsia additions
     "emutls.c",       "enable_execute_stack.c", "eprintf.c", "gcc_personality_v0.c",
     "clear_cache.c",
+    // generic __atomic_* libcalls (compiler-rt omits by default); 32-bit needs
+    // them for 8-byte/misaligned atomics. See header. No arch-subdir shadow.
+    "atomic.c",
 };
 
 // GENERIC_TF_SOURCES (203-230) — the 128-bit IEEE-quad (TFmode) soft-float
