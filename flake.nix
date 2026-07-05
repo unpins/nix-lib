@@ -3009,6 +3009,17 @@ CBODY
           # man (codec libs, coreutils/busybox) skip gracefully. Set false to
           # opt a package out.
           , embedMan ? true
+          # Dead-store-ref scrub patterns for the NATIVE unpinEmbedWrap, for
+          # packages that DON'T carry an engine `multicall` attr (single-binary or
+          # cppRenameMulticall folds like acl/brotli/cpio). Same semantics as
+          # `multicall.removeReferences` (name-substring patterns; opt-in; []
+          # leaves the drv byte-identical) — this is just the reachable spelling
+          # when there is no `multicall` attr to hang it on (that attr triggers the
+          # engine module path). Unioned with multicall.removeReferences below.
+          # Use for baked datadir constants the static binary never reaches at
+          # runtime (e.g. autotools' own $out/share/locale from NLS). See
+          # unpinEmbedWrap's `removeReferences`.
+          , removeReferences ? [ ]
           # Override the man source for the windows/cosmo binary. By default the
           # cross build (which ships no man) grafts the version-locked pages from
           # the x86_64-linux nixpkgs build, which over-harvests (ffmpeg's
@@ -3354,7 +3365,7 @@ CBODY
                 # build (passthru.unpinEmbedsMan) — kept working during the migration.
                 useEmbedWrap = !selfFold && !(base.unpinEmbedsMan or false)
                   && (embedMan || runtimeEmbedNative != null);
-                nativeEmbedOpts = { primary = binName; man = embedMan; removeReferences = if multicall == null then [ ] else multicall.removeReferences or [ ]; }
+                nativeEmbedOpts = { primary = binName; man = embedMan; removeReferences = removeReferences ++ (if multicall == null then [ ] else multicall.removeReferences or [ ]); }
                   // (if runtimeEmbedNative != null then runtimeEmbedNative pkgs base else { });
                 # Legacy in-build man embed, retained ONLY for un-migrated
                 # unpinEmbedsMan flakes during the migration (deleted once all 9 VFS
