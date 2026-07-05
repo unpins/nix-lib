@@ -37,8 +37,24 @@
         } else {
           NIX_LDFLAGS = (o.NIX_LDFLAGS or "") + " -L${libatomicStub}/lib";
         };
+      # …and the same `-latomic` rides along in the installed `libcrypto.pc` /
+      # `libssl.pc` `Libs.private` (OpenSSL's Configure `ex_libs`). CONSUMERS that
+      # link static openssl via `pkg-config --static` (kmod's PKG_CHECK_MODULES,
+      # curl, …) inherit that flag on their OWN link line, where the openssl-drv
+      # stub above doesn't reach — so each would need its own stub. Strip
+      # `-latomic` from the .pc instead: the `__atomic_*` libcalls resolve from
+      # every engine consumer's compiler-rt builtins (a6a3473 folded atomic.c in),
+      # so the flag is pure dead weight everywhere. One fix, every consumer clean.
+      stripPcAtomic = o: {
+        postInstall = (o.postInstall or "") + ''
+          for pc in "''${dev:-$out}"/lib/pkgconfig/*.pc "$out"/lib/pkgconfig/*.pc; do
+            [ -e "$pc" ] && sed -i 's/ -latomic\b//g' "$pc"
+          done
+          true
+        '';
+      };
     in
     if scope.stdenv.hostPlatform.isAarch32
-    then base.overrideAttrs addStubL
+    then base.overrideAttrs (o: (addStubL o) // (stripPcAtomic o))
     else base;
 }
