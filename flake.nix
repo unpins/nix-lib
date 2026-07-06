@@ -2435,6 +2435,23 @@ CBODY
             # unpinEmbedWrap's removeReferences). Applied to the mega binary.
             removeReferences = nixpkgs.lib.unique
               (nixpkgs.lib.concatMap (m: m.removeReferences or [ ]) modules);
+            # Basenames the auto-derive drops from depInputDirs: a deep closure can
+            # surface a glibc-style libc split (libc.a + friends) that would clash
+            # with the engine/cosmo-provided libc. musl never splits these out, so on
+            # the engine (musl) path the list is defensive — EXCEPT `libcrypt.a`,
+            # which musl also folds into libc.a, so any `libcrypt.a` in a musl closure
+            # is libxcrypt (crypt_gensalt/yescrypt), a real dep some packages (shadow)
+            # fold. A module opts its own libcrypt.a back IN via multicall.keepAuto
+            # Archives; other folds (tcsh/perl, which use musl's plain crypt) keep the
+            # default skip. Union the keeps across modules, subtract from the skip set.
+            keptAutoArchives = nixpkgs.lib.unique
+              (nixpkgs.lib.concatMap (m: m.keepAutoArchives or [ ]) modules);
+            libcSplitArchives = [
+              "libc.a" "libm.a" "libpthread.a" "librt.a" "libdl.a"
+              "libresolv.a" "libutil.a" "libcrypt.a" "libxnet.a" "libnsl.a"
+            ];
+            effectiveSkipArchives =
+              nixpkgs.lib.subtractLists keptAutoArchives libcSplitArchives;
             # Shell prelude (shared by both builders) that fills a `autodeps`
             # array from depInputDirs, filtering the libc split archives.
             autoDepsPrelude = ''
@@ -2443,7 +2460,7 @@ CBODY
                 for a in "$d"/lib/*.a; do
                   [ -e "$a" ] || continue
                   case "$(basename "$a")" in
-                    libc.a|libm.a|libpthread.a|librt.a|libdl.a|libresolv.a|libutil.a|libcrypt.a|libxnet.a|libnsl.a) continue ;;
+                    ${nixpkgs.lib.concatStringsSep "|" effectiveSkipArchives}) continue ;;
                   esac
                   autodeps+=("$a")
                 done
@@ -3074,8 +3091,16 @@ CBODY
           #                    aliases = [ "egrep" "fgrep" ]; } ];
           #     internalArchives = [ "lib/libgreputils.a" ];  # private (gnulib)
           #     depArchives = [ "${pkgs.pkgsStatic.pcre2.out}/lib/libpcre2-8.a" ];
+          #     keepAutoArchives = [ "libcrypt.a" ];  # rescue from the libc-split skip
           #     requires = { };   # cxx/group/frameworks/… overrides
           #   }
+          # `keepAutoArchives` names basenames the auto-derive would otherwise drop as
+          # a glibc-style libc split (see effectiveSkipArchives). musl folds crypt into
+          # libc.a, so a `libcrypt.a` in a musl closure is always libxcrypt (real dep,
+          # crypt_gensalt/yescrypt); a fold that needs it (shadow) rescues its own —
+          # already engine-compiled in the build closure, so it rides as bitcode and
+          # folds on every arch (unlike a hand-passed depArchive, which resolves to the
+          # vanilla GCC-ELF instance and breaks the ppc64le -flto link's inline-PLT).
           # null = unchanged. Linux native only for now. `depArchives` is a
           # passthru reference, not linked into the shipped binary.
           , multicall ? null
@@ -3445,6 +3470,10 @@ CBODY
                   # mega builder globs <dir>/lib/*.a at build time. `depArchives`
                   # stays as an additive override for archives not in the closure.
                   depInputDirs = multicallExternalDepDirs moduleSource;
+                  # Basenames to rescue from the auto-derive's libc-split skip list
+                  # (e.g. "libcrypt.a" for a package that folds libxcrypt). Empty by
+                  # default — only libxcrypt-consuming folds (shadow) set it.
+                  keepAutoArchives = multicall.keepAutoArchives or [ ];
                   # Man source for the mega to MERGE: the built drv's man-bearing
                   # output (split `man`, else out). null when this build ships no
                   # man; the merge skips nulls.
