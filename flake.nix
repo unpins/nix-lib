@@ -737,6 +737,51 @@
             nativeBuildInputs = (o.nativeBuildInputs or [ ]) ++ [ hook ];
           });
 
+        # armv7l (aarch32) engine cross: nothing sets CC_FOR_BUILD, so meson
+        # auto-detects the engine's unprefixed `cc` (an arm-TARGETING clang) as
+        # the BUILD-machine compiler too (CI log: "C compiler for the build
+        # machine: cc (clang 21.1.8)" + "Build machine cpu family: arm"). meson's
+        # cross-sizeof shortcut `_cross_compute_int` then COMPILES a probe with
+        # that build compiler and RUNS it (clike.py:469) — an armv7l binary. On
+        # the aarch64 CI runner there is no arm binfmt, so run() raises
+        # CrossNoRunException "Can not run test applications" (compilers.py:690;
+        # NOT an EnvironmentException, so clike.py's `except` does not swallow it)
+        # → configure dies. glib's `cc.sizeof('char')` is the first to hit it, so
+        # EVERY engine meson package on armv7l is affected. It only "passes"
+        # locally because this x86_64 box has qemu-arm binfmt with the fix-binary
+        # (F) flag that leaks into the sandbox — the in-build qemu we forbid.
+        #
+        # Fix: export CC_FOR_BUILD/CXX_FOR_BUILD = the REAL builder's native
+        # compiler (pkgsBuildBuild.stdenv.cc — aarch64 gcc in CI, x86_64 gcc under
+        # the local helper). meson reads *_FOR_BUILD for the build-machine
+        # compiler (environment.py:65), so the probe is compiled AND run with a
+        # builder-native compiler → runs natively, never qemu; it also makes meson
+        # detect the build cpu as the builder's, so need_exe_wrapper(BUILD) is
+        # False. Only armv7l trips this — it is the sole cross built on a
+        # foreign-arch (aarch64) runner; the x86_64-hosted crosses (i686/ppc64le/
+        # riscv64) already keep a builder-native build compiler.
+        #
+        # Attach per-package via nativeBuildInputs — NEVER touch the global meson
+        # drv (re-hashes the world, see withDarwinMesonSubsystem above). Gated to
+        # aarch32 cross by its enginePkgsStatic call site → strict no-op
+        # (byte-identical) on every other arch and non-meson package.
+        withMesonBuildCC = pkgs: drv:
+          let
+            bp = pkgs.buildPackages;
+            buildCC = pkgs.pkgsBuildBuild.stdenv.cc;
+            hook = bp.makeSetupHook { name = "meson-buildcc-hook"; }
+              (bp.writeText "meson-buildcc-hook.sh" ''
+                _unpinsMesonBuildCC() {
+                  export CC_FOR_BUILD=${buildCC}/bin/cc
+                  export CXX_FOR_BUILD=${buildCC}/bin/c++
+                }
+                preConfigureHooks+=(_unpinsMesonBuildCC)
+              '');
+          in
+          drv.overrideAttrs (o: {
+            nativeBuildInputs = (o.nativeBuildInputs or [ ]) ++ [ hook ];
+          });
+
         # Append to NIX_CFLAGS_LINK (cc-wrapper LINK-time flags),
         # structuredAttrs-aware like appendCFlags. Unlike NIX_LDFLAGS this reaches
         # ONLY $CC-driven links, never a direct `ld -r`, so --gc-sections/--icf
@@ -2863,8 +2908,35 @@ CBODY
                     else { }))
               withBashFix
               (builtins.attrNames autoWiredFixes);
+            # See withMesonBuildCC above. armv7l is the only cross built on a
+            # foreign-arch runner, so it is the only host where meson's build-
+            # machine compiler must be pinned to the native builder. Curated list
+            # of the engine meson packages (same by-name style as autoWiredFixes);
+            # add new meson deps here as the catalog grows. Gated to aarch32 CROSS
+            # → identity overlay (byte-identical) on every other arch; the
+            # `prev ? ${n}` guard skips names absent from a given set, and the
+            # whole branch is lazy so non-aarch32 never forces these attrs.
+            mesonBuildCcPkgs = [
+              "glib"
+              "cairo"
+              "pango"
+              "dav1d"
+              "librsvg"
+              "libopus"
+              "librist"
+              "libbluray"
+              "rubberband"
+            ];
+            withMesonBuildCcFix = withDepFixes.extend
+              (_final: prev:
+                if prev.stdenv.hostPlatform.isAarch32
+                   && prev.stdenv.buildPlatform != prev.stdenv.hostPlatform
+                then builtins.listToAttrs
+                  (map (n: { name = n; value = withMesonBuildCC prev prev.${n}; })
+                    (builtins.filter (n: prev ? ${n}) mesonBuildCcPkgs))
+                else { });
           in
-          withDepFixes;
+          withMesonBuildCcFix;
 
         # The Windows (mingw + cosmo) root nixpkgs and its engine-swapped variant,
         # lifted to lib-level thunks. They are PACKAGE-INDEPENDENT (no pkgsAttr, no
