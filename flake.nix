@@ -2926,6 +2926,11 @@ CBODY
               "librist"
               "libbluray"
               "rubberband"
+              "dbus"
+              "libdrm"
+              "libgudev"
+              "libsysprof-capture"
+              "xorgproto"
             ];
             withMesonBuildCcFix = withDepFixes.extend
               (_final: prev:
