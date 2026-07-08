@@ -348,8 +348,19 @@
             # genuine cross only finds them when prefixed (unprefixed left RANLIB
             # empty). The cc-wrapper sources unprefixed `clang`, so `ccUnwrapped`
             # stays unprefixed.
+            # isGNU=true keeps the isGNU-gated wrapper behaviour the engine relies
+            # on (the gnu-binutils-strip wrapper; no darwin ZERO_AR_DATE). isLLVM=true
+            # is ALSO truthful — every tool here is an LLVM drop-in (ld.lld, llvm-ar,
+            # llvm-windres, …) — and it is what nixpkgs recipes read to apply their
+            # LLVM-appropriate handling: without it a recipe like freetype skips its
+            # own `RC=""` guard (`!isWindows && bintools.isLLVM`) and then compiles a
+            # Windows .rc via the exposed llvm-windres on a Linux target, which fails.
+            # Passthru-only (stripped before the build) so the wrapper store path is
+            # unchanged; the version-gated isLLVM branches (ncurses/binutils/… need
+            # version≥17) stay off since no bintools version is set → byte-neutral for
+            # the catalog, only freetype's version-less guard flips.
             bintoolsUnwrapped = pkgs.runCommand "unpin-bintools-unwrapped-${target}"
-              { passthru = { isGNU = true; targetPrefix = "${target}-"; }; } ''
+              { passthru = { isGNU = true; isLLVM = true; targetPrefix = "${target}-"; }; } ''
               mkdir -p $out/bin
               mkt() {
                 cat > "$out/bin/${target}-$1" <<EOF
@@ -515,7 +526,19 @@
           # cosmocc's APE, static-musl ELF strips fine, so strippedOrJoined's
           # final strip applies.
           pkgs.stdenvAdapters.addAttrsToDerivation
-            { dontPatchELF = true; hardeningDisable = [ "all" ]; }
+            ({ dontPatchELF = true; hardeningDisable = [ "all" ]; }
+              # The engine feeds the SDK via SDKROOT inside the cc wrapper (see
+              # darwinEnvSetup), which covers every compile/link. But some nixpkgs
+              # darwin preConfigures read SDKROOT in the BUILD SHELL before any
+              # compile — e.g. compiler-rt's
+              # `-DDARWIN_macosx_OVERRIDE_SDK_VERSION=$(jq .Version $SDKROOT/SDKSettings.json)`
+              # — and apple-sdk (whose setup hook would export SDKROOT shell-wide) is
+              # dropped from extraBuildInputs below to keep its crt hooks out of the
+              # Mach-O link. So also export SDKROOT as a plain build-env var. This is
+              # a bare path (no setup hook), so it re-introduces none of apple-sdk's
+              # crt/-syslibroot machinery. Without it, C++ darwin engine builds fail
+              # to bootstrap their libc++/compiler-rt runtime.
+              // nixpkgs.lib.optionalAttrs isDarwinTarget { SDKROOT = "${pkgs.apple-sdk.sdkroot}"; })
             ((pkgs.overrideCC hostPkgs.stdenv cc).override (old: {
               extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ]) ++ [ seedHook ]
                 ++ nixpkgs.lib.optional captureLinks captureHook;
@@ -2882,11 +2905,32 @@ CBODY
         enginePkgsStaticFor = { pkgs, toolchain }:
           let
             engStdenv = engineStdenvForShared { inherit pkgs toolchain; };
+            # Base (pre-swap) gnu static-musl stdenv — pins pkg-config off the
+            # engine (below). Captured from the pristine pkgs so the pin is an
+            # absolute value the pkgsStatic splice can't re-resolve to engStdenv.
+            baseStaticStdenv = pkgs.pkgsStatic.stdenv;
             engineBashAttrs = [ "bash" "bashInteractive" "bashNonInteractive" ];
             withEngineStdenv = pkgs.pkgsStatic.extend
               (_final: prev:
                 if prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic
-                then { stdenv = engStdenv; }
+                then {
+                  stdenv = engStdenv;
+                  # pkg-config is a BUILD tool (a nativeBuildInput), never linked
+                  # into the shipped binary — so it must not be engine-compiled.
+                  # The set-wide swap would otherwise reach the HOST pkg-config
+                  # that freetype's postInstall embeds in freetype-config
+                  # (`pkgsHostHost.pkg-config`): built with the engine clang its
+                  # bundled glib code hits -Wint-conversion under clang-21 and
+                  # fails, breaking every freetype consumer (poppler, fastfetch…).
+                  # Overriding the top-level attr is defeated by pkgsStatic
+                  # splicing (the wrapper re-resolves its unwrapped C program
+                  # through the swapped stdenv); pin the UNWRAPPED build's stdenv
+                  # to the base gnu one instead — byte-identical to plain nixpkgs
+                  # pkgsStatic, zero effect on shipped code. Same by-name exception
+                  # idiom as the bash/meson/dep fixes below.
+                  pkg-config-unwrapped =
+                    prev.pkg-config-unwrapped.override { stdenv = baseStaticStdenv; };
+                }
                 else { });
             withBashFix = withEngineStdenv.extend
               (_final: prev:

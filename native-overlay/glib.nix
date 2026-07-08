@@ -9,6 +9,13 @@
 # Second fix (glib 2.88.1): `subsystem = host_machine.subsystem()` can't
 # autodetect in cross mode ("Subsystem not defined"). Set `subsystem = 'macos'`
 # in [host_machine] via the same file (both targets are desktop macOS).
+#
+# Third fix (glib 2.88.1): gio/meson.build hard-requires arpa/nameser.h (its
+# `C_IN` resolver check errors out otherwise), but nixpkgs' apple-sdk ships only
+# ftp/inet/telnet/tftp under arpa/ — the DNS resolver headers live in the
+# separate `darwin.libresolv`. The normal darwin stdenv pulls them via apple-sdk's
+# setup hook, but the engine drops apple-sdk (SDKROOT instead), so add libresolv
+# explicitly. Headers only: the res_*/ns_* symbols are in libSystem (allow-listed).
 { lib }:
 pkgs:
 if pkgs.stdenv.hostPlatform.isDarwin then
@@ -19,6 +26,7 @@ if pkgs.stdenv.hostPlatform.isDarwin then
     cpuFamily = if hp.isAarch64 then "aarch64" else "x86_64";
   in
   pkgs.glib.overrideAttrs (oa: {
+    buildInputs = (oa.buildInputs or [ ]) ++ [ pkgs.darwin.libresolv ];
     preConfigure = (oa.preConfigure or "") + ''
       cat > "$NIX_BUILD_TOP/objc-cross.conf" <<EOF
       [binaries]
