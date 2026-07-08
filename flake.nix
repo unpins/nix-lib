@@ -2963,6 +2963,7 @@ CBODY
             mesonBuildCcPkgs = [
               "glib"
               "cairo"
+              "pixman"
               "pango"
               "dav1d"
               "librsvg"
