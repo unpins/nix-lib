@@ -3437,12 +3437,28 @@ CBODY
                 # This is the engine-self-fold replacement for `darwin = false`:
                 # instead of opting darwin OUT of the module, it opts it in with
                 # the right (smaller) list. Windows keeps `multicall.programs`.
-                mcPrograms =
+                mcProgramsRaw =
                   if multicall != null
                      && pkgs.stdenv.hostPlatform.isDarwin
                      && multicall ? darwinPrograms
                   then multicall.darwinPrograms
                   else (if multicall == null then [ ] else multicall.programs);
+                # A program may be built on some targets only — binutils' gold/dwp
+                # have no RISC-V backend (gold's configure.tgt omits it; gold is
+                # frozen, superseded by lld), so binutils' own configure skips them
+                # on a riscv64 host and no `ld-new`/`dwp` link sidecar exists there.
+                # A `supportedTarget` predicate (target `hostPlatform` → bool) drops
+                # such a program on unsupported targets. It filters the ONE list that
+                # feeds the module hook, the manifest applets AND the dispatcher
+                # (all `mcPrograms` below), so they stay consistent — the fold then
+                # matches exactly what upstream built (gold/dwp on the 5 arches that
+                # have it, skipped on riscv64), with no missing-sidecar hard-error
+                # and no dangling dispatcher entry. Purely eval-time (no IFD): the
+                # arch is a target-platform property, so evaluating the flake never
+                # forces a build. Default (no predicate) = always included.
+                mcPrograms = nixpkgs.lib.filter
+                  (p: (p.supportedTarget or (_: true)) pkgs.stdenv.hostPlatform)
+                  mcProgramsRaw;
                 # The bitcode module rides the engine's -flto objects. Linux and
                 # darwin both default-on (the darwin standalone already builds
                 # regardless); a package sets multicall.darwin = false to opt out.
