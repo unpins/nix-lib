@@ -73,6 +73,116 @@
             inherit unpinPackTool;
           };
 
+        # Shared engine plumbing for the Perl-family packages (unpins/perl,
+        # unpins/biber). Under the unpin-llvm engine pkgsStatic is the bitcode
+        # set, so perl + its XS/deps are all LLVM bitcode and the binary is
+        # LTO-linked. The VFS that serves the embedded /zip @INC can't be bound by
+        # `ld --wrap` or `objcopy --redefine-sym` (neither touches a bitcode
+        # symtab), so perl's libc file-op refs are rewritten IN THE IR
+        # (`llvm opt -S | sed | llvm opt`). `vfsSed` is the fix-prone core — the
+        # darwin stat/lstat arch asymmetry lives there — so it gets ONE home here
+        # instead of a copy in each flake that can silently drift.
+        #
+        # `introspectName` is the writeShellScript name for the bitcode-lowering
+        # helper (per-package so hoisting keeps each cross drv byte-identical).
+        enginePerl =
+          { pkgs
+          , sp ? pkgs.pkgsStatic
+          , introspectName
+          }:
+          let
+            multitool =
+              "${unpinToolchain sp.stdenv.buildPlatform.system}/bin/llvm";
+          in
+          {
+            inherit multitool;
+
+            # perl-cross introspects target objects with readelf/objdump; under
+            # the engine those are LTO bitcode ("not supported"). Lower a bitcode
+            # arg to a native ELF object for the triple embedded in the module
+            # before handing it to the real `llvm` tool; ELF args pass through.
+            # -target is mandatory (else clang lowers to the x86_64 host -> wrong
+            # sizes/endian). $1 = subtool; the object is perl-cross's last arg.
+            # Build-host tool, cross only.
+            bcIntrospect = sp.buildPackages.writeShellScript introspectName ''
+              mt=${multitool}
+              tool=$1; shift
+              n=$#
+              obj=''${!n}
+              if [ -f "$obj" ] && [ "$(od -An -tx1 -N4 "$obj" 2>/dev/null | tr -d ' \n')" = 4243c0de ]; then
+                triple=$("$mt" opt -S "$obj" -o - 2>/dev/null \
+                  | sed -n 's/^target triple = "\(.*\)"/\1/p' | head -1)
+                low=$(mktemp -d)/lowered.o
+                if [ -n "$triple" ] && "$mt" clang -target "$triple" -fno-lto -x ir -c "$obj" -o "$low" 2>/dev/null; then
+                  set -- "''${@:1:$((n - 1))}" "$low"
+                fi
+              fi
+              exec "$mt" "$tool" "$@"
+            '';
+
+            # The engine bitcode shell helpers, interpolated into buildPhase after
+            # `MT=<multitool>` is set. isbc + vfsSed + bcrewrite are used by every
+            # Perl-family build; the archive variants (vfsArchiveFns) only by
+            # biber.
+            vfsShellFns = ''
+              # bitcode magic: raw 4243c0de (linux) / darwin-wrapped dec0170b.
+              isbc() { case "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" in 4243c0de|dec0170b) return 0;; *) return 1;; esac; }
+              # Rename perl's libc file-op refs to the VFS shims. @sym is a FUNCTION
+              # symbol (sigil differs from %struct.stat), so @stat never touches
+              # `struct stat`. darwin's SDK emits raw-label imports and the
+              # stat/lstat spelling is ARCH-specific: x86_64 carries the legacy
+              # inode32 ABI so the alias is `_stat$INODE64`, but arm64 was inode64
+              # from day one so it's the PLAIN `_stat` (open/access are plain on
+              # both arches). Miss the plain `_stat`/`_lstat` and perl's require
+              # stat()s the real FS for /zip modules -> ENOENT -> "Can't locate
+              # strict.pm" on arm64-darwin only. 32-bit musl's _REDIR_TIME64
+              # renames stat->__stat_time64. Rules that miss a given IR are no-ops.
+              vfsSed() {
+                sed -i \
+                  -e 's/@open\b/@unpinvfs_open/g' \
+                  -e 's/@stat\b/@unpinvfs_stat/g' \
+                  -e 's/@lstat\b/@unpinvfs_lstat/g' \
+                  -e 's/@access\b/@unpinvfs_access/g' \
+                  -e 's/@__stat_time64\b/@unpinvfs_stat/g' \
+                  -e 's/@__lstat_time64\b/@unpinvfs_lstat/g' \
+                  -e 's/@"\\01__stat_time64"/@unpinvfs_stat/g' \
+                  -e 's/@"\\01__lstat_time64"/@unpinvfs_lstat/g' \
+                  -e 's/@"\\01_open"/@unpinvfs_open/g' \
+                  -e 's/@"\\01_access"/@unpinvfs_access/g' \
+                  -e 's/@"\\01_stat"/@unpinvfs_stat/g' \
+                  -e 's/@"\\01_lstat"/@unpinvfs_lstat/g' \
+                  -e 's/@"\\01_stat\$INODE64"/@unpinvfs_stat/g' \
+                  -e 's/@"\\01_lstat\$INODE64"/@unpinvfs_lstat/g' \
+                  "$1"
+              }
+              bcrewrite() { $MT opt -S "$1" -o "$1.ll"; vfsSed "$1.ll"; $MT opt "$1.ll" -o "$1"; rm -f "$1.ll"; }
+            '';
+
+            # Archive-level variants, biber only (perl rewrites libperl.a members
+            # by hand). bcrewriteArchive rewrites every bitcode member then repacks
+            # with the bitcode-aware llvm ar; weakenArchive is the engine analogue
+            # of objcopy --weaken-symbol (prepend `weak` to the matching define).
+            vfsArchiveFns = ''
+              bcrewriteArchive() {
+                local a; a=$(readlink -f "$1"); local d; d=$(mktemp -d)
+                ( cd "$d" && $MT ar x "$a" )
+                for o in "$d"/*; do [ -f "$o" ] || continue; isbc "$o" && bcrewrite "$o"; done
+                rm -f "$1" && $MT ar rcs "$1" "$d"/*
+              }
+              weakenArchive() {  # $1 = archive, $2 = symbol
+                local a; a=$(readlink -f "$1"); local d; d=$(mktemp -d)
+                ( cd "$d" && $MT ar x "$a" )
+                for o in "$d"/*; do
+                  [ -f "$o" ] || continue; isbc "$o" || continue
+                  $MT opt -S "$o" -o "$o.ll"
+                  sed -i -E "/@$2\(/ s/^define /define weak /" "$o.ll"
+                  $MT opt "$o.ll" -o "$o"; rm -f "$o.ll"
+                done
+                rm -f "$1" && $MT ar rcs "$1" "$d"/*
+              }
+            '';
+          };
+
         # mkUnpinStdenv (route A: bespoke, no cc-wrapper). Returns
         # `{ sysroot, unpinCC, cc, mkDerivation }` (mkDerivation = stdenvNoCC +
         # this toolchain).
