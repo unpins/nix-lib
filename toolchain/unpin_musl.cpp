@@ -1385,15 +1385,9 @@ Variant parseVariant(ArrayRef<const char *> Args, const std::string &triple) {
 bool isLinkStep(ArrayRef<const char *> Args) {
   for (size_t i = 1; i < Args.size(); ++i) {
     StringRef a = Args[i];
-    // `-r` is a relocatable/partial link: it combines objects into ONE .o, it
-    // does NOT produce a final image. Injecting the self-contained-image front
-    // (crt + -lSystem/entry + -fuse-ld=lld) into it is wrong — ld64.lld has no
-    // `-r` and the forced entry point makes it demand `main` ("undefined
-    // symbol: main", e.g. Apple's Csu crt1.o build). Let clang drive `-r` with
-    // its default `ld` (cctools on darwin, which does support `-r`).
     if (a == "-c" || a == "-S" || a == "-E" || a == "-fsyntax-only" ||
-        a == "-r" || a == "--version" || a == "-###" || a == "-v" ||
-        a == "-dumpversion" || a.starts_with("-print"))
+        a == "--version" || a == "-###" || a == "-v" || a == "-dumpversion" ||
+        a.starts_with("-print"))
       return false;
   }
   return true;
