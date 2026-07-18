@@ -639,6 +639,20 @@
                 preConfigureHooks+=(unpinSeedSysrootCache)
                 preBuildHooks+=(unpinSeedSysrootCache)
               '');
+            # Darwin only: point XDG_CACHE_HOME at a writable build-local dir at hook
+            # SOURCE time (before any phase). seedHook above only exports it in
+            # preConfigureHooks, which runHook fires AFTER the package's own preConfigure
+            # attr — and a preConfigure/postPatch attr can compile+link before then (e.g.
+            # x265 multibitdepth's `cmake -B build-10bits`). On darwin the linker builds
+            # its macOS sysroot on demand into XDG_CACHE_HOME; unset, it falls back to
+            # $HOME/.cache = /homeless-shelter (unwritable), the sysroot build fails, and
+            # the link degrades to ELF ld.lld which rejects the Mach-O flags. Separate
+            # hook (not folded into seedHook) so the linux seedHook text stays byte-identical.
+            earlyCacheHook = pkgs.makeSetupHook { name = "unpin-early-cache-home"; }
+              (pkgs.writeText "unpin-early-cache-home.sh" ''
+                export XDG_CACHE_HOME="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-cache"
+                mkdir -p "$XDG_CACHE_HOME"
+              '');
             captureHook = pkgs.makeSetupHook { name = "unpin-capture-links"; }
               (pkgs.writeText "unpin-capture-links.sh" ''
                 export UNPIN_CAPTURE_LINKS=1
@@ -671,6 +685,7 @@
               // nixpkgs.lib.optionalAttrs isDarwinTarget { SDKROOT = "${pkgs.apple-sdk.sdkroot}"; })
             ((pkgs.overrideCC hostPkgs.stdenv cc).override (old: {
               extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ]) ++ [ seedHook ]
+                ++ nixpkgs.lib.optional isDarwinTarget earlyCacheHook
                 ++ nixpkgs.lib.optional captureLinks captureHook;
               # The darwin stdenv bakes `apple-sdk` into `extraBuildInputs`, so
               # every mkDerivation pulls the SDK's setup hooks (re-export SDKROOT,
