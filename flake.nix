@@ -294,6 +294,21 @@
           let
             sysroot = unpinSysroot { inherit pkgs toolchain; triple = target; inherit optClass native cxx; };
             ltoArg = if lto then " -flto" else "";
+            # musl folds libm (and pthread/rt/dl/…) into libc — there is no separate
+            # libm.a. CMake's `find_library(m)` (e.g. libtiff's FindCMath) doesn't
+            # know that: finding no musl libm, it falls through to the build host's
+            # glibc `libm.so` and hardcodes that absolute path onto the link line.
+            # In the static-musl output those glibc-versioned math symbols (floor@
+            # GLIBC_2.2.5, pow@GLIBC_2.29, …) can't resolve, stay at address 0, and
+            # the first floor()/pow() call jumps to NULL → SIGSEGV at runtime (not a
+            # link error — the symbols are UND in a PIE with no interp). An empty
+            # libm.a (exactly what musl ships) on CMAKE_LIBRARY_PATH is found first,
+            # so find_library(m) resolves to it and the real math comes from libc.
+            # Linux-musl only: darwin has libm in libSystem, mingw ships a real libm.
+            muslLibmStub = pkgs.runCommand "unpin-musl-libm-stub" { } ''
+              mkdir -p $out/lib
+              ${pkgs.buildPackages.binutils}/bin/ar rcs $out/lib/libm.a
+            '';
             # Windows: force fortify off. The engine's mingw CRT has none of the
             # `__*_chk` shims, so any known-size memcpy/strcpy fails to link. `-U`
             # doesn't work (gnulib's config.h `#if !defined _FORTIFY_SOURCE`
@@ -637,6 +652,11 @@
           # final strip applies.
           pkgs.stdenvAdapters.addAttrsToDerivation
             ({ dontPatchELF = true; hardeningDisable = [ "all" ]; }
+              # See muslLibmStub: keep CMake's find_library(m) off the host glibc
+              # libm.so. Linux-musl only (darwin/windows have a real libm).
+              // nixpkgs.lib.optionalAttrs (!isDarwinTarget && !isWinTarget) {
+                CMAKE_LIBRARY_PATH = "${muslLibmStub}/lib";
+              }
               # The engine feeds the SDK via SDKROOT inside the cc wrapper (see
               # darwinEnvSetup), which covers every compile/link. But some nixpkgs
               # darwin preConfigures read SDKROOT in the BUILD SHELL before any
@@ -3015,6 +3035,23 @@ CBODY
         enginePkgsStaticFor = { pkgs, toolchain }:
           let
             engStdenv = engineStdenvForShared { inherit pkgs toolchain; };
+            # libjpeg-turbo: the engine's full -flto MISCOMPILES it — CTest #121
+            # bmpsizetest hangs (its 65500² whole-image path allocs ~12GB) → OOM
+            # (thin-LTO instead segfaults lld; only no-LTO is clean, byte-for-byte
+            # the stock gcc behaviour). Build the SHARED libjpeg with lto=false so
+            # every codec consumer (aom/avif/heif/jxl/chafa/ffmpeg/jpeg-tools/
+            # openjpeg/jbig2/poppler…) gets the correct build. This lives here, not
+            # in native-overlay/libjpeg-turbo.nix, because the lto=false engine
+            # stdenv needs the BASE pkgs the adapter wraps — an autoWire `apply`
+            # only sees the post-swap set. See that overlay file for the rationale.
+            engStdenvNoLto = unpinAdapterStdenv {
+              inherit pkgs toolchain;
+              target = pkgs.pkgsStatic.stdenv.hostPlatform.config;
+              native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
+              cxx = true;
+              lto = false;
+              captureLinks = true;
+            };
             # Base (pre-swap) gnu static-musl stdenv — pins pkg-config off the
             # engine (below). Captured from the pristine pkgs so the pin is an
             # absolute value the pkgsStatic splice can't re-resolve to engStdenv.
@@ -3095,8 +3132,22 @@ CBODY
                   (map (n: { name = n; value = withMesonBuildCC prev prev.${n}; })
                     (builtins.filter (n: prev ? ${n}) mesonBuildCcPkgs))
                 else { });
+            # Swap libjpeg-turbo to the lto=false engine stdenv set-wide (see
+            # engStdenvNoLto above). nixpkgs' `libjpeg` aliases `libjpeg_turbo`;
+            # override the concrete attr and re-point the alias so consumers of
+            # either name get the no-LTO build. Gated isMusl||isStatic like the
+            # other set-wide engine fixes; identity on non-engine hosts.
+            withLibjpegNoLto = withMesonBuildCcFix.extend
+              (_final: prev:
+                if (prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic)
+                   && (prev ? libjpeg_turbo || prev ? libjpeg)
+                then
+                  let lj = (prev.libjpeg_turbo or prev.libjpeg).override { stdenv = engStdenvNoLto; };
+                  in { libjpeg = lj; }
+                     // nixpkgs.lib.optionalAttrs (prev ? libjpeg_turbo) { libjpeg_turbo = lj; }
+                else { });
           in
-          withMesonBuildCcFix;
+          withLibjpegNoLto;
 
         # The Windows (mingw + cosmo) root nixpkgs and its engine-swapped variant,
         # lifted to lib-level thunks. They are PACKAGE-INDEPENDENT (no pkgsAttr, no
