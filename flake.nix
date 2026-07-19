@@ -305,9 +305,15 @@
             # libm.a (exactly what musl ships) on CMAKE_LIBRARY_PATH is found first,
             # so find_library(m) resolves to it and the real math comes from libc.
             # Linux-musl only: darwin has libm in libSystem, mingw ships a real libm.
+            # An empty `ar` archive is just the 8-byte global header — write it
+            # directly rather than shelling out to `ar`. Under a cross set
+            # `buildPackages.binutils` is the target-prefixed wrapper (its bin/ has
+            # `<triple>-ar`, no bare `ar`), so `bin/ar` is exit-127 on every cross
+            # target; the literal header needs no binutils and is byte-identical to
+            # what `ar rcs` emits for a memberless archive.
             muslLibmStub = pkgs.runCommand "unpin-musl-libm-stub" { } ''
               mkdir -p $out/lib
-              ${pkgs.buildPackages.binutils}/bin/ar rcs $out/lib/libm.a
+              printf '!<arch>\n' > $out/lib/libm.a
             '';
             # Windows: force fortify off. The engine's mingw CRT has none of the
             # `__*_chk` shims, so any known-size memcpy/strcpy fails to link. `-U`
@@ -638,20 +644,16 @@
                 }
                 preConfigureHooks+=(unpinSeedSysrootCache)
                 preBuildHooks+=(unpinSeedSysrootCache)
-              '');
-            # Darwin only: point XDG_CACHE_HOME at a writable build-local dir at hook
-            # SOURCE time (before any phase). seedHook above only exports it in
-            # preConfigureHooks, which runHook fires AFTER the package's own preConfigure
-            # attr — and a preConfigure/postPatch attr can compile+link before then (e.g.
-            # x265 multibitdepth's `cmake -B build-10bits`). On darwin the linker builds
-            # its macOS sysroot on demand into XDG_CACHE_HOME; unset, it falls back to
-            # $HOME/.cache = /homeless-shelter (unwritable), the sysroot build fails, and
-            # the link degrades to ELF ld.lld which rejects the Mach-O flags. Separate
-            # hook (not folded into seedHook) so the linux seedHook text stays byte-identical.
-            earlyCacheHook = pkgs.makeSetupHook { name = "unpin-early-cache-home"; }
-              (pkgs.writeText "unpin-early-cache-home.sh" ''
-                export XDG_CACHE_HOME="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-cache"
-                mkdir -p "$XDG_CACHE_HOME"
+                # Also seed NOW, at hook-source time (before any phase). runHook
+                # fires the package's own `preConfigure`/`postPatch` ATTR before the
+                # preConfigureHooks array, and such an attr can already compile+link
+                # (e.g. x265 multibitdepth's `cmake -B build-10bits` runs a
+                # CMakeTestCCompiler probe). Without XDG_CACHE_HOME seeded that early
+                # the linux sysroot copy is missing (ld.lld: cannot open crt1.o /
+                # -lgcc / -lc) and the darwin on-demand sysroot build falls back to
+                # $HOME/.cache = /homeless-shelter and fails. The _unpinCacheSeeded
+                # guard makes the later hook runs no-ops.
+                unpinSeedSysrootCache
               '');
             captureHook = pkgs.makeSetupHook { name = "unpin-capture-links"; }
               (pkgs.writeText "unpin-capture-links.sh" ''
@@ -685,7 +687,6 @@
               // nixpkgs.lib.optionalAttrs isDarwinTarget { SDKROOT = "${pkgs.apple-sdk.sdkroot}"; })
             ((pkgs.overrideCC hostPkgs.stdenv cc).override (old: {
               extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ]) ++ [ seedHook ]
-                ++ nixpkgs.lib.optional isDarwinTarget earlyCacheHook
                 ++ nixpkgs.lib.optional captureLinks captureHook;
               # The darwin stdenv bakes `apple-sdk` into `extraBuildInputs`, so
               # every mkDerivation pulls the SDK's setup hooks (re-export SDKROOT,
