@@ -2604,6 +2604,12 @@ CBODY
           , defaultApplet ? null     # applet name to run bare (null = list)
           , toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
           , target ? pkgs.pkgsStatic.stdenv.hostPlatform.config
+          # Which link backend folds this mega (see `engines` below). NOT derived
+          # from moduleFormat: the cross megas carry `elf-archive` modules but
+          # still link through the unpin-llvm adapter, so format and backend are
+          # independent axes. Defaults to the engine every caller uses today; a
+          # cosmo module set overrides it (cosmo objects can't go through lld).
+          , engine ? "unpin-llvm"
           }:
           let
             renamedName = a: nameOverrides.${a.name} or a.name;
@@ -2724,60 +2730,123 @@ CBODY
             darwinFrameworkFlags = nixpkgs.lib.optionalString
               (isDarwinHost && darwinFrameworks != [ ])
               (nixpkgs.lib.concatMapStringsSep " " (f: "-framework ${f}") darwinFrameworks);
-            adapter = unpinAdapterStdenv {
-              inherit pkgs toolchain target;
-              # Cross mega: with a cross pkgs the link runs through the cross
-              # stdenv (lld cross-links per-arch modules); only the sysroot sanity
-              # run is gated off. toolchain stays build-host (clang -target emits
-              # the host arch).
-              native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
-              cxx = anyCxx;
-              lto = anyBitcode;
+            # The mega's link backend, as DATA. The mega has always had two of them
+            # (unpin-llvm below, cosmocc after it); they differ on a fixed set of
+            # axes, so name the axes once instead of writing one builder per
+            # backend. A third backend (gcc/binutils) is then a record entry, not a
+            # new builder. Selected by module format — the producer side already
+            # tags every manifest (`moduleFormat`).
+            #
+            #   stdenv    which stdenv performs the link
+            #   prelude   shell emitted before autoDepsPrelude
+            #   linkLine  the link itself (comments included, verbatim)
+            #   postLink  shell between the link and `runHook postBuild`
+            #   install   the installPhase body, before `runHook postInstall`
+            #
+            # Each fragment is spliced with no added whitespace, so its own
+            # trailing newline is load-bearing; keep the `''` blocks' relative
+            # indentation as-is.
+            engines = {
+              "unpin-llvm" = {
+                stdenv = unpinAdapterStdenv {
+                  inherit pkgs toolchain target;
+                  # Cross mega: with a cross pkgs the link runs through the cross
+                  # stdenv (lld cross-links per-arch modules); only the sysroot sanity
+                  # run is gated off. toolchain stays build-host (clang -target emits
+                  # the host arch).
+                  native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
+                  cxx = anyCxx;
+                  lto = anyBitcode;
+                };
+                prelude = "";
+                # `bitcodeLibcForce` carries a trailing space and pastes straight
+                # onto `-o` — keep the concatenation exact.
+                linkLine = ''
+                  # stripLinkFlag (-Wl,-s on ELF/PE, -Wl,-x on Mach-O) strips at link
+                  # (after LTO codegen bound the entries) — the entries are dead in the
+                  # symtab once linked, so the shipped binary carries none. The
+                  # UNPIN_META ZIP is embedded post-link by withAliases, so it survives
+                  # the strip. Explicit depArchives + auto-derived (autodeps) ride in
+                  # one group (empty on darwin — ld64 resolves back-refs multi-pass).
+                  ${face} -fuse-ld=lld ${stripLinkFlag} ${bitcodeLibcForce}-o ${binFile} \
+                    multicall/dispatcher.c \
+                    ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
+                    ${groupOpen} ${nixpkgs.lib.concatStringsSep " " nativeArchives} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose} \
+                    ${darwinFrameworkFlags}
+                '';
+                postLink = "";
+                install = ''
+                  install -m755 ${binFile} "$out/bin/${binFile}"
+                '';
+              };
+              # Stock nixpkgs static toolchain (gcc + binutils, ld.bfd). Consumes
+              # the `elf-archive` modules the objcopy/NM emitter
+              # (multicallModuleHook) already produces for every non-unpin-llvm
+              # engine, so the producer side needs nothing new. No -fuse-ld (bfd is
+              # the default), and no bitcodeLibcForce: that one exists to keep a
+              # weak musl `malloc` alive across an -flto link, and there is no LTO
+              # link here. UNBUILT — reachable only by passing engine = "gcc"; the
+              # entry is the seam, not a validated target.
+              "gcc" = {
+                stdenv = pkgs.pkgsStatic.stdenv;
+                prelude = "";
+                linkLine = ''
+                  # -static is belt-and-braces: pkgsStatic's cc-wrapper already links
+                  # static for an isStatic host, and a duplicate is a no-op. Explicit
+                  # depArchives + auto-derived (autodeps) ride in one group.
+                  ${face} -static ${stripLinkFlag} -o ${binFile} \
+                    multicall/dispatcher.c \
+                    ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
+                    ${groupOpen} ${nixpkgs.lib.concatStringsSep " " nativeArchives} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose} \
+                    ${darwinFrameworkFlags}
+                '';
+                postLink = "";
+                install = ''
+                  install -m755 ${binFile} "$out/bin/${binFile}"
+                '';
+              };
+              "cosmocc" = {
+                stdenv = cosmo;
+                prelude = ''
+                  # nullglob-safe per-bucket group: a bucket dir with no archives
+                  # (e.g. bash has no applet archives) contributes nothing.
+                  grp() { local f had=0 out="-Wl,--start-group"
+                          for f in "$1"/*.a; do [ -e "$f" ] || continue; had=1; out="$out $f"; done
+                          [ "$had" = 1 ] && printf -- '%s -Wl,--end-group ' "$out"; }
+                '';
+                linkLine = ''
+                  # explicit depArchives + auto-derived (autodeps) in one group
+                  alldeps=( ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" )
+                  depgrp=()
+                  [ "''${#alldeps[@]}" -gt 0 ] && depgrp=( -Wl,--start-group "''${alldeps[@]}" -Wl,--end-group )
+                  ${face} -O2 -o ${name} multicall/dispatcher.c \
+                    ${cosmoModuleLink} \
+                    "''${depgrp[@]}"
+                '';
+                postLink = ''
+                  ${cosmoApelink} -o ${name}.ape ${name}
+                  ${cosmoApelink} -V ${cosmoVbits} -o ${name}.exe ${name}
+                '';
+                install = ''
+                  install -m755 ${name}.ape "$out/bin/${name}.ape"
+                  install -m755 ${name}.exe "$out/bin/${name}.exe"
+                '';
+              };
             };
+            engineRec = engines.${if cosmoMode then "cosmocc" else engine};
 
-            # ── Bitcode/ELF path: one ELF via the unpin-llvm adapter,
-            # whole-program LTO across modules with lld. ──
-            megaElfDrv = adapter.mkDerivation {
-              inherit name;
-              dontUnpack = true;
-              dontConfigure = true;
-              buildPhase = ''
-                runHook preBuild
-                mkdir -p multicall
-                printf '${nixpkgs.lib.concatStringsSep "\\n" appletLines}\n' > multicall/applets.list
-                ${multicallTableDispatcherC { inherit name; defaultApplet = defaultSan; }}
-                ${autoDepsPrelude}
-                # stripLinkFlag (-Wl,-s on ELF/PE, -Wl,-x on Mach-O) strips at link
-                # (after LTO codegen bound the entries) — the entries are dead in the
-                # symtab once linked, so the shipped binary carries none. The
-                # UNPIN_META ZIP is embedded post-link by withAliases, so it survives
-                # the strip. Explicit depArchives + auto-derived (autodeps) ride in
-                # one group (empty on darwin — ld64 resolves back-refs multi-pass).
-                ${face} -fuse-ld=lld ${stripLinkFlag} ${bitcodeLibcForce}-o ${binFile} \
-                  multicall/dispatcher.c \
-                  ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
-                  ${groupOpen} ${nixpkgs.lib.concatStringsSep " " nativeArchives} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose} \
-                  ${darwinFrameworkFlags}
-                runHook postBuild
-              '';
-              installPhase = ''
-                runHook preInstall
-                mkdir -p "$out/bin"
-                install -m755 ${binFile} "$out/bin/${binFile}"
-                runHook postInstall
-              '';
-            };
-
-            # ── Cosmo path: native cosmocc link in each package's NATIVE order
-            # (objs DIRECT, then applet group, then gnulib group), then apelink to
-            # a fat APE + a thin Windows PE32+. cosmo objects can't go through lld. ──
+            # Cosmo helpers, referenced by the "cosmocc" engine record above.
             cosmo = cosmoStdenv pkgs;
             cosmoApelink = "${cosmo.cosmocc}/bin/apelink";
             cosmoVbits = toString cosmo.platformBits.windows;
             cosmoModuleLink = nixpkgs.lib.concatMapStringsSep " \\\n          "
               (m: ''"${m.moduleObjs}"/*.o $(grp "${m.appletDir}") $(grp "${m.gnulibDir}")'')
               modules;
-            megaCosmoDrv = cosmo.mkDerivation {
+
+            # ONE builder for every backend: the skeleton (dispatcher table,
+            # autodeps, install layout) is backend-independent; engineRec supplies
+            # the link.
+            megaDrv = engineRec.stdenv.mkDerivation {
               inherit name;
               dontUnpack = true;
               dontConfigure = true;
@@ -2786,29 +2855,13 @@ CBODY
                 mkdir -p multicall
                 printf '${nixpkgs.lib.concatStringsSep "\\n" appletLines}\n' > multicall/applets.list
                 ${multicallTableDispatcherC { inherit name; defaultApplet = defaultSan; }}
-                # nullglob-safe per-bucket group: a bucket dir with no archives
-                # (e.g. bash has no applet archives) contributes nothing.
-                grp() { local f had=0 out="-Wl,--start-group"
-                        for f in "$1"/*.a; do [ -e "$f" ] || continue; had=1; out="$out $f"; done
-                        [ "$had" = 1 ] && printf -- '%s -Wl,--end-group ' "$out"; }
-                ${autoDepsPrelude}
-                # explicit depArchives + auto-derived (autodeps) in one group
-                alldeps=( ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" )
-                depgrp=()
-                [ "''${#alldeps[@]}" -gt 0 ] && depgrp=( -Wl,--start-group "''${alldeps[@]}" -Wl,--end-group )
-                ${face} -O2 -o ${name} multicall/dispatcher.c \
-                  ${cosmoModuleLink} \
-                  "''${depgrp[@]}"
-                ${cosmoApelink} -o ${name}.ape ${name}
-                ${cosmoApelink} -V ${cosmoVbits} -o ${name}.exe ${name}
-                runHook postBuild
+                ${engineRec.prelude}${autoDepsPrelude}
+                ${engineRec.linkLine}${engineRec.postLink}runHook postBuild
               '';
               installPhase = ''
                 runHook preInstall
                 mkdir -p "$out/bin"
-                install -m755 ${name}.ape "$out/bin/${name}.ape"
-                install -m755 ${name}.exe "$out/bin/${name}.exe"
-                runHook postInstall
+                ${engineRec.install}runHook postInstall
               '';
             };
           in
@@ -2867,7 +2920,7 @@ CBODY
                 cp -rL --no-preserve=mode ${combinedRt}/. "$__unpin_stage/"
                 chmod -R u+w "$__unpin_stage" 2>/dev/null || true
               '';
-          } (if cosmoMode then megaCosmoDrv else megaElfDrv);
+          } megaDrv;
 
         # Why not overlays for per-package fixes? `appendOverlays` invalidates
         # `pkgsBuildHost.stdenv` → cascade rebuild of compiler-rt-libc-static etc.
