@@ -322,6 +322,41 @@
             # the wrapper's `=2`) leaves it DEFINED so gnulib's guard stays false.
             # Empty on Linux.
             winFortifyOff = nixpkgs.lib.optionalString isWinTarget " -D_FORTIFY_SOURCE=0";
+            # darwin: give every internal-linkage symbol a module-unique name.
+            #
+            # Under full LTO all bitcode merges into one module, and LLVM's IR
+            # linker renames only INTERNAL symbols on a clash — an external
+            # definition always keeps the name. On linux the engine compiles musl
+            # to bitcode, so libc's own external `close`/`open`/… are in the merged
+            # module, win their names, and every file-static homonym is renamed
+            # away. On darwin libc is libSystem, outside the LTO: the module holds
+            # a bare `declare i32 @close(i32)` and NO external definition, so a
+            # file-static `close()` keeps the name and the declaration binds to it.
+            # ffmpeg's `file_close()` then passed a file descriptor to a codec's
+            # destructor — `movq (%rdi), %rbx` on rdi=3, SIGSEGV — while still
+            # writing correct output, so the symptom was exit 139 only on commands
+            # that open a file.
+            #
+            # This is a CLASS, not an instance: ffmpeg's apv_parser.c and libvmaf's
+            # six feature extractors each define a static `close`. Only one keeps
+            # the bare name at a time, so renaming the culprit just hands the name
+            # to the next definition — verified, twice. `-funique-internal-linkage-
+            # names` appends a module-unique suffix to every internal symbol
+            # (`_close` → `__ZL5closePv.__uniq.<hash>`), so no internal can collide
+            # with — or capture — an external declaration, whatever the package.
+            #
+            # Compile steps only: on a pure link clang reports it as
+            # `-Wunused-command-line-argument`, which deps that build with -Werror
+            # turn fatal (same trap `-static-libgcc` sprang on cjson/mbedtls).
+            # Presence of a source-file argument is the discriminator. darwin-gated,
+            # so every non-darwin target emits a byte-identical wrapper script.
+            uniqNamesProbe = nixpkgs.lib.optionalString isDarwinTarget ''
+              __uniq=""
+              for __a in "\$@"; do case "\$__a" in
+                *.c|*.cc|*.cpp|*.cxx|*.C|*.m|*.mm) __uniq=" -funique-internal-linkage-names";;
+              esac; done
+            '';
+            uniqNamesArg = nixpkgs.lib.optionalString isDarwinTarget "\\$__uniq";
             # darwin: feed the packaged macOS SDK via SDKROOT (the engine clang
             # honours it as `-isysroot`, then links the SDK's libSystem +
             # Frameworks). BUILD-time dep, cached; shipped binaries stay 0-ref
@@ -462,7 +497,7 @@
                   set -- "\$@" "\$__a"
                 done
               fi
-              ${darwinEnvSetup}exec ${toolchain}/bin/llvm $2 -target ${target} -D__STDC_ISO_10646__=201706L${darwinStubFlag} "\$@" ${optClass}${winFortifyOff}\$__lto
+              ${uniqNamesProbe}${darwinEnvSetup}exec ${toolchain}/bin/llvm $2 -target ${target} -D__STDC_ISO_10646__=201706L${darwinStubFlag} "\$@" ${optClass}${winFortifyOff}\$__lto${uniqNamesArg}
               EOF
                 chmod +x "$out/bin/$1"
               }
@@ -522,6 +557,18 @@
                 # byte-identical to the validated linux/windows sets.
                 mkt install_name_tool install-name-tool ; mkt install-name-tool install-name-tool
                 mkt lipo lipo ; mkt otool otool ; mkt dsymutil dsymutil
+                # …and re-point `ld` at the Mach-O lld. `ld.lld` is the ELF driver;
+                # on a darwin target it rejects every Mach-O flag the driver emits
+                # ("unknown argument '-arch'", "-syslibroot: Is a directory"). The
+                # engine's own cc reaches ld64.lld through the toolchain, so this
+                # only bites when something else resolves the linker BY NAME —
+                # clang searches PATH for `<triple>-ld` before plain `ld`, so a
+                # compiler paired with cctools/ld64 (the darwin CC_FOR_BUILD) still
+                # picks this shim up and links with the wrong flavour. meson then
+                # reports it as "Compiler for language c for the build machine not
+                # found" (fribidi's gen.tab needs one). Darwin-gated; ELF/PE
+                # targets keep ld.lld byte-identical.
+                mkt ld ld64.lld ; mkt ld.lld ld64.lld ; mkt ld64.lld ld64.lld
               ''}
             '';
             # Wrap from `pkgsStatic.buildPackages`, not `pkgsStatic` directly:
@@ -660,6 +707,34 @@
                 export UNPIN_CAPTURE_LINKS=1
                 export UNPIN_LINK_DIR="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-links"
               '');
+            # nixpkgs' makeStaticDarwin adapter appends `-static-libgcc` to
+            # NIX_CFLAGS_LINK whenever `stdenv.cc.isGNU` — and the engine cc claims
+            # GNU on purpose (see (1) in the header). The adapter re-reads
+            # `stdenv.cc` AFTER the overrideCC below, so darwin pkgsStatic hands
+            # every engine derivation a flag ld64 never had; clang answers
+            # `argument unused during compilation` on every link. Invisible until a
+            # package makes that warning fatal — and three do. cjson and mbedtls
+            # build their demos/tests with -Werror. Worse, svt-av1's `check_flag`
+            # probes ADD `-Werror=unused-command-line-argument`, so EVERY probe
+            # reported "No" (even `-Wall`): `-mavx2` never reached the ASM_AVX2
+            # sources and the intrinsics refused to inline. Drop the flag instead of
+            # patching each package: it means nothing on Mach-O, so this changes no
+            # link — only what clang has to complain about.
+            dropStaticLibgccHook = pkgs.makeSetupHook
+              { name = "unpin-drop-static-libgcc"; }
+              (pkgs.writeText "unpin-drop-static-libgcc.sh" ''
+                unpinDropStaticLibgcc() {
+                  if [ -n "''${NIX_CFLAGS_LINK:-}" ]; then
+                    export NIX_CFLAGS_LINK="''${NIX_CFLAGS_LINK//-static-libgcc/}"
+                  fi
+                }
+                preConfigureHooks+=(unpinDropStaticLibgcc)
+                preBuildHooks+=(unpinDropStaticLibgcc)
+                # Also now: a package's own preConfigure ATTR runs before the
+                # preConfigureHooks array and can already probe flags (svt-av1's
+                # cmake does), same ordering trap seedHook documents above.
+                unpinDropStaticLibgcc
+              '');
           in
           # dontPatchELF: static-musl has no interp/RPATH to touch.
           # hardeningDisable=all: match route-A's minimal flag set (fortify needs
@@ -687,7 +762,8 @@
               // nixpkgs.lib.optionalAttrs isDarwinTarget { SDKROOT = "${pkgs.apple-sdk.sdkroot}"; })
             ((pkgs.overrideCC hostPkgs.stdenv cc).override (old: {
               extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ]) ++ [ seedHook ]
-                ++ nixpkgs.lib.optional captureLinks captureHook;
+                ++ nixpkgs.lib.optional captureLinks captureHook
+                ++ nixpkgs.lib.optional isDarwinTarget dropStaticLibgccHook;
               # The darwin stdenv bakes `apple-sdk` into `extraBuildInputs`, so
               # every mkDerivation pulls the SDK's setup hooks (re-export SDKROOT,
               # -isysroot/-syslibroot, Csu crt) that fight the engine's crt-less
@@ -2117,6 +2193,65 @@ CBODY
                                     # hand-listed objs/internalArchives
           , stripDllexport ? false  # mingw: strip __declspec(dllexport) before
                                     # internalize (see stripStep) — off elsewhere
+          , foldSharedArchives ? false # multi-program packages whose programs
+                                    # share the same private static archives
+                                    # (ffmpeg/ffprobe → libav*): fold the shared
+                                    # archives ONCE instead of per-program. Opt-in;
+                                    # off keeps the per-program path byte-identical.
+          , machoAsm ? false        # darwin: feed the `-r` fold a BITCODE-ONLY copy
+                                    # of the shared archives, taken whole.
+                                    #
+                                    # That fold runs the ELF `ld.lld`, which
+                                    # cannot read the target's Mach-O objects and
+                                    # skips them silently ("archive member 'x.o'
+                                    # is neither ET_REL nor LLVM bitcode"). They
+                                    # are rescued into the native sidecar, but
+                                    # every reference they made is missing from
+                                    # the link — so a BITCODE member that only the
+                                    # asm needs is never demanded and lands in
+                                    # neither output. ffmpeg's
+                                    # `libavcodec/x86/constants.c` is exactly
+                                    # that, and every `ff_pw_*`/`ff_pb_*` went
+                                    # undefined at the mega link.
+                                    #
+                                    # Two things that do NOT work, both tried:
+                                    # naming the missing symbols with `-u` (the
+                                    # ELF driver and Mach-O disagree on the
+                                    # leading underscore, so no one spelling
+                                    # matches both sides), and whole-archiving the
+                                    # archives as they are (that finally makes
+                                    # lld LOAD the Mach-O members instead of
+                                    # skipping them: `not an ELF file`, fatal).
+                                    # Hence bitcode-only: no name has to match,
+                                    # and no Mach-O ever reaches the ELF driver.
+                                    # The extra members cost nothing in the end —
+                                    # internalize + DCE drop whatever the entry
+                                    # points do not reach.
+                                    #
+                                    # It also switches the two nm scrapes below to
+                                    # Mach-O spelling, which differs twice over.
+                                    # `llvm-nm` prints the leading underscore the
+                                    # object file carries (`_ff_pw_1`) while LLVM
+                                    # IR — and `-internalize-public-api-list` —
+                                    # names it bare, so both scrapes are demangled.
+                                    # And for an undefined Mach-O symbol nm emits
+                                    # the NAME ALONE, with no `U` type column, so
+                                    # the ELF `$1=="U"` filter silently yields an
+                                    # empty list: the keeplist stayed at the bare
+                                    # entry points and internalize made every
+                                    # asm-referenced global local (`s` in nm) —
+                                    # same undefined symbols as before the fix,
+                                    # from a different cause. Read the archive with
+                                    # `nm --undefined-only` before trusting either
+                                    # spelling: the `multicall(shared): keeping …`
+                                    # line below is the cheap proof it matched.
+                                    #
+                                    # NB: keep every addition to the emitted
+                                    # script inside `optionalString machoAsm`,
+                                    # SHELL COMMENTS INCLUDED — the script text is
+                                    # what the drv hashes, so an explanatory line
+                                    # in the `''` block rebuilds every ELF target.
+                                    # Hence this note lives out here.
           }: drv:
           let
             san = n: nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ] n;
@@ -2244,6 +2379,64 @@ CBODY
                 ${llvm} opt -passes=internalize -internalize-public-api-list="$keeplist" \
                   ${internalizeIn} -o multicall/mod_${san p.name}.bc
               '';
+
+            # ── option A: shared-archive fold (foldSharedArchives, multi-prog) ──
+            # ffmpeg/ffprobe share the ENTIRE libav* codebase. The per-program
+            # path above folds those private archives into EACH program's module,
+            # so a module-level inline-asm def with `.global` (libavcodec mlpdsp's
+            # `ff_mlp_firorder_N`) lands in both modules; llvm-link concatenates
+            # module-level asm verbatim (InternalizePass can't touch it) and the
+            # mega-link's integrated assembler then rejects the redefinition. Fold
+            # the shared archives ONCE instead:
+            #   1. per program: `ld.lld -r` ONLY its own objs + trampoline (NOT the
+            #      shared archives), then `opt -internalize` keeping just the entry
+            #      — this localizes `main` and every own-object global so two
+            #      programs' same-named statics (both `main`, cmdutils' globals)
+            #      can't collide when combined; undefined refs into libav* stay
+            #      undefined.
+            #   2. `ld.lld -r` all per-program modules + the DEDUPED union of shared
+            #      archives once. lld pulls each archive member on demand
+            #      (first-def-wins) → libav*'s module-level asm appears exactly once.
+            #   3. native SIMD members the bitcode link dropped → module_native.a
+            #      (once), asm-referenced bitcode defs kept external, everything
+            #      else internalized down to the per-program entries.
+            # Safe only when the shared library never calls BACK into a program's
+            # own objects by name (libav* doesn't — fftools registers callbacks by
+            # pointer); no catalog shared-code package violates this.
+            foldShared = foldSharedArchives && builtins.length programs > 1;
+            entriesCsv = nixpkgs.lib.concatMapStringsSep "," entryOf programs;
+            modsList = spaceSep (map (p: "multicall/mod_${san p.name}.bc") programs);
+            perProgramShared = p:
+              let
+                entry = entryOf p;
+                infer = inferLinkInputs && (p.objs or null) == null;
+                partial = "multicall/partial_${san p.name}.bc";
+                readInputs =
+                  if infer then ''
+                    __side="$UNPIN_LINK_DIR/${p.name}.link"
+                    [ -f "$__side" ] || { echo "multicallModuleHookLTO: no link sidecar for ${p.name} ($__side)" >&2; exit 1; }
+                    __objs=$(awk '$1=="OBJ"{print $2}' "$__side")
+                    __arch=$(awk '$1=="LOCALA"{print $2}' "$__side" | awk '!seen[$0]++')
+                    [ -n "$__objs" ] || { echo "multicallModuleHookLTO: sidecar for ${p.name} has no objects" >&2; exit 1; }
+                  '' else ''
+                    __objs="${spaceSep (p.objs or [ ])}"
+                    __arch="${spaceSep internalArchives}"
+                  '';
+              in
+              ''
+                printf 'extern int main(int,char**,char**);\nint %s(int c,char**v,char**e){return main(c,v,e);}\n' \
+                  '${entry}' > multicall/tramp_${san p.name}.c
+                $CC -flto -O2 -c multicall/tramp_${san p.name}.c -o multicall/tramp_${san p.name}.bc
+                ${readInputs}
+                for __a in $__arch; do echo "$__a" >> multicall/union.arch.raw; done
+                ${llvm} ld.lld -r $__objs multicall/tramp_${san p.name}.bc \
+                  --lto-emit-llvm -o ${partial}
+                ${llvm} opt -passes=internalize -internalize-public-api-list='${entry}' \
+                  ${partial} -o multicall/mod_${san p.name}.bc
+                # rescue native asm from a program's OWN objects (none for ffmpeg;
+                # general-safety for other shared-code packages)
+                _unpin_collect "$module/lib/module_native.a" $__objs
+              '';
           in
           drv.overrideAttrs (old: {
             outputs = (old.outputs or [ "out" ]) ++ [ "module" ];
@@ -2272,23 +2465,51 @@ CBODY
                   [ -e "$__i" ] || continue
                   case "$__i" in
                     *.a)
-                      # split a (possibly mixed) archive: archive only its native
-                      # members; the bitcode members already rode into module.bc
-                      # via the ld.lld -r link. Copy in first so a relative archive
-                      # path survives the cd into the extraction dir.
+                      # Split a (possibly mixed) archive: archive only its NATIVE
+                      # members; the bitcode members already rode into module.bc via
+                      # the ld.lld -r link. `llvm-ar x` flattens every member to its
+                      # BASENAME and OVERWRITES same-basename collisions on disk. Most
+                      # archives have none, so keep the fast flat extract there (and
+                      # byte-identical to the original path); only when a member name
+                      # repeats — ffmpeg's libavcodec.a holds per-codec x86 objects
+                      # sharing basenames (`mc.o`/`deblock.o`/`idct.o`/…) so a flat
+                      # extract loses e.g. hevc's `mc.o` → `ff_hevc_put_bi_epel_*`
+                      # goes undefined at the mega-link — fall back to instance-by-
+                      # instance extraction (`llvm-ar xN <k>` pulls the k-th instance)
+                      # into uniquely-numbered files so nothing is dropped.
                       __td=$(mktemp -d)
                       cp "$__i" "$__td/in.a" || { rm -rf "$__td"; continue; }
-                      mkdir -p "$__td/x"
-                      ( cd "$__td/x" && ${llvm} llvm-ar x "$__td/in.a" ) || { rm -rf "$__td"; continue; }
-                      for __m in "$__td"/x/*; do
-                        [ -f "$__m" ] || continue
-                        # NB: must be if/then (not `[ ] && cmd`) — under set -e a
-                        # bare `[ ] && cmd` whose test is false returns non-zero and
-                        # aborts the whole postBuild silently.
-                        if [ "$(_unpin_natkind "$__m")" = native ]; then
-                          ${llvm} llvm-ar qc "$__nat" "$__m"
-                        fi
-                      done
+                      ${llvm} llvm-ar t "$__td/in.a" > "$__td/members" 2>/dev/null || { rm -rf "$__td"; continue; }
+                      if [ "$(wc -l < "$__td/members")" = "$(sort -u "$__td/members" | wc -l)" ]; then
+                        mkdir -p "$__td/x"
+                        ( cd "$__td/x" && ${llvm} llvm-ar x "$__td/in.a" ) || { rm -rf "$__td"; continue; }
+                        for __m in "$__td"/x/*; do
+                          [ -f "$__m" ] || continue
+                          # NB: if/then (not `[ ] && cmd`) — under set -e a false test
+                          # in `[ ] && cmd` aborts the whole postBuild silently.
+                          if [ "$(_unpin_natkind "$__m")" = native ]; then
+                            ${llvm} llvm-ar qc "$__nat" "$__m"
+                          fi
+                        done
+                      else
+                        mkdir -p "$__td/e" "$__td/seen"
+                        __k=0
+                        while IFS= read -r __mem; do
+                          [ -n "$__mem" ] || continue
+                          __safe=$(printf '%s' "$__mem" | tr -c 'A-Za-z0-9._-' '_')
+                          __c=$(cat "$__td/seen/$__safe" 2>/dev/null || echo 0); __c=$((__c + 1)); printf '%s' "$__c" > "$__td/seen/$__safe"
+                          rm -f "$__td"/e/*
+                          ( cd "$__td/e" && ${llvm} llvm-ar xN "$__c" "$__td/in.a" "$__mem" ) 2>/dev/null || true
+                          __f=$(ls "$__td/e" 2>/dev/null | head -1)
+                          [ -n "$__f" ] || { __k=$((__k + 1)); continue; }
+                          if [ "$(_unpin_natkind "$__td/e/$__f")" = native ]; then
+                            __u="$__td/n_$(printf '%06d' $__k)_$__safe"
+                            mv "$__td/e/$__f" "$__u"
+                            ${llvm} llvm-ar qc "$__nat" "$__u"
+                          fi
+                          __k=$((__k + 1))
+                        done < "$__td/members"
+                      fi
                       rm -rf "$__td"
                       ;;
                     *)
@@ -2299,6 +2520,72 @@ CBODY
                   esac
                 done
               }
+              ${if foldShared then ''
+              : > multicall/union.arch.raw
+              ${nixpkgs.lib.concatMapStringsSep "\n" perProgramShared programs}
+              # fold all per-program modules + the DEDUPED shared archives ONCE, so
+              # each shared archive member (and its module-level inline asm) is
+              # pulled a single time. lld's on-demand archive semantics resolve the
+              # per-program undefined libav* refs against these members.
+              __union=$(sort -u multicall/union.arch.raw)${nixpkgs.lib.optionalString machoAsm ''
+
+              __bcu=multicall/union_bc.a
+              rm -f "$__bcu"
+              for __a in $__union; do
+                __td=$(mktemp -d)
+                cp "$__a" "$__td/in.a" || { rm -rf "$__td"; continue; }
+                ${llvm} llvm-ar t "$__td/in.a" > "$__td/members" 2>/dev/null \
+                  || { rm -rf "$__td"; continue; }
+                mkdir -p "$__td/e" "$__td/seen"
+                __k=0
+                while IFS= read -r __mem; do
+                  [ -n "$__mem" ] || continue
+                  __safe=$(printf '%s' "$__mem" | tr -c 'A-Za-z0-9._-' '_')
+                  __c=$(cat "$__td/seen/$__safe" 2>/dev/null || echo 0); __c=$((__c + 1))
+                  printf '%s' "$__c" > "$__td/seen/$__safe"
+                  rm -f "$__td"/e/*
+                  ( cd "$__td/e" && ${llvm} llvm-ar xN "$__c" "$__td/in.a" "$__mem" ) 2>/dev/null || true
+                  __f=$(ls "$__td/e" 2>/dev/null | head -1)
+                  [ -n "$__f" ] || { __k=$((__k + 1)); continue; }
+                  if [ "$(_unpin_natkind "$__td/e/$__f")" = bc ]; then
+                    __u="$__td/b_$(printf '%06d' $__k)_$__safe"
+                    mv "$__td/e/$__f" "$__u"
+                    ${llvm} llvm-ar qc "$__bcu" "$__u"
+                  fi
+                  __k=$((__k + 1))
+                done < "$__td/members"
+                rm -rf "$__td"
+              done
+              if [ -f "$__bcu" ]; then ${llvm} llvm-ar s "$__bcu"; else ${llvm} llvm-ar rc "$__bcu"; fi''}
+              ${llvm} ld.lld -r ${modsList} ${nixpkgs.lib.optionalString machoAsm "--whole-archive $__bcu --no-whole-archive "}$__union \
+                --lto-emit-llvm -o multicall/link_all.bc
+              # native SIMD from the shared archives (once)
+              _unpin_collect "$module/lib/module_native.a" $__union
+              if [ -f "$module/lib/module_native.a" ]; then
+                ${llvm} llvm-ar s "$module/lib/module_native.a"
+              else
+                ${llvm} llvm-ar rc "$module/lib/module_native.a"
+              fi
+              # keep the per-program entries external; also keep any bitcode symbol
+              # a rescued asm object references — the shared archives are folded IN
+              # here (not external depArchives), so their asm-referenced defs must
+              # survive internalize or they go undefined at the mega native link.
+              keeplist='${entriesCsv}'
+              if ${llvm} llvm-ar t "$module/lib/module_native.a" >/dev/null 2>&1 \
+                 && [ -n "$(${llvm} llvm-ar t "$module/lib/module_native.a" 2>/dev/null)" ]; then
+                ${llvm} llvm-nm --undefined-only "$module/lib/module_native.a" 2>/dev/null \
+                  | ${if machoAsm
+                      then "awk 'NF && $NF !~ /:$/ {print $NF}' | sed 's/^_//'"
+                      else "awk '$1==\"U\"{print $2}'"} | sort -u > multicall/nat_all.u
+                ${llvm} llvm-nm --defined-only --extern-only multicall/link_all.bc 2>/dev/null \
+                  | awk '$NF ~ /:$/ {next} {print $NF}'${nixpkgs.lib.optionalString machoAsm " | sed 's/^_//'"} | sort -u > multicall/def_all.d
+                __extra=$(comm -12 multicall/nat_all.u multicall/def_all.d)
+                for __s in $__extra; do keeplist="$keeplist,$__s"; done
+                [ -n "$__extra" ] && echo "multicall(shared): keeping asm-referenced bitcode syms external:" $__extra >&2 || true
+              fi
+              ${llvm} opt -passes=internalize -internalize-public-api-list="$keeplist" \
+                multicall/link_all.bc -o "$module/lib/module.bc"
+              '' else ''
               ${nixpkgs.lib.concatMapStringsSep "\n" perProgram programs}
               # always materialize module_native.a (empty archive if no asm) so the
               # manifest path is stable and the mega-link can reference it
@@ -2310,6 +2597,7 @@ CBODY
               fi
               ${llvm} llvm-link ${spaceSep (map (p: "multicall/mod_${san p.name}.bc") programs)} \
                 -o "$module/lib/module.bc"
+              ''}
             '';
           });
 
@@ -2666,9 +2954,19 @@ CBODY
             # default skip. Union the keeps across modules, subtract from the skip set.
             keptAutoArchives = nixpkgs.lib.unique
               (nixpkgs.lib.concatMap (m: m.keepAutoArchives or [ ]) modules);
+            # `libresolv.a` is in the set for the SPLIT-libc case only. darwin has no
+            # split — libSystem is monolithic — and its libresolv.a is the standalone
+            # BIND resolver (`res_9_ninit`/`res_9_nquery`/`res_9_dn_expand`) that
+            # glib's gthreadedresolver.c calls, exactly the libxcrypt-on-musl shape
+            # described above. Skipping it there is unconditionally wrong, so drop it
+            # from the set on darwin rather than making each darwin fold rescue it by
+            # name via keepAutoArchives. Spliced mid-list to keep the non-darwin
+            # ordering byte-identical (this list is emitted into the `case` pattern,
+            # so reordering it rehashes every linux mega).
             libcSplitArchives = [
               "libc.a" "libm.a" "libpthread.a" "librt.a" "libdl.a"
-              "libresolv.a" "libutil.a" "libcrypt.a" "libxnet.a" "libnsl.a"
+            ] ++ nixpkgs.lib.optional (!isDarwinHost) "libresolv.a" ++ [
+              "libutil.a" "libcrypt.a" "libxnet.a" "libnsl.a"
             ];
             effectiveSkipArchives =
               nixpkgs.lib.subtractLists keptAutoArchives libcSplitArchives;
@@ -3121,6 +3419,98 @@ CBODY
               lto = false;
               captureLinks = true;
             };
+            # libjpeg-turbo 3.1.x's `simdcoverage` helper references jsimd_can_*
+            # entry points its RVV port lacks (jsimd_can_encode_mcu_AC_refine_
+            # prepare), so on riscv64 the build aborts on -Wimplicit-function-
+            # declaration. Drop the (unused, lib-untouched) helper. Same fix as
+            # native-overlay/libjpeg-turbo.nix, but as a drv→drv transform so it
+            # composes with the lto=false `.override` below (a `.override` drops a
+            # lower overlay's postPatch, so the drop must ride ON the swapped drv)
+            # AND with the pristine librsvg scope, which never sees withLibjpegNoLto.
+            dropJpegSimdcov = drv: drv.overrideAttrs (oa: {
+              postPatch = (oa.postPatch or "") + ''
+                substituteInPlace simd/CMakeLists.txt \
+                  --replace-fail "add_executable(simdcoverage simdcoverage.c)" "" \
+                  --replace-fail "target_link_libraries(simdcoverage jpeg-static)" ""
+              '';
+            });
+            # Darwin: ONE iconv per closure. macOS ships two, and they do NOT
+            # agree on symbol names — Apple's libiconv-113 exports plain
+            # `iconv`/`iconv_open`/`iconv_close`, while GNU libiconv renames its
+            # own to `libiconv*` in the header (`#define iconv libiconv`) so it
+            # can coexist with the system copy. Either is fine; MIXING them is
+            # not, and a mix stays invisible until the final link of whoever
+            # pulls the dep in.
+            #
+            # `darwinIconvFixed` swaps Apple → GNU on the TOP-LEVEL drv only, so
+            # a package linked GNU's archive while its deps — built earlier,
+            # still on Apple's header — had emitted plain `iconv*`: `ld64.lld:
+            # undefined symbol: iconv_open, referenced by encoding.c` (libxml2,
+            # hit by ffmpeg). Not an ffmpeg bug; ffmpeg is just the first darwin
+            # engine package with an iconv-using dep.
+            #
+            # Swapping the scope's `libiconv` attribute instead is impossible:
+            # nixpkgs' darwin bootstrap asserts `libiconv == darwin.libiconv`.
+            # So converge the other way — hand the GNU header to the packages
+            # that actually call iconv, exactly as `unpinLibarchive` does for
+            # libarchive. The list is closed and MEASURED, not guessed: an
+            # llvm-nm sweep of all 948 static darwin archives in the store for an
+            # undefined plain `iconv*` finds these six and nothing else.
+            #
+            # Converging the ENGINE world only. The pristine set librsvg builds
+            # its private pango/cairo/glib chain from stays on Apple's iconv and
+            # is internally consistent there; mixing, not Apple, was the bug.
+            #
+            # `real` is captured OUTSIDE the extend: GNU libiconv's own closure
+            # reaches `libiconv` again (gettext), so reading it off `prev` would
+            # close a cycle through an attribute being defined — eval recurses.
+            darwinIconvConverge = scope:
+              if !(scope.stdenv.hostPlatform.isDarwin or false)
+                 || !(scope ? libiconvReal)
+              then scope
+              else
+                let
+                  l = nixpkgs.lib;
+                  real = scope.libiconvReal;
+                  # Both spellings carry pname "libiconv", so drop every one and
+                  # add GNU back — same idiom as darwinIconvFixed's `noIconv`.
+                  noIconv = l.filter (x: (x.pname or "") != "libiconv");
+                  # Propagated, not a plain buildInput: a consumer that links
+                  # e.g. libxml2.a resolves `libiconv*` out of ITS own link, so
+                  # the -L has to travel with the dep.
+                  swap = d: d.overrideAttrs (o: {
+                    buildInputs = noIconv (o.buildInputs or [ ]);
+                    propagatedBuildInputs =
+                      noIconv (o.propagatedBuildInputs or [ ]) ++ [ real ];
+                  });
+                  # gettext is deliberately NOT here, though the sweep flags its
+                  # libintl/libgettextpo/libtextstyle. Two reasons, both hard:
+                  # GNU libiconv depends on gettext, so giving gettext libiconv
+                  # closes a dependency cycle; and gettext is also a NATIVE build
+                  # tool (msgfmt), where the swap hands a bootstrap-clang link
+                  # the engine's LLVM-bitcode archive — `ld: ignoring file
+                  # libiconv.a … unknown-unsupported file format`, then
+                  # `_iconv_ostream_create` undefined. If libintl's plain
+                  # `iconv*` ever reaches a real link, it needs a host-splice-only
+                  # fix, not this list.
+                  users = [ "libxml2" "glib" "libass" "boost" "zvbi" ];
+                in
+                scope.extend (_final: prev:
+                  # ONLY in this scope's OWN fixpoint. An overlay propagates to
+                  # `buildPackages`, and libxml2 (xmllint) and gettext (msgfmt)
+                  # are libraries AND native build tools — handing a
+                  # bootstrap-clang link the engine's LLVM-bitcode libiconv.a
+                  # gets it ignored as "unknown-unsupported file format" and
+                  # then `configure: error: libiconv not found`. The test is cc
+                  # IDENTITY, not "is the engine": `real` is only linkable by
+                  # the toolchain it was built with, so the rule is "apply where
+                  # the compiler still matches the one `real` came from" — which
+                  # is also what makes this correct for the pristine scope.
+                  if (prev.stdenv.cc.name or "") != (scope.stdenv.cc.name or "?")
+                  then { }
+                  else
+                    l.genAttrs (l.filter (n: prev ? ${n}) users)
+                      (n: swap prev.${n}));
             # Base (pre-swap) gnu static-musl stdenv — pins pkg-config off the
             # engine (below). Captured from the pristine pkgs so the pin is an
             # absolute value the pkgsStatic splice can't re-resolve to engStdenv.
@@ -3146,7 +3536,20 @@ CBODY
                   # idiom as the bash/meson/dep fixes below.
                   pkg-config-unwrapped =
                     prev.pkg-config-unwrapped.override { stdenv = baseStaticStdenv; };
+                  # x264 is assembly-dominated (its whole reason for being), so LTO
+                  # buys it nothing — and its `base.o` forces the LLVM module flag
+                  # `override-stack-alignment=64` (AVX needs a 64-byte-aligned
+                  # stack), which COLLIDES with a bitcode consumer's LTO module
+                  # (`i32 16`) at the final link: `ld.lld: error: linking module
+                  # flags 'override-stack-alignment': IDs have conflicting values`
+                  # (hit by ffmpeg). Build it with the lto=false engine stdenv →
+                  # native ELF, a sidecar carrying no LLVM module flags (same as
+                  # libjpeg below). Pin here, BEFORE the autoWired STRINGS
+                  # overrideAttrs (native-overlay/x264.nix), so the `.override`
+                  # doesn't discard that fix. Gated on `prev ? x264`.
                 }
+                // nixpkgs.lib.optionalAttrs (prev ? x264)
+                  { x264 = prev.x264.override { stdenv = engStdenvNoLto; }; }
                 else { });
             withBashFix = withEngineStdenv.extend
               (_final: prev:
@@ -3211,12 +3614,91 @@ CBODY
                 if (prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic)
                    && (prev ? libjpeg_turbo || prev ? libjpeg)
                 then
-                  let lj = (prev.libjpeg_turbo or prev.libjpeg).override { stdenv = engStdenvNoLto; };
+                  let lj0 = (prev.libjpeg_turbo or prev.libjpeg).override { stdenv = engStdenvNoLto; };
+                      # riscv64: also drop the broken RVV simdcoverage helper (rides
+                      # ON the swapped drv so the `.override` above doesn't discard it).
+                      lj = if prev.stdenv.hostPlatform.isRiscV or false
+                           then dropJpegSimdcov lj0 else lj0;
                   in { libjpeg = lj; }
                      // nixpkgs.lib.optionalAttrs (prev ? libjpeg_turbo) { libjpeg_turbo = lj; }
                 else { });
+            # librsvg is a RUST package, and rustc can never be an engine derivation:
+            # the engine cc-wrapper carries `libc = null` (libc comes from the
+            # sysroot, not the wrapper — load-bearing), while rustc's configureFlags
+            # interpolate `musl-root=${cc.libc}`, so the set-wide stdenv swap makes
+            # every spliced rustc stage coerce null → eval dies. Rather than fight
+            # rustc's cross-splice (many stages, each re-resolving rustc-unwrapped
+            # through the swapped set), build librsvg from the PRISTINE pkgsStatic —
+            # exactly how it built before the engine migration. Its native `.a` (the
+            # rust crate's C-ABI staticlib) is folded by the engine link as a native
+            # sidecar, like SIMD asm. The C deps it SHARES with the top package
+            # (pango/cairo/glib…) still resolve to the engine set at the final link
+            # (pkg-config --static dedups each `-l` to one archive), so the pristine
+            # copies only serve librsvg's own build. The fixes are baked in here
+            # (`nativeFixes.librsvg` against the pristine scope) so the consumer uses
+            # the injected attr directly — re-applying them against the engine scope
+            # would splice engine libunwind/pango into a pristine build. Gated like
+            # the other set-wide engine fixes; identity where librsvg is absent.
+            withRustDeps = withLibjpegNoLto.extend
+              (_final: prev:
+                if (prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic)
+                   && prev ? librsvg
+                then {
+                  # librsvg pulls libjpeg_turbo transitively (gdk-pixbuf/libtiff/
+                  # libwebp) from this PRISTINE scope, which never passes through
+                  # withLibjpegNoLto — so the riscv64 simdcoverage drop must be
+                  # applied here too, or librsvg's own build fails. Assign to both
+                  # attrs from the concrete drv (going via the `libjpeg` alias would
+                  # cycle through nixpkgs' `libjpeg = libjpeg_turbo`).
+                  librsvg =
+                    let
+                      # …and darwin: librsvg drags its OWN pango/cairo/glib/
+                      # gdk-pixbuf chain out of this pristine scope, so every
+                      # darwin structural fix the consuming flake applies to the
+                      # engine scope has to be applied here too — the pristine
+                      # copies never pass through it. Without them the chain dies
+                      # one dep at a time: glib/pango "Subsystem not defined" (meson
+                      # can't autodetect it in cross mode), cairo's
+                      # ipc_rmid_deferred_release darwin lookup, graphite2's
+                      # unguarded `nolib_test($<TARGET_SONAME_FILE:graphite2>)` on
+                      # a static lib, dav1d's cpu_family='arm64' asm dispatch. Same
+                      # set `rsvg-convert` uses to build this chain standalone.
+                      # Darwin-gated, so every other host keeps its hash.
+                      # NOT iconv-converged, deliberately. This chain is not
+                      # private to librsvg's own build the way the note above
+                      # suggests: librsvg is a Rust `staticlib`, so librsvg-2.a
+                      # BUNDLES the objects of every native library it linked —
+                      # `librsvg-2.a(gconvert.c.o)`, `(libxml2_la-encoding.o)` —
+                      # and those reference iconv in the CONSUMER's link. It
+                      # stays on Apple's spelling, internally consistent, and
+                      # `darwinIconvFixed` puts Apple's archive on the darwin
+                      # link next to GNU's so both spellings resolve. Converging
+                      # this scope instead is not available: `libiconvReal` is
+                      # reachable from the very attributes being overridden, so
+                      # the extend closes a cycle (infinite recursion at eval).
+                      base = (
+                        if pkgs.pkgsStatic.stdenv.hostPlatform.isDarwin or false
+                        then pkgs.pkgsStatic.extend (_f: p: {
+                          glib       = nativeFixes.glib       p;
+                          graphite2  = nativeFixes.graphite2  p;
+                          fontconfig = nativeFixes.fontconfig p;
+                          pango      = nativeFixes.pango      p;
+                          cairo      = nativeFixes.cairo      p;
+                          dav1d      = nativeFixes.dav1d      p;
+                        })
+                        else pkgs.pkgsStatic);
+                    in
+                    nativeFixes.librsvg (
+                      if pkgs.pkgsStatic.stdenv.hostPlatform.isRiscV or false
+                      then base.extend (_f: p:
+                        let lj = dropJpegSimdcov p.libjpeg_turbo;
+                        in { libjpeg = lj; libjpeg_turbo = lj; })
+                      else base);
+                }
+                else { });
+            withDarwinIconvDeps = darwinIconvConverge withRustDeps;
           in
-          withLibjpegNoLto;
+          withDarwinIconvDeps;
 
         # The Windows (mingw + cosmo) root nixpkgs and its engine-swapped variant,
         # lifted to lib-level thunks. They are PACKAGE-INDEPENDENT (no pkgsAttr, no
@@ -3707,6 +4189,8 @@ CBODY
                       programs = mcPrograms;
                       internalArchives = multicall.internalArchives or [ ];
                       inferLinkInputs = multicall.inferLinkInputs or true;
+                      foldSharedArchives = multicall.foldSharedArchives or false;
+                      machoAsm = pkgs.stdenv.hostPlatform.isDarwin or false;
                       llvm = "${tc pkgs.stdenv.buildPlatform.system}/bin/llvm";
                     }
                     (rawBuild pkgs)
@@ -3725,18 +4209,95 @@ CBODY
                 # miscompiles). Drop Apple libiconv, append GNU libiconvReal (clean
                 # static .a) built with the engine stdenv. Harmless for non-iconv
                 # packages.
+                #
+                # …plus a tiny compat archive so the OTHER spelling resolves too.
+                # Not everything on a darwin link speaks `libiconv*`: librsvg is
+                # a Rust `staticlib`, so librsvg-2.a BUNDLES the objects of its
+                # own PRISTINE chain — glib's `gconvert.c.o`, libxml2's
+                # `encoding.o` — and those were compiled against Apple's header,
+                # so they call plain `iconv`/`iconv_open`/`iconv_close` (exactly
+                # those three, nothing else) and go undefined here.
+                #
+                # Three forwarding functions, not a second libiconv. Linking
+                # Apple's archive next to GNU's is the obvious move and does not
+                # work: both files are named `libiconv.a`, so `-liconv` picks one
+                # and only one; naming Apple's by absolute path then collides on
+                # `__libiconv_version`, the single symbol GNU did not rename, and
+                # it cannot be renamed away because llvm-objcopy refuses Apple's
+                # Mach-O members ("not recognized as a valid object file"). It
+                # would also mean shipping two charset engines and two sets of
+                # conversion tables in one binary. Forwarding keeps ONE
+                # implementation; `iconv_t` is an opaque pointer on both sides
+                # and every handle is now created AND consumed by GNU, so the
+                # spellings can never disagree about what a handle means.
+                #
+                # An archive, not a bare `.o`: a plain object is always pulled in,
+                # which would define plain `iconv*` in every darwin binary. This
+                # way the linker takes it only where something asks.
                 darwinIconvFixed = drv:
                   if engine == "unpin-llvm" && pkgs.stdenv.hostPlatform.isDarwin
                   then
                     let
                       noIconv = nixpkgs.lib.filter (x: (x.pname or "") != "libiconv");
                     in
+                    let
+                      # GNU libiconv, carrying Apple's spellings as forwarding
+                      # wrappers INSIDE its own archive.
+                      #
+                      # macOS has two iconv ABIs: Apple's exports `iconv`/
+                      # `iconv_open`/`iconv_close`, GNU's renames them to
+                      # `libiconv*` via `#define` in its header. Both archives are
+                      # named `libiconv.a` and they share exactly one symbol,
+                      # `_libiconv_version`. The engine converges darwin on GNU
+                      # (see darwinIconvConverge), but objects built against Apple
+                      # headers still reach the link — librsvg is a Rust
+                      # `staticlib`, so librsvg-2.a BUNDLES its pristine deps'
+                      # objects, and those call plain `iconv*`.
+                      #
+                      # The wrappers must live in the ARCHIVE, not in NIX_LDFLAGS.
+                      # A mega-multicall link auto-derives its inputs by globbing
+                      # `lib/*.a` across the whole dep closure, which is broader
+                      # than any single link line: it picks up Apple's libiconv.a
+                      # from packages that never converged (qrencode, …). With the
+                      # wrappers merely alongside, `iconv_open` is undefined when
+                      # the mega links, ld pulls Apple's member to satisfy it, that
+                      # member drags in `_libiconv_version`, and it collides with
+                      # GNU's — `duplicate symbol`. Defining the wrappers in the
+                      # archive that already answers `libiconv*` means nothing ever
+                      # demands Apple's member, so it is never pulled and the two
+                      # archives coexist untouched. It also spares every consumer
+                      # the flag.
+                      iconvCompat =
+                        (pkgs.pkgsStatic.libiconvReal.override {
+                          stdenv = engineStdenvFor pkgs;
+                        }).overrideAttrs (o: {
+                          postInstall = (o.postInstall or "") + ''
+                            cat > compat.c <<'EOF'
+                            #include <stddef.h>
+                            typedef void *iconv_t;
+                            /* Declared by hand: including <iconv.h> would #define
+                               these names right back to the ones defined below. */
+                            extern iconv_t libiconv_open(const char *, const char *);
+                            extern size_t libiconv(iconv_t, char **, size_t *, char **, size_t *);
+                            extern int libiconv_close(iconv_t);
+                            iconv_t iconv_open(const char *t, const char *f)
+                            { return libiconv_open(t, f); }
+                            size_t iconv(iconv_t cd, char **in, size_t *inl, char **out, size_t *outl)
+                            { return libiconv(cd, in, inl, out, outl); }
+                            int iconv_close(iconv_t cd) { return libiconv_close(cd); }
+                            EOF
+                            $CC -c compat.c -o unpin_iconv_compat.o
+                            ${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm \
+                              llvm-ar r $out/lib/libiconv.a unpin_iconv_compat.o
+                            ${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm \
+                              llvm-ar s $out/lib/libiconv.a
+                          '';
+                        });
+                    in
                     drv.overrideAttrs (old: {
                       # gnulib tools carry libiconv in propagatedBuildInputs too —
                       # filter BOTH or Apple libiconv survives.
-                      buildInputs =
-                        (noIconv (old.buildInputs or [ ]))
-                        ++ [ (pkgs.pkgsStatic.libiconvReal.override { stdenv = engineStdenvFor pkgs; }) ];
+                      buildInputs = (noIconv (old.buildInputs or [ ])) ++ [ iconvCompat ];
                       propagatedBuildInputs = noIconv (old.propagatedBuildInputs or [ ]);
                     })
                   else withDarwinIconv pkgs drv;
@@ -3935,6 +4496,7 @@ CBODY
                   inherit (multicall) programs;
                   internalArchives = multicall.internalArchives or [ ];
                   inferLinkInputs = multicall.inferLinkInputs or true;
+                  foldSharedArchives = multicall.foldSharedArchives or false;
                   llvm = "${unpinToolchain windowsPkgs.stdenv.buildPlatform.system}/bin/llvm";
                   # mingw API is __declspec(dllexport); strip so internalize folds
                   # the module to one external (see hook's stripStep).

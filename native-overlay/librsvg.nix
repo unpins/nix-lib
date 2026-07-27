@@ -34,14 +34,30 @@
 #    libgcc_eh.a), so symlink `libgcc_s.a -> libgcc_eh.a` onto the link path.
 #
 # 6. Strip the over-reported unwinder lib from librsvg-2.0.pc Libs.private
-#    (ppc64le + riscv64). rustc appends an unwinder a static-musl `--static`
-#    consumer (ffmpeg) can't satisfy:
+#    (ppc64le + riscv64 + i686). rustc appends an unwinder a static-musl
+#    `--static` consumer (ffmpeg) can't satisfy:
 #      - ppc64le: `-lunwind` pulls libunwind's ppc64 unwinder, which calls
 #        `getcontext`/`setcontext` — musl has no ucontext for powerpc64.
 #      - riscv64: `-lgcc_s`, which static musl doesn't ship (see #5).
-#    librsvg.a itself only needs `_Unwind_Resume` (libgcc_eh provides it,
-#    pulled by the cc static link), so dropping either token is safe. x86 musl
-#    has ucontext and isn't affected. Each sed is a no-op when absent.
+#      - i686: `-lunwind` — libunwind's `_Unwind_Resume` object for 32-bit x86
+#        (`x86/Gos-linux.c`) resumes via libc `setcontext`, which the musl i686
+#        sysroot doesn't provide → undefined at the static link. (x86_64 is
+#        unaffected: libunwind ships its own `x86_64/setcontext.S`, so its
+#        `_Unwind_Resume` is self-contained.)
+#    librsvg.a itself only needs `_Unwind_Resume` (the engine's LLVM libunwind
+#    provides a clean one via `--extra-libs=-lunwind`; off-engine, libgcc_eh),
+#    so dropping the token is safe. Each sed is a no-op when absent.
+#
+# 7. Propagate `darwin.libresolv` (darwin). librsvg is a Rust `staticlib`, so
+#    librsvg-2.a BUNDLES the objects of every native library it linked —
+#    including glib's `gthreadedresolver.c.o`, which calls `res_9_ninit`/
+#    `res_9_nquery`/`res_9_dn_expand`. gio-2.0.pc lists `-lresolv` but a
+#    consumer that reaches librsvg WITHOUT glib's own `.pc` (ffmpeg finds it via
+#    librsvg-2.0.pc) gets the token with no `-L`: `ld64.lld: library not found
+#    for -lresolv`, then those symbols undefined. native-overlay/glib.nix adds
+#    libresolv for its HEADERS only — its note that "the res_* symbols are in
+#    libSystem" does not hold for this link — so the search path has to travel
+#    with the archive that carries the references.
 { lib }:
 pkgs:
 let
@@ -54,7 +70,9 @@ in
 pkgs.librsvg.overrideAttrs (oa: {
   buildInputs = (oa.buildInputs or [ ])
     ++ lib.optionals (!isMinGW) [ pkgs.libunwind ];
-  propagatedBuildInputs = (oa.propagatedBuildInputs or [ ]) ++ [ pkgs.pango ];
+  # See fix #7 below for libresolv.
+  propagatedBuildInputs = (oa.propagatedBuildInputs or [ ]) ++ [ pkgs.pango ]
+    ++ lib.optional (host.isDarwin or false) pkgs.darwin.libresolv;
 
   # See fix #3 / #3b above.
   preBuild = (oa.preBuild or "")
@@ -81,8 +99,8 @@ pkgs.librsvg.overrideAttrs (oa: {
   doCheck = host.isx86_64 && host.isLinux;
 }
 # See fix #6 above. Gated via optionalAttrs so no other arch's librsvg
-# derivation hash changes (postFixup stays absent off ppc64le/riscv64).
-// lib.optionalAttrs (isPower64 || isRiscV) {
+# derivation hash changes (postFixup stays absent off ppc64le/riscv64/i686).
+// lib.optionalAttrs (isPower64 || isRiscV || host.isx86_32) {
   postFixup = (oa.postFixup or "") + ''
     for pc in "''${dev:-$out}/lib/pkgconfig/librsvg-2.0.pc" "$out/lib/pkgconfig/librsvg-2.0.pc"; do
       [ -f "$pc" ] && sed -i -E 's/ -l(unwind|gcc_s)//g' "$pc" || true

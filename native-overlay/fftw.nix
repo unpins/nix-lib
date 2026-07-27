@@ -13,15 +13,23 @@
 #    `ompdGdbSupport = false`) would build openmp itself, pulling a broken
 #    llvm-static. Side-step with `emptyDirectory`; fftw keeps `--enable-threads`
 #    (pthread), which is what consumers exercise.
+#
+#    This bites the unpin-llvm ENGINE on every OS, not just darwin: the engine's
+#    self-contained clang ships no OpenMP runtime, so `--enable-openmp` fails the
+#    configure probe outright (`don't know how to enable OpenMP`) on linux too.
+#    The openmp `libfftw3(f)_omp` variant is unused (consumers link the serial
+#    lib), so drop it wherever the engine is active. Gate on the engine cc so a
+#    non-engine musl build keeps its byte-identical openmp build.
 { lib }:
 pkgs:
 let
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
+  isEngine = lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
   stripGfortran = oa: builtins.filter
     (d: !(d.pname or null == "gfortran-wrapper"))
     (oa.nativeBuildInputs or [ ]);
 in
-if isDarwin
+if isDarwin || isEngine
 # `.override` before `.overrideAttrs` — re-invoking the function discards a
 # prior overrideAttrs.
 then
