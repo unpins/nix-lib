@@ -3595,6 +3595,8 @@ CBODY
               "libgudev"
               "libsysprof-capture"
               "xorgproto"
+              "harfbuzz"
+              "libvmaf"
             ];
             withMesonBuildCcFix = withDepFixes.extend
               (_final: prev:
