@@ -566,6 +566,28 @@ void collectBuiltinSources(StringRef muslArch, std::vector<std::string> &out,
   }
 }
 
+// compiler-rt's CMake feature-probes `_Float16` per arch and passes
+// -DCOMPILER_RT_HAS_FLOAT16 where it compiles (builtins/CMakeLists.txt:930).
+// Without the macro, fp_extend.h/fp_trunc.h type the half as `uint16_t` instead
+// of `_Float16` — which changes its REGISTER CLASS: clang calls __extendhfsf2
+// with the value in xmm0 while the helper reads edi, and reads __truncsfhf2's
+// result from xmm0 while the helper returns it in eax. Every f16<->f32
+// conversion that lowers to a libcall (i.e. no hardware f16 in the target's
+// baseline) then returns register garbage rather than a converted value —
+// silently, since both sides link fine. Same probe, same flag.
+bool probeFloat16(const std::string &self, const std::string &triple,
+                  const std::string &objDir) {
+  std::string src = objDir + "/f16probe.c";
+  {
+    std::error_code ec;
+    raw_fd_ostream os(src, ec, sys::fs::OF_None);
+    if (ec) return false;
+    os << "_Float16 foo(_Float16 x) { return x; }\n";
+  }
+  return runSelf(self, {"clang", "-target", triple, "-c", src, "-o",
+                        objDir + "/f16probe.o"}) == 0;
+}
+
 // Compile the selected builtins -> objDir/*.o (parallel) + the aarch64
 // outline-atomics helpers, then `llvm-ar` into libclang_rt.builtins.a. Unlike
 // the musl objects, these compile with the FRONT ACTIVE (no UNPIN_NO_FRONT) so
@@ -603,6 +625,8 @@ bool buildBuiltins(const std::string &self, const std::string &triple,
     return false;
   }
 
+  bool hasFloat16 = probeFloat16(self, triple, objDir);
+
   std::atomic<size_t> next{0};
   std::atomic<bool> ok{true};
   std::vector<std::string> objs(jobs.size());
@@ -627,6 +651,7 @@ bool buildBuiltins(const std::string &self, const std::string &triple,
         // archive ref discovered post-LTO, so the program link fails undefined.
         // NDEBUG is standard for a release compiler-rt and kills the ref at src.
         if (!isAsm) args.push_back("-DNDEBUG");
+        if (!isAsm && hasFloat16) args.push_back("-DCOMPILER_RT_HAS_FLOAT16");
         for (const char *f : {"-fno-builtin", "-fomit-frame-pointer",
                               "-fvisibility=hidden", "-Qunused-arguments", "-w"})
           args.push_back(f);
