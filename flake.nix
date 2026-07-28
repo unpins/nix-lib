@@ -1992,7 +1992,15 @@
         # 2-arg call leaves it a garbage register → SIGSEGV. Passing environ is
         # ABI-safe for 2-arg mains (they ignore the extra register). The LTO path
         # interposes a 3-arg trampoline that forwards all three.
-        multicallTableDispatcherC = { name, defaultApplet ? null }:
+        #
+        # `windows` adds the mingw command-line rewrite below. It is a parameter
+        # rather than an unconditional `#ifdef _WIN32` block so the emitted C stays
+        # byte-identical on every other target — the source text is part of the
+        # derivation, so an unconditional block would rehash every multicall
+        # package (and every mega) on every platform for a Windows-only fix. Cosmo
+        # doesn't want it either: it never defines `_WIN32`, so the upstream argv
+        # rebuilds this compensates for are not compiled into an APE.
+        multicallTableDispatcherC = { name, defaultApplet ? null, windows ? false }:
           let
             fallbackC =
               if defaultApplet == null
@@ -2007,6 +2015,52 @@
     return 1;''
               else ''    (void)list_programs;  /* defaultApplet replaces the listing fallback */
     return ${defaultApplet}_main(argc, argv, environ);'';
+
+            # Emitted only for mingw — see the `windows` note above.
+            winCmdlineFixDecl = nixpkgs.lib.optionalString windows ''
+        cat <<'CBODY'
+#include <wchar.h>
+#include <windows.h>
+/* Applets that rebuild their own argv from the real Windows command line
+   (CommandLineToArgvW, msvcrt's __wgetmainargs) throw away the argv the
+   dispatcher handed them: they would see the selector we just consumed and
+   report argv[0] as the .exe path. So rewrite the command line in place to what
+   the applet should have been launched with — `<applet> <args...>`. That buffer
+   IS what those rebuilds read: GetCommandLineW hands back the PEB's own copy.
+   Its UNICODE_STRING.Length is left stale on purpose; every consumer here goes
+   by the NUL, and updating it would mean reaching into ntdll's structs.
+
+   Only a plain unquoted `--unpin-program=NAME` second token is rewritten. A
+   quoted one is left alone: dispatch still works, the applet just sees the raw
+   line as it does today. */
+static void unpin_fix_cmdline(const char *sel) {
+    wchar_t *cl = GetCommandLineW(), *p, *tok, *rest;
+    size_t n, i;
+    if (cl == NULL) return;
+    /* argv[0] parses by its own rule: quoted through the closing quote, else up
+       to the first blank — no escape processing either way. */
+    p = cl;
+    if (*p == L'"') {
+        for (p++; *p != 0 && *p != L'"'; p++) { }
+        if (*p != 0) p++;
+    } else {
+        for (; *p != 0 && *p != L' ' && *p != L'\t'; p++) { }
+    }
+    while (*p == L' ' || *p == L'\t') p++;
+    tok = p;
+    if (wcsncmp(tok, L"--unpin-program=", 16) != 0) return;
+    for (rest = tok; *rest != 0 && *rest != L' ' && *rest != L'\t'; rest++) { }
+    n = strlen(sel);
+    /* The applet name displaces the whole .exe path, so it fits many times over;
+       bail out rather than clobber the token we are about to read. */
+    if (cl + n > tok) return;
+    for (i = 0; i < n; i++) cl[i] = (wchar_t)(unsigned char)sel[i];
+    memmove(cl + n, rest, (wcslen(rest) + 1) * sizeof(wchar_t));
+}
+CBODY
+'';
+            winCmdlineFixCall = nixpkgs.lib.optionalString windows
+              "                unpin_fix_cmdline(sel);\n";
           in
           ''
       {
@@ -2055,7 +2109,7 @@ static void copy_basename(char *dst, size_t cap, const char *src) {
     if (strncmp(dst, "lt-", 3) == 0) memmove(dst, dst + 3, strlen(dst + 3) + 1);
 }
 CBODY
-        cat <<CBODY
+${winCmdlineFixDecl}        cat <<CBODY
 static void list_programs(FILE *out) {
     fprintf(out, "${name} is one binary with several programs:");
     for (const struct applet *a = applets; a->name; a++)
@@ -2080,7 +2134,7 @@ int main(int argc, char **argv) {
         for (const struct applet *a = applets; a->name; a++)
             if (strcmp(sel, a->name) == 0) {
                 argv[1] = (char *)sel;   /* applet's argv[0]=NAME, args follow */
-                return a->fn(argc - 1, argv + 1, environ);
+${winCmdlineFixCall}                return a->fn(argc - 1, argv + 1, environ);
             }
         fprintf(stderr, "${name}: no program '%s'\n", sel);
         return 1;
@@ -2814,7 +2868,7 @@ CBODY
                 ${nixpkgs.lib.concatMapStringsSep "\n" rebuild programs}
 
                 printf '${nixpkgs.lib.concatStringsSep "\\n" appletLines}\n' > multicall/applets.list
-              ${multicallTableDispatcherC { name = primary; defaultApplet = null; }}
+              ${multicallTableDispatcherC { name = primary; defaultApplet = null; windows = isWindows; }}
                 $CC -O2 -c -o multicall/dispatcher.o multicall/dispatcher.c
 
                 install -m644 ${multicallMk} ${makeSubdir}/unpin-multicall.mk
@@ -3152,7 +3206,7 @@ CBODY
                 runHook preBuild
                 mkdir -p multicall
                 printf '${nixpkgs.lib.concatStringsSep "\\n" appletLines}\n' > multicall/applets.list
-                ${multicallTableDispatcherC { inherit name; defaultApplet = defaultSan; }}
+                ${multicallTableDispatcherC { inherit name; defaultApplet = defaultSan; windows = isWin && !cosmoMode; }}
                 ${engineRec.prelude}${autoDepsPrelude}
                 ${engineRec.linkLine}${engineRec.postLink}runHook postBuild
               '';
