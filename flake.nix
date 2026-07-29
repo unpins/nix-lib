@@ -3742,7 +3742,15 @@ CBODY
                           cairo      = nativeFixes.cairo      p;
                           dav1d      = nativeFixes.dav1d      p;
                         })
-                        else pkgs.pkgsStatic);
+                        # Everywhere else only graphite2 is needed, and for a
+                        # different reason than darwin's: CMake's libtool emulation
+                        # writes a `libgraphite2.la` naming a `libgraphite2.so` the
+                        # static build never produced. Only a LIBTOOL consumer of
+                        # this injected chain trips on it — libtool rewrites
+                        # `-lgraphite2` into that absolute path and the link dies
+                        # (chafa; ffmpeg's own build system never reads a `.la`).
+                        else pkgs.pkgsStatic.extend
+                          (_f: p: { graphite2 = nativeFixes.graphite2 p; }));
                     in
                     nativeFixes.librsvg (
                       if pkgs.pkgsStatic.stdenv.hostPlatform.isRiscV or false

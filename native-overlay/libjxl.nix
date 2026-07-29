@@ -11,6 +11,7 @@ pkgs:
 let
   isMinGW = pkgs.stdenv.hostPlatform.isMinGW or false;
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
+  isEngine = lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
   # asciidoc/doxygen everywhere (docs off); gdk-pixbuf + make-shell-wrapper-hook
   # only on mingw — they survive enablePlugins=false, and the wrapper hook
   # splices to a mingw bash that can't cross-compile (no sigset_t). Same trap
@@ -57,5 +58,12 @@ in
     "-DCMAKE_HAVE_LIBC_PTHREAD=ON"
     "-DATOMICS_LOCK_FREE_INSTRUCTIONS=ON"
   ];
+  # nixpkgs pins `CXXFLAGS = -mfp16-format=ieee` on aarch32 (gcc defaults to
+  # `none`, which hides `__fp16`). clang has no such option — it is always IEEE
+  # — and rejects it outright, so CMake's first try-compile dies. Only the
+  # engine path sees clang; gcc still needs the flag. Same fix the jxl flake
+  # carries for its own top-level libjxl.
+  env = (oa.env or { })
+    // lib.optionalAttrs (isEngine && pkgs.stdenv.hostPlatform.isAarch32) { CXXFLAGS = ""; };
   doCheck = false;
 })

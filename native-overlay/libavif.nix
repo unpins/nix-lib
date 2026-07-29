@@ -16,10 +16,24 @@
 pkgs:
 let
   isMinGW = pkgs.stdenv.hostPlatform.isMinGW or false;
+  isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
+  isEngine = lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
   dropNative = lib.filter
     (x: !(builtins.elem (x.pname or x.name or "") [ "gdk-pixbuf" "make-shell-wrapper-hook" ]));
 in
 pkgs.libavif.overrideAttrs (oa: {
+  # merge_static_libs.cmake folds the codec archives into libavif.a, and its
+  # `if(APPLE)` branch hardcodes `xcrun libtool -static`. The engine's darwin
+  # toolchain ships neither (no cctools, no xcrun) — `command not found`, exit
+  # 127. The very next branch does the same merge with `${CMAKE_AR} -M` and an
+  # MRI script, which the engine's llvm-ar runs fine, so take APPLE out of the
+  # running and let the Clang branch match. Gated on the engine cc: the stock
+  # darwin stdenv has xcrun and keeps its cached drv.
+  postPatch = (oa.postPatch or "")
+    + lib.optionalString (isDarwin && isEngine) ''
+      substituteInPlace cmake/Modules/merge_static_libs.cmake \
+        --replace-fail 'if(APPLE)' 'if(FALSE)'
+    '';
   nativeBuildInputs =
     if isMinGW then dropNative (oa.nativeBuildInputs or [ ]) else (oa.nativeBuildInputs or [ ]);
   cmakeFlags = [
