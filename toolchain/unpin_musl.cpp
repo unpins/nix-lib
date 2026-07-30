@@ -292,8 +292,12 @@ bool isTime32Arch(StringRef muslArch) {
   return false;
 }
 
+// configure:463 sets optimize="internal,malloc,string" by default, expanded to
+// OPTIMIZE_GLOBS and compiled -O3 (Makefile:118-119).
 bool isO3Path(StringRef p) {
-  return p.starts_with("musl/src/string/") || p.starts_with("musl/src/internal/");
+  return p.starts_with("musl/src/string/") ||
+         p.starts_with("musl/src/internal/") ||
+         p.starts_with("musl/src/malloc/");
 }
 
 // zig addCcArgs(): the per-source musl CFLAGS, with includes pointing at the
@@ -304,6 +308,12 @@ void addCcArgs(std::vector<std::string> &a, const std::string &muslArch,
   std::string L = libcRoot();
   const char *base[] = {"-std=c99",
                         "-ffreestanding",
+                        // Makefile:47 CFLAGS_C99FSE. These compile with
+                        // UNPIN_NO_FRONT (no -resource-dir), so without it the
+                        // host's /usr/include stays on the search path and a
+                        // header musl does not ship would silently resolve to
+                        // glibc's instead of failing.
+                        "-nostdinc",
                         "-fexcess-precision=standard",
                         "-frounding-math",
                         "-ffp-contract=off",
@@ -536,12 +546,27 @@ void collectBuiltinSources(StringRef muslArch, std::vector<std::string> &out,
   }
   if (muslArch == "x86_64") {
     for (const char *f : kBuiltins80Bit) all.push_back(f);
-    for (const char *f : kBuiltinsX86_64) all.push_back(f);
+    for (const char *f : kBuiltinsX86_64) {
+      // floatund{i,s}{df,sf}/floatundixf .S are SysV-ABI asm upstream guards
+      // behind NOT WIN32 (CMakeLists 330-336, 344-349): they read the argument
+      // from %rdi, but Win64 passes it in %rcx. Worse, the shadow rule below
+      // then drops the correct generic .c, leaving ONLY the wrong definition
+      // in the archive.
+      if (isWin && (StringRef(f) == "x86_64/floatundidf.S" ||
+                    StringRef(f) == "x86_64/floatundisf.S" ||
+                    StringRef(f) == "x86_64/floatundixf.S"))
+        continue;
+      all.push_back(f);
+    }
   } else if (muslArch == "i386") {
     for (const char *f : kBuiltinsI386) all.push_back(f);
     for (const char *f : kBuiltins80Bit) all.push_back(f); // 80-bit XF long double
   } else if (muslArch == "aarch64") {
     for (const char *f : kBuiltinsAArch64) all.push_back(f);
+    if (isDarwin)
+      for (const char *f : kBuiltinsAArch64SmeApple) all.push_back(f);
+    else if (!isWin) // clang rejects SME functions on the Windows ABI
+      for (const char *f : kBuiltinsAArch64Sme) all.push_back(f);
   } else if (muslArch == "arm") {
     for (const char *f : kBuiltinsArm) all.push_back(f);
   } else if (muslArch == "riscv64") {
@@ -575,17 +600,54 @@ void collectBuiltinSources(StringRef muslArch, std::vector<std::string> &out,
 // conversion that lowers to a libcall (i.e. no hardware f16 in the target's
 // baseline) then returns register garbage rather than a converted value —
 // silently, since both sides link fine. Same probe, same flag.
-bool probeFloat16(const std::string &self, const std::string &triple,
-                  const std::string &objDir) {
-  std::string src = objDir + "/f16probe.c";
+// The probe MUST carry the variant's cpu flags: upstream feeds the probe the
+// same BUILTIN_CFLAGS_${arch} + TARGET_${arch}_CFLAGS the sources compile with
+// (CMakeLists 901-911), and `_Float16` availability moves with -march on x86.
+// A flag-blind probe answers for the DEFAULT cpu — which on i386 has SSE2, so
+// the macro goes on — while the real jobs get `-march=i686`, where the type
+// does not exist: fp_trunc.h's `typedef _Float16 dst_t` is then a hard error
+// and the whole sysroot build dies. lame's configure appends `-march=i686`
+// unconditionally under clang and libtool puts CFLAGS on the link line, so
+// this is reachable, not hypothetical.
+bool probeCompiles(const std::string &self, const std::string &triple,
+                   const std::string &objDir, const Variant &V,
+                   StringRef name, StringRef body) {
+  std::string src = (Twine(objDir) + "/" + name + ".c").str();
   {
     std::error_code ec;
     raw_fd_ostream os(src, ec, sys::fs::OF_None);
     if (ec) return false;
-    os << "_Float16 foo(_Float16 x) { return x; }\n";
+    os << body << "\n";
   }
-  return runSelf(self, {"clang", "-target", triple, "-c", src, "-o",
-                        objDir + "/f16probe.o"}) == 0;
+  std::vector<std::string> a = {"clang", "-target", triple};
+  for (auto &f : V.cpuFlags) a.push_back(f);
+  a.push_back("-c");
+  a.push_back(src);
+  a.push_back("-o");
+  a.push_back((Twine(objDir) + "/" + name + ".o").str());
+  return runSelf(self, a) == 0;
+}
+
+bool probeFloat16(const std::string &self, const std::string &triple,
+                  const std::string &objDir, const Variant &V) {
+  return probeCompiles(self, triple, objDir, V, "f16probe",
+                       "_Float16 foo(_Float16 x) { return x; }");
+}
+
+// compiler-rt gates -DCOMPILER_RT_ARMHF_TARGET on __ARM_PCS_VFP
+// (CMakeLists 915 / 948). Without it int_lib.h forces every builtin to base
+// AAPCS (`pcs("aapcs")`), but LLVM only overrides the libcall CC to ARM_AAPCS
+// for the __aeabi_* table and the half helpers — the plain __* names keep the
+// target default, which on musleabihf is AAPCS-VFP. The six symbols clang
+// calls by their plain name (__powi[sd]f2, __mul[sd]c3, __div[sd]c3) then read
+// their FP arguments out of the core registers: wrong results, and __divdc3
+// writes 16 bytes through a caller-supplied sret pointer that does not exist.
+// Probe rather than key on the arch token — muslArchName() maps both
+// musleabihf and soft-float musleabi to "arm".
+bool probeArmHardFloat(const std::string &self, const std::string &triple,
+                       const std::string &objDir, const Variant &V) {
+  return probeCompiles(self, triple, objDir, V, "armhfprobe",
+                       "#ifndef __ARM_PCS_VFP\n#error soft\n#endif\nint x;");
 }
 
 // Compile the selected builtins -> objDir/*.o (parallel) + the aarch64
@@ -625,7 +687,8 @@ bool buildBuiltins(const std::string &self, const std::string &triple,
     return false;
   }
 
-  bool hasFloat16 = probeFloat16(self, triple, objDir);
+  bool hasFloat16 = probeFloat16(self, triple, objDir, V);
+  bool armhf = muslArch == "arm" && probeArmHardFloat(self, triple, objDir, V);
 
   std::atomic<size_t> next{0};
   std::atomic<bool> ok{true};
@@ -652,8 +715,18 @@ bool buildBuiltins(const std::string &self, const std::string &triple,
         // NDEBUG is standard for a release compiler-rt and kills the ref at src.
         if (!isAsm) args.push_back("-DNDEBUG");
         if (!isAsm && hasFloat16) args.push_back("-DCOMPILER_RT_HAS_FLOAT16");
+        // NOT under !isAsm: arm/aeabi_dcmp.S, arm/aeabi_fcmp.S and
+        // arm/comparesf2.S all #if on this macro and call into the C
+        // comparison routines. C-only leaves __aeabi_dcmplt & co. reading the
+        // wrong registers — invisible until d0/d1 happen to be dirty.
+        if (armhf) args.push_back("-DCOMPILER_RT_ARMHF_TARGET");
         for (const char *f : {"-fno-builtin", "-fomit-frame-pointer",
-                              "-fvisibility=hidden", "-Qunused-arguments", "-w"})
+                              // The FLAG covers C/C++ TUs; the MACRO is what
+                              // assembly.h and int_lib.h read to emit .hidden /
+                              // .private_extern, so .S entry points and the
+                              // Mach-O aliases need it too (CMakeLists 883-885).
+                              "-fvisibility=hidden", "-DVISIBILITY_HIDDEN",
+                              "-Qunused-arguments", "-w"})
           args.push_back(f);
         if (!isAsm) args.push_back(V.fast ? "-O2" : "-Os");
         appendCpuPic(args, V);
@@ -833,8 +906,14 @@ bool buildCxxRuntime(const std::string &self, const std::string &triple,
     }
     a.push_back("-I");
     a.push_back(cx + "/libunwind/include");
+    // -DNDEBUG: the only runtime we were shipping with asserts live (builtins
+    // and libc++/libc++abi already get it). Beyond the asserts themselves,
+    // UnwindCursor.hpp & friends reference __assert_fail from NATIVE archive
+    // members — including the one defining _Unwind_Resume, a symbol the LTO
+    // backend materialises late — which under the bitcode libc is the
+    // post-LTO undefined-reference trap that -DNDEBUG on builtins already fixed.
     for (const char *f :
-         {"-D_LIBUNWIND_HIDE_SYMBOLS", "-Wa,--noexecstack",
+         {"-D_LIBUNWIND_HIDE_SYMBOLS", "-DNDEBUG", "-Wa,--noexecstack",
           "-fvisibility=hidden", "-fvisibility-inlines-hidden",
           "-fvisibility-global-new-delete=force-hidden",
           "-D_LIBUNWIND_IS_NATIVE_ONLY", "-fasynchronous-unwind-tables",
@@ -852,7 +931,11 @@ bool buildCxxRuntime(const std::string &self, const std::string &triple,
 
   // --- libc++abi ---
   std::vector<std::vector<std::string>> ab;
-  for (const char *rel : kLibcxxabiFiles) {
+  std::vector<std::string> abFiles;
+  for (const char *rel : kLibcxxabiFiles) abFiles.push_back(rel);
+  if (!isWin && !isDarwin)
+    for (const char *rel : kLibcxxabiPosixFiles) abFiles.push_back(rel);
+  for (auto &rel : abFiles) {
     std::string r = std::string("libcxxabi/") + rel;
     if (!vfsHas("cxx/" + r)) continue;
     std::vector<std::string> a = {"clang"};
@@ -863,9 +946,6 @@ bool buildCxxRuntime(const std::string &self, const std::string &triple,
                           "-fasynchronous-unwind-tables", "-Qunused-arguments",
                           "-w"})
       a.push_back(f);
-    // mingw is a GNU ABI with __cxa_thread_atexit_impl in the CRT (zig adds this
-    // for every non-old-glibc GNU target); routes cxa_thread_atexit through it.
-    if (isWin) a.push_back("-DHAVE___CXA_THREAD_ATEXIT_IMPL");
     addConfigSite(a);
     a.push_back("-I");
     a.push_back(cx + "/libcxxabi/include");

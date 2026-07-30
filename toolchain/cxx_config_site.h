@@ -45,7 +45,12 @@
 #define _LIBCPP_HAS_UNICODE 1
 #define _LIBCPP_HAS_WIDE_CHARACTERS 1
 #define _LIBCPP_HAS_NO_STD_MODULES
-#define _LIBCPP_HAS_TIME_ZONE_DATABASE 1
+// 0, matching the win/darwin config sites: the tzdb TUs live in
+// libc++experimental.a, which we do not build, and std::chrono::tzdb reads
+// /usr/share/zoneinfo/tzdata.zi at runtime — a host file a hermetic static
+// binary must not depend on. Claiming 1 while shipping neither was the
+// inconsistency; the API is unreachable without -fexperimental-library either way.
+#define _LIBCPP_HAS_TIME_ZONE_DATABASE 0
 #define _LIBCPP_INSTRUMENTED_WITH_ASAN 0
 
 // PSTL backends

@@ -2,9 +2,16 @@
 //
 // Transcribed from compiler-rt/lib/builtins/CMakeLists.txt (LLVM 21.1.8) for
 // the de-risk config: Linux / musl, NOT Apple / Windows / MSVC / Android /
-// Fuchsia / baremetal / GPU; COMPILER_RT_ENABLE_SOFTWARE_INT128=OFF. BF16, SME,
+// Fuchsia / baremetal / GPU; COMPILER_RT_ENABLE_SOFTWARE_INT128=OFF. BF16,
 // emupac and the int128-software path are omitted (niche; their absence only
-// yields an undefined ref if actually used, never a miscompile). atomic.c IS
+// yields an undefined ref if actually used, never a miscompile). BF16 stays
+// out deliberately: the only bf16 reference anywhere in the catalog is
+// libhwy's __extendbfsf2, which appears solely in GCC-built objects (highway
+// takes a bit-shift path unless HWY_HAVE_SCALAR_BF16_OPERATORS, gated on
+// GCC >= 13) and is inlined by clang — and adding the set would not even
+// close the class, since upstream's truncxfbf2.c tests CRT_HAS_TF_MODE
+// without including anything that defines it and so compiles to an EMPTY TU
+// on every target. Keeping libhwy on the engine is the real lever. atomic.c IS
 // included (compiler-rt EXCLUDE_ATOMIC_BUILTIN=ON omits it by default): as the
 // sole static runtime we must provide the generic __atomic_load/store libcalls
 // that 32-bit targets emit for 8-byte/misaligned atomics (openssl on
@@ -134,11 +141,35 @@ static const char *const kBuiltinsArm[] = {
     "arm/aeabi_memset.S",
 };
 
-// aarch64_SOURCES (590-596). emupac.cpp (needs C++/siphash) and the SME ABI
-// routines are omitted; outline-atomics helpers from lse.S are generated
-// programmatically (see kOutlineAtomic* below).
+// aarch64_SOURCES (590-596). emupac.cpp (needs C++/siphash) is omitted;
+// outline-atomics helpers from lse.S are generated programmatically (see
+// kOutlineAtomic* below).
 static const char *const kBuiltinsAArch64[] = {
     "cpu_model/aarch64.c", "aarch64/fp_mode.c",
+};
+
+// SME ABI support routines (CMakeLists 600-617), split by OS because Apple has
+// its own. Needed the moment any TU declares `__arm_new("za")` — clang then
+// emits __arm_tpidr2_save/__arm_tpidr2_restore around the ZA lazy save, e.g.
+// libyuv's rotate_sme.cc. Under -flto an unreferenced kernel is dead-stripped
+// before codegen and the call never materialises, so the gap only shows up in
+// a non-LTO archive, where symbol resolution runs before --gc-sections.
+// sme-abi.S carries its own `.arch armv9-a+sme2` (Apple's, armv8-a+sme2) and
+// reads __aarch64_cpu_features from cpu_model/aarch64.c, already selected
+// above; the sme-libc-opt-* routines are plain aarch64 string code, streaming-
+// compatible by construction, so none of them need extra -march flags.
+// Upstream's two halves are NOT symmetric: sme-abi.S defines 8 routines,
+// Apple's only 4 (no __arm_sme_save/restore/state_size, no __arm_get_current_vg
+// and no __arm_sc_mem*), so __arm_agnostic("sme_za_state") links on
+// aarch64-linux and not on aarch64-darwin. That asymmetry is upstream's.
+static const char *const kBuiltinsAArch64Sme[] = {
+    "aarch64/sme-abi.S",
+    "aarch64/sme-abi-assert.c",
+    "aarch64/sme-libc-opt-memcpy-memmove.S",
+    "aarch64/sme-libc-opt-memset-memchr.S",
+};
+static const char *const kBuiltinsAArch64SmeApple[] = {
+    "aarch64/arm_apple_sme_abi.s",
 };
 
 // riscv64_SOURCES (783-798): riscv_SOURCES + riscv/muldi3.S.

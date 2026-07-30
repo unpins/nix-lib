@@ -29,6 +29,17 @@
           # buildLibc selects by replicating musl's Makefile.
           zigLibc = "${origPkgs.zig_0_16.src}/lib/libc";
           muslTar = origPkgs.musl.src;
+          # Same story for mingw: zig's lib/libc/mingw is a PRUNED copy of the
+          # mingw-w64 CRT, and what it prunes includes every 80-bit `long double`
+          # math routine (sqrtl/floorl/fmodl/frexpl/hypotl/sinl/…). Those are not
+          # optional on x86_64: UCRT exports the *l names only where
+          # `long double == double` (def-include/func.def.in F_LD64), clang emits
+          # real libcalls for them, and libmingw32's own complex/*l.c and
+          # math/{cbrtl,lgammal,lroundl,tgammal,…}.c reference them — so the
+          # undefined symbol cascades from an ordinary lroundl()/cabsl() call.
+          # Fill the gaps from the upstream tarball, which is the SAME 13.0
+          # release zig bundles (__MINGW64_VERSION_MAJOR 13, MINOR 0).
+          mingwCrtTar = origPkgs.pkgsCross.mingwW64.windows.mingw_w64.src;
 
           # Recipe/version stamp baked in as UNPIN_CACHE_TAG and folded into the
           # on-demand cache key (Variant in unpin_musl.cpp). Must change whenever
@@ -509,6 +520,13 @@ static cl::SubCommand LinkSub(LinkSubName, "Link LLVM bitcode/IR modules");' \
               [ -d "${zigLibc}/mingw/$__d" ] && \
                 cp -r "${zigLibc}/mingw/$__d" "$__stage/libc/mingw/$__d"
             done
+            chmod -R u+w "$__stage/libc/mingw"
+            # Fill zig's pruned math/ from the matching upstream release. -n so
+            # zig's copy wins wherever both exist: this only ADDS the long-double
+            # routines (and the .def.h / fp_consts.h they include).
+            mkdir -p _mw && tar xf ${mingwCrtTar} -C _mw --strip-components=1
+            cp -rn _mw/mingw-w64-crt/math/. "$__stage/libc/mingw/math/"
+            rm -rf _mw
             cp -r "${zigLibc}/include/any-windows-any" \
                "$__stage/libc/include/any-windows-any"
 

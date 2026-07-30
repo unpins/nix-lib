@@ -410,6 +410,30 @@ static const char *const kMingwX86[] = {
     "math/nextafterl.c",
     "math/nexttoward.c",
     "math/nexttowardf.c",
+    // Not in zig's pruned tree; staged from the upstream 13.0 tarball (see
+    // default.nix). UCRT does not export these on x86_64 — func.def.in's
+    // F_LD64 expands empty wherever `long double` is not `double` — and clang
+    // emits real libcalls for all of them, so without these the archive has
+    // undefined references from its OWN complex/*l.c and math/*l.c members.
+    // fp_constsl.c also carries nanl and the __QNANL/__INFL/__DENORML reps.
+    "math/sqrtl.c",
+    "math/frexpl.c",
+    "math/modfl.c",
+    "math/truncl.c",
+    "math/roundl.c",
+    "math/fmaxl.c",
+    "math/fminl.c",
+    "math/hypotl.c",
+    "math/isnanl.c",
+    "math/fp_constsl.c",
+    "math/x86/floorl.S",
+    "math/x86/ceill.S",
+    "math/x86/copysignl.S",
+    "math/x86/tanl.S",
+    "math/x86/fmodl.c",
+    "math/x86/sinl.c",
+    "math/x86/cosl.c",
+    "math/x86/atanl.c",
 };
 
 // mingw32_winpthreads_src: winpthreads (compiled with -DIN_WINPTHREAD)

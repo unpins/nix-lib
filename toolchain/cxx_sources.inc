@@ -9,7 +9,11 @@
 //===----------------------------------------------------------------------===//
 
 // libc++abi (relative to cxx/libcxxabi/). cxa_noexception.cpp is wasi-only and
-// omitted; cxa_thread_atexit.cpp is threaded-only (we are threaded, so kept).
+// omitted. stdlib_new_delete.cpp is omitted too: libcxx/src/new.cpp already
+// defines all 20 replaceable allocation functions, and upstream's own CMake
+// calls having both an ODR violation (libcxx/CMakeLists 271-275). `-lc++`
+// precedes `-lc++abi` on every platform, so libc++'s copy is what already ends
+// up in every binary — dropping this one is link-identical.
 static const char *const kLibcxxabiFiles[] = {
     "src/cxa_aux_runtime.cpp",
     "src/cxa_default_handlers.cpp",
@@ -22,12 +26,21 @@ static const char *const kLibcxxabiFiles[] = {
     "src/stdlib_exception.cpp",
     "src/stdlib_stdexcept.cpp",
     "src/stdlib_typeinfo.cpp",
-    "src/stdlib_new_delete.cpp",
     "src/abort_message.cpp",
     "src/fallback_malloc.cpp",
     "src/private_typeinfo.cpp",
     "src/cxa_exception.cpp",
     "src/cxa_personality.cpp",
+};
+
+// libc++abi, POSIX only — upstream gates this TU on `UNIX OR FUCHSIA` and NOT
+// APPLE (libcxxabi/src/CMakeLists 39-44). On mingw it is actively harmful:
+// mingw-w64 supplies __cxa_thread_atexit itself, and since -lc++abi is scanned
+// before -lmingw32 our member wins the resolution and drags in a strong
+// __cxa_thread_atexit_impl that no Windows library defines. Any thread_local
+// with a non-trivial destructor then fails to link. Darwin lowers thread_local
+// destructors to _tlv_atexit and never wants it either.
+static const char *const kLibcxxabiPosixFiles[] = {
     "src/cxa_thread_atexit.cpp",
 };
 
