@@ -870,6 +870,19 @@ bool buildCxxRuntime(const std::string &self, const std::string &triple,
     a.push_back(V.fast ? "-O2" : "-Os");
   };
 
+  // Bitcode whenever the link is -flto, mirroring the libc. A NATIVE archive
+  // member is pulled only once something needs it, which can be after the LTO
+  // backend has computed its preserve set from the native references it saw;
+  // a libc symbol referenced ONLY from such a member is internalized and
+  // dropped, then turns up undefined. That is `abort` from libunwind's
+  // _LIBUNWIND_ABORT (avif armv7l, once its last native codec archive became
+  // bitcode) and was `__assert_fail` before -DNDEBUG papered over that one
+  // instance. Same LTO unit, no ordering, whole class gone. .S stays native —
+  // the assembler emits an object either way.
+  auto addLto = [&](std::vector<std::string> &a) {
+    if (V.lto) a.push_back("-flto");
+  };
+
   // Build-only macros + warnings shared by libc++ and libc++abi. The config-site
   // knobs (ABI version, threads, musl, hardening, …) are NOT here — they come
   // from the embedded __config_site. Only build-time switches remain.
@@ -923,6 +936,7 @@ bool buildCxxRuntime(const std::string &self, const std::string &triple,
     // mingw headers redeclare some libunwind symbols with dllimport attrs.
     if (isWin) a.push_back("-Wno-dll-attribute-on-redeclaration");
     addVariant(a);
+    if (!isAsm) addLto(a);
     target(a);
     a.push_back("-c");
     a.push_back(cx + "/" + r);
@@ -954,6 +968,7 @@ bool buildCxxRuntime(const std::string &self, const std::string &triple,
     a.push_back("-I");
     a.push_back(cx + "/libcxx/src");
     addVariant(a);
+    addLto(a);
     target(a);
     a.push_back("-c");
     a.push_back(cx + "/" + r);
@@ -991,6 +1006,7 @@ bool buildCxxRuntime(const std::string &self, const std::string &triple,
     a.push_back("-I");
     a.push_back(cx + "/libc"); // llvm-libc shim (shared/fp_bits.h, …)
     addVariant(a);
+    addLto(a);
     target(a);
     a.push_back("-c");
     a.push_back(cx + "/" + r);
@@ -1498,6 +1514,23 @@ bool isLinkStep(ArrayRef<const char *> Args) {
   return true;
 }
 
+// A relocatable link (`-r`) merges inputs into ONE object file: no entry point,
+// no crt, no libraries. The self-contained link the fronts inject below breaks
+// it outright (`-static` + crt1.o + `-lc` all reject `-r`), but the linker still
+// has to be lld — nothing else reads our bitcode. So `-r` keeps the linker
+// selection and drops everything else. Excluding `-r` from isLinkStep instead
+// (as an earlier revision did) drops the selection too, and `$CC -r` over
+// bitcode then falls to a linker that cannot read it.
+bool isRelocatableLink(ArrayRef<const char *> Args) {
+  for (size_t i = 1; i < Args.size(); ++i) {
+    StringRef a = Args[i];
+    if (a == "-r" || a == "--relocatable" || a == "-Wl,-r" ||
+        a == "-Wl,--relocatable")
+      return true;
+  }
+  return false;
+}
+
 // C++ mode? Mirror clang's own detection: a "++" driver face (clang++/c++/g++),
 // --driver-mode=g++, an explicit `-x c++…`, -stdlib=libc++/-lc++, or any
 // positional input with a C++ source extension. Drives libc++ include + link.
@@ -1633,6 +1666,13 @@ void frontRewriteDarwin(SmallVectorImpl<const char *> &Args, StringSaver &Saver,
   std::string dir = ensureDarwinSysroot(ti.triple, ti.archTok, V);
   if (dir.empty()) return; // build failed; let clang error naturally
 
+  if (isRelocatableLink(Args)) {
+    add("-nostdlib");
+    add("-fuse-ld=lld");
+    add(Twine("-B") + dir + "/bin");
+    return;
+  }
+
   std::string muslArch = muslArchName(ti.archTok);
   std::string cxxLib;
   if (cxx) cxxLib = ensureCxxRuntime(ti.triple, muslArch, /*headerTriple=*/"", V,
@@ -1703,6 +1743,13 @@ void frontRewriteWin(SmallVectorImpl<const char *> &Args, StringSaver &Saver,
   Variant V = parseVariant(Args, ti.triple);
   std::string dir = ensureWinSysroot(ti.triple, ti.archTok, V);
   if (dir.empty()) return; // build failed; let clang error naturally
+
+  if (isRelocatableLink(Args)) {
+    add("-nostdlib");
+    add("-fuse-ld=lld");
+    add(Twine("-B") + dir + "/bin");
+    return;
+  }
 
   std::string muslArch = muslArchName(ti.archTok);
   std::string cxxLib;
@@ -1793,6 +1840,13 @@ void frontRewriteMusl(SmallVectorImpl<const char *> &Args, StringSaver &Saver) {
 
   std::string dir = ensureSysroot(ti.triple, muslArch, headerTriple, V);
   if (dir.empty()) return; // build failed; let clang error naturally
+
+  if (isRelocatableLink(Args)) {
+    add("-nostdlib");
+    add("-fuse-ld=lld");
+    add(Twine("-B") + dir + "/bin");
+    return;
+  }
 
   std::string cxxLib;
   if (cxx) cxxLib = ensureCxxRuntime(ti.triple, muslArch, headerTriple, V);
