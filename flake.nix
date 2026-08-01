@@ -290,7 +290,15 @@
         # pango). Emitted at build time so `$CC`/`$CXX` expand there. meson
         # REPLACES (not merges) a [host_machine] a later --cross-file redefines,
         # hence the full section rather than just `subsystem` — which is the
-        # second half of the fix, since it cannot autodetect in cross mode.
+        # second half of the fix, since it cannot autodetect in cross mode
+        # ("Subsystem not defined or could not be autodetected").
+        #
+        # ATTACH PER-PACKAGE, never by overriding the global `meson`. gnutar's
+        # checkPhase closure transitively pulls `meson`, so ANY change to the
+        # `meson` derivation re-hashes the whole darwin stdenv closure — gnutar
+        # included — forcing a from-source rebuild on the GHA macos-14 runner
+        # where gnutar test 155 (time01 "tricky time stamps") fails, cascading to
+        # EVERY darwin build.
         withDarwinMesonObjc = pkgs: drv:
           let hp = pkgs.stdenv.hostPlatform; in
           drv.overrideAttrs (oa: {
@@ -994,57 +1002,6 @@
           if isLLDTarget pkgs then [ (lldRSafe pkgs.buildPackages) ]
           else [ ];
 
-        # nixos-26.05 meson (glib 2.88, pango 1.57, harfbuzz, gdk-pixbuf, …)
-        # evaluates `subsystem = host_machine.subsystem()` on darwin; in CROSS
-        # mode meson can't autodetect it and aborts
-        #   ERROR: Subsystem not defined or could not be autodetected
-        # and nixpkgs' generated cross-file (build-support/lib/meson.nix
-        # [host_machine]) omits `subsystem`. When a cross-file is already in play
-        # (a real cross — guard so we never force cross mode onto a native build)
-        # this appends a supplemental cross-file re-emitting the COMPLETE
-        # [host_machine] + subsystem='macos' (meson REPLACES [host_machine]
-        # across files — a partial one drops system/cpu/endian → "Machine info
-        # is currently {'subsystem'…}").
-        #
-        # ATTACH PER-PACKAGE, never by overriding the global `meson`. gnutar's
-        # checkPhase closure transitively pulls `meson`, so ANY change to the
-        # `meson` derivation (even its propagatedBuildInputs) re-hashes the whole
-        # darwin stdenv closure — gnutar included — forcing a from-source rebuild
-        # on the GHA macos-14 runner where gnutar test 155 (time01 "tricky time
-        # stamps") fails, cascading to EVERY darwin build. So the setup-hook
-        # rides the CONSUMING package's own nativeBuildInputs; the cached
-        # stdenv/gnutar stay untouched. The per-package objc nativeFixes
-        # (glib/pango/cairo) already carry their own complete [host_machine]
-        # section; apply this to any other meson package that needs it.
-        withDarwinMesonSubsystem = pkgs: drv:
-          let
-            bp = pkgs.buildPackages;
-            hp = pkgs.stdenv.hostPlatform;
-            cpuFamily = if hp.isAarch64 then "aarch64" else "x86_64";
-            hook = bp.makeSetupHook { name = "meson-darwin-subsystem-hook"; }
-              (bp.writeText "meson-darwin-subsystem-hook.sh" ''
-                _unpinsMesonDarwinSubsystem() {
-                  case " ''${mesonFlags:-} ''${mesonFlagsArray[*]:-} " in
-                    *--cross-file*) ;;
-                    *) return 0 ;;
-                  esac
-                  cat > "$NIX_BUILD_TOP/unpins-darwin-subsystem.ini" <<EOF
-                [host_machine]
-                system = 'darwin'
-                cpu_family = '${cpuFamily}'
-                cpu = '${hp.parsed.cpu.name}'
-                endian = 'little'
-                subsystem = 'macos'
-                EOF
-                  mesonFlagsArray+=("--cross-file=$NIX_BUILD_TOP/unpins-darwin-subsystem.ini")
-                }
-                preConfigureHooks+=(_unpinsMesonDarwinSubsystem)
-              '');
-          in
-          drv.overrideAttrs (o: {
-            nativeBuildInputs = (o.nativeBuildInputs or [ ]) ++ [ hook ];
-          });
-
         # armv7l (aarch32) engine cross: nothing sets CC_FOR_BUILD, so meson
         # auto-detects the engine's unprefixed `cc` (an arm-TARGETING clang) as
         # the BUILD-machine compiler too (CI log: "C compiler for the build
@@ -1070,7 +1027,7 @@
         # riscv64) already keep a builder-native build compiler.
         #
         # Attach per-package via nativeBuildInputs — NEVER touch the global meson
-        # drv (re-hashes the world, see withDarwinMesonSubsystem above). Gated to
+        # drv (re-hashes the world, see withDarwinMesonObjc above). Gated to
         # aarch32 cross by its enginePkgsStatic call site → strict no-op
         # (byte-identical) on every other arch and non-meson package.
         withMesonBuildCC = pkgs: drv:

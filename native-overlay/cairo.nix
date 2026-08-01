@@ -6,8 +6,9 @@
 # overrideAttrs must NEVER read `oa.mesonFlags` — forcing the list re-triggers
 # the throw before our value lands — so reconstruct it: mirror the pinned cairo
 # mesonFlags + pkgsStatic flags, with deferred-release set 'false' (valid, and
-# correct: macOS shmctl(IPC_RMID) forbids later attaches). The standard
-# [host_machine] cross-file is re-added by the meson setup hook.
+# correct: macOS shmctl(IPC_RMID) forbids later attaches). nixpkgs' own meson
+# setup hook still contributes its [host_machine] cross-file via
+# mesonFlagsArray, which `mesonFlags` here does not displace.
 { lib }:
 pkgs:
 let
