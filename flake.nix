@@ -1198,30 +1198,39 @@
         # openssl's packaging delta, single-sourced so the standalone `openssl`
         # package, its Windows build, and every engine consumer (native-overlay/
         # openssl.nix) apply the identical recipe instead of each re-rolling it.
-        # nixpkgs compiles OPENSSLDIR/ENGINESDIR/MODULESDIR as paths into the static
-        # libcrypto; left alone they point at the /nix/store output (a store ref in a
-        # self-contained binary, and a path that doesn't exist on the user's host).
-        # Retarget the three to the conventional system locations (sslDir = /etc/ssl
-        # natively, C:/ssl on Windows) so the binary stays 0-ref and consults the
-        # host's openssl.cnf + trust store like a distro openssl. nixpkgs adds `no-ct`
-        # for static builds solely because CT bakes a /nix/store CTLOG_FILE; with
-        # OPENSSLDIR retargeted that follows to sslDir/ct_log_list.cnf, so drop the
-        # flag and ship CT. c_rehash is a legacy perl-equivalent shim wrapped via
-        # makeWrapper; we delete it, but makeBinaryWrapper *compiles* it first with
-        # `cc -x c -` (C on stdin) — under the unpin-llvm engine the cc-wrapper
-        # appends crt1.o while -x c is active and clang parses the ELF crt as C
-        # (-Werror,-Wnull-character). Stub makeWrapper so the shim is never built
-        # (non-engine builds compiled it fine but deleted it anyway — pure waste).
-        retargetOpenssl = sslDir: enginesDir: modulesDir: old: {
-          configureFlags = builtins.filter (f: f != "no-ct") (old.configureFlags or [ ]);
-          buildFlags = (old.buildFlags or [ ]) ++ [
+        #
+        # nixpkgs compiles OPENSSLDIR/ENGINESDIR/MODULESDIR into libcrypto as
+        # paths; left alone they point at the /nix/store output — a store ref in
+        # a self-contained binary, and a path absent on the user's host. Retarget
+        # them to the conventional system location (`sslDir` = /etc/ssl natively,
+        # C:/ssl on Windows) so the binary stays 0-ref and reads the host's
+        # openssl.cnf + trust store like a distro openssl. engines-3/ossl-modules
+        # are openssl's own fixed layout under it, not a choice — hence one
+        # parameter, not three.
+        #
+        # Dropping `no-ct` is the same change, not a second one: nixpkgs adds it
+        # for static builds solely because CT bakes a /nix/store CTLOG_FILE, which
+        # now follows OPENSSLDIR to sslDir/ct_log_list.cnf. So CT ships.
+        #
+        # c_rehash (legacy perl-equivalent of `openssl rehash`) is deleted in two
+        # halves, because it arrives twice: `make install_sw` installs upstream's
+        # perl script, then nixpkgs' postInstall overwrites it with a makeWrapper
+        # shim. The `rm` handles the script; the stub handles the shim — which
+        # must never be *built*, since makeBinaryWrapper compiles it with
+        # `cc -x c -` and under the engine the cc-wrapper appends crt1.o while
+        # -x c is still active, so clang parses the ELF crt as C
+        # (-Werror,-Wnull-character). Non-engine builds compiled it fine and
+        # deleted it anyway, so the stub costs them nothing.
+        retargetOpenssl = sslDir: oa: {
+          configureFlags = builtins.filter (f: f != "no-ct") (oa.configureFlags or [ ]);
+          buildFlags = (oa.buildFlags or [ ]) ++ [
             "OPENSSLDIR=${sslDir}"
-            "ENGINESDIR=${enginesDir}"
-            "MODULESDIR=${modulesDir}"
+            "ENGINESDIR=${sslDir}/engines-3"
+            "MODULESDIR=${sslDir}/ossl-modules"
           ];
           postInstall = ''
             makeWrapper() { :; }
-          '' + (old.postInstall or "") + ''
+          '' + (oa.postInstall or "") + ''
             rm -f "''${bin:-$out}/bin/c_rehash"
           '';
         };

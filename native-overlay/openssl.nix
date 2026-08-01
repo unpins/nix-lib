@@ -16,7 +16,7 @@
   apply = pkgs:
     let
       base = pkgs.openssl.overrideAttrs
-        (lib.retargetOpenssl "/etc/ssl" "/etc/ssl/engines-3" "/etc/ssl/ossl-modules");
+        (lib.retargetOpenssl "/etc/ssl");
       # 32-bit ARM (armv7l/armv6): OpenSSL's Configure appends `-latomic` to its
       # own app/test link (apps/openssl etc.). A static-musl + compiler-rt
       # toolchain ships no `libatomic.a` — the generic `__atomic_*` libcalls live
