@@ -977,14 +977,14 @@
           '';
 
         # The unpins-standard lld options for a non-darwin final link.
-        lldStdOpts = _: "-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe";
+        lldStdOpts = "-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe";
         # `-B<lld>/bin` makes the driver find `ld.lld` for `-fuse-ld=lld` without
         # lld on PATH, so appending `${lib.gcSectionsFlag pkgs}` to a post-link is
         # self-sufficient (no per-package nativeBuildInputs edit). lld/bin ships no
         # `ld`/`as`/`ar`, so -B can't shadow the build's binutils.
         gcSectionsFlag = pkgs:
           if isLLDTarget pkgs then
-            "-B${lldRSafe pkgs.buildPackages}/bin ${lldStdOpts pkgs}"
+            "-B${lldRSafe pkgs.buildPackages}/bin ${lldStdOpts}"
           else "";
 
         # `lld` build tool for the scope. Only needed where a link uses
@@ -1189,7 +1189,7 @@
                  || !(super ? ${pkgName}) then { }
               else {
                 ${pkgName} = (appendLinkFlags super.${pkgName}
-                  (lldStdOpts super)).overrideAttrs (old: {
+                  lldStdOpts).overrideAttrs (old: {
                   # Use the pre-`.extend` host lld (`basePkgs.buildPackages`),
                   # NOT `super.buildPackages.lld`. In a cross scope `super` is
                   # the *extended* pkgsStatic whose buildPackages carries this
