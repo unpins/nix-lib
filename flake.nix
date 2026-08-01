@@ -276,6 +276,54 @@
         # omits it (clang warns "argument unused" under -E, which a -Werror probe
         # reads as unsupported). Bitcode app objs + ELF musl libc.a is the
         # standard LTO-app/non-LTO-libc case.
+
+        # Is this package set built by the engine cc? Every per-target fix that
+        # works around a clang-vs-gcc difference gates on it, so it has ONE
+        # definition: the cc is named by `unpinCC`/`ccUnwrapped` below, and a
+        # rename there must not silently turn a dozen fixes into no-ops.
+        isUnpinEngine = pkgs:
+          nixpkgs.lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
+
+        # meson refuses `add_languages('objc')` in cross mode unless the cross
+        # file names objc/objcpp, and nixpkgs' darwin cross file omits both — so
+        # a linux→darwin cross-eval aborts for any package that calls it (glib,
+        # pango). Emitted at build time so `$CC`/`$CXX` expand there. meson
+        # REPLACES (not merges) a [host_machine] a later --cross-file redefines,
+        # hence the full section rather than just `subsystem` — which is the
+        # second half of the fix, since it cannot autodetect in cross mode.
+        withDarwinMesonObjc = pkgs: drv:
+          let hp = pkgs.stdenv.hostPlatform; in
+          drv.overrideAttrs (oa: {
+            preConfigure = (oa.preConfigure or "") + ''
+              cat > "$NIX_BUILD_TOP/objc-cross.conf" <<EOF
+              [binaries]
+              objc = '$CC'
+              objcpp = '$CXX'
+
+              [host_machine]
+              system = 'darwin'
+              cpu_family = '${if hp.isAarch64 then "aarch64" else "x86_64"}'
+              cpu = '${hp.parsed.cpu.name}'
+              endian = 'little'
+              subsystem = 'macos'
+              EOF
+              mesonFlagsArray+=("--cross-file=$NIX_BUILD_TOP/objc-cross.conf")
+            '';
+          });
+
+        # Loader shared by the three per-target fix directories: `<pkg>.nix` is
+        # the fix for `<pkg>`, so there is no index to drift from the files.
+        importFixDir = { dir, lib }:
+          nixpkgs.lib.mapAttrs'
+            (file: _: nixpkgs.lib.nameValuePair
+              (nixpkgs.lib.removeSuffix ".nix" file)
+              (import (dir + "/${file}") { inherit lib; }))
+            (nixpkgs.lib.filterAttrs
+              (file: type: type == "regular"
+                && file != "default.nix"
+                && nixpkgs.lib.hasSuffix ".nix" file)
+              (builtins.readDir dir));
+
         unpinAdapterStdenv =
           { pkgs, toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
           , target, optClass ? "-O2", cxx ? true, native ? false, lto ? false
