@@ -1323,10 +1323,10 @@
         # issue, and --enable-static there is a genuine static-link request).
         filterEnableStaticOnDarwin = drv:
           if (drv.stdenv.hostPlatform.isDarwin or false)
-          then drv.overrideAttrs (old: {
-            configureFlags = nixpkgs.lib.filter
+          then drv.overrideAttrs (oa: {
+            configureFlags = builtins.filter
               (f: f != "--enable-static" && f != "--disable-shared")
-              (old.configureFlags or [ ]);
+              (oa.configureFlags or [ ]);
           })
           else drv;
 
@@ -1354,18 +1354,18 @@
             buildSalt = pkgs.buildPackages.stdenv.cc.suffixSalt;
           in
           if !(host.isDarwin or false) then drv
-          else drv.overrideAttrs (old: {
-            buildInputs = [ pkgs.pkgsStatic.libiconv ] ++ (old.buildInputs or [ ]);
-            preBuild = (old.preBuild or "")
+          else drv.overrideAttrs (oa: {
+            buildInputs = [ pkgs.pkgsStatic.libiconv ] ++ (oa.buildInputs or [ ]);
+            preBuild = (oa.preBuild or "")
               + nixpkgs.lib.optionalString cross ''
                 export NIX_LDFLAGS_${buildSalt}="''${NIX_LDFLAGS_${buildSalt}:-} -L${nixpkgs.lib.getLib pkgs.buildPackages.libiconv}/lib"
               '';
-          # structuredAttrs drvs (coreutils-full) keep NIX_LDFLAGS in `env`;
-          # setting it top-level too is a hard collision. Route to env there,
-          # keep the top-level append everywhere else (byte-identical).
-          } // (if old ? env && old.env ? NIX_LDFLAGS
-                then { env = old.env // { NIX_LDFLAGS = old.env.NIX_LDFLAGS + " -liconv"; }; }
-                else { NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " -liconv"; }));
+          # Hand-rolled instead of appendLdFlags: the helper writes a bare
+          # `-liconv` when the drv has no NIX_LDFLAGS, this writes " -liconv".
+          # Same link line, different hash — unifying is a deliberate rebuild.
+          } // (if oa ? env && oa.env ? NIX_LDFLAGS
+                then { env = oa.env // { NIX_LDFLAGS = oa.env.NIX_LDFLAGS + " -liconv"; }; }
+                else { NIX_LDFLAGS = (oa.NIX_LDFLAGS or "") + " -liconv"; }));
 
         # Build-host-native tool that packs a staging `unpin/` tree into a
         # zstd-in-zip (ZIP method 93) overlay — the format withMan/withAliases use.
