@@ -28,24 +28,24 @@
   apply = pkgs:
     let
       host = pkgs.stdenv.hostPlatform;
-      isEngine = lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
+      isEngine = lib.isUnpinEngine pkgs;
     in
     pkgs.graphite2.overrideAttrs (oa: {
       postPatch = (oa.postPatch or "")
         + lib.optionalString host.isDarwin ''
-          substituteInPlace src/CMakeLists.txt --replace-fail \
-            '    include(Graphite)
-              nolib_test(stdc++ $<TARGET_SONAME_FILE:graphite2>)' \
-            '    include(Graphite)
-              if (BUILD_SHARED_LIBS)
-                  nolib_test(stdc++ $<TARGET_SONAME_FILE:graphite2>)
-              endif ()'
-        ''
+        substituteInPlace src/CMakeLists.txt --replace-fail \
+          '    include(Graphite)
+            nolib_test(stdc++ $<TARGET_SONAME_FILE:graphite2>)' \
+          '    include(Graphite)
+            if (BUILD_SHARED_LIBS)
+                nolib_test(stdc++ $<TARGET_SONAME_FILE:graphite2>)
+            endif ()'
+      ''
         + lib.optionalString isEngine ''
-          substituteInPlace CMakeLists.txt \
-            --replace-fail 'add_subdirectory(tests)' '# add_subdirectory(tests)' \
-            --replace-fail 'add_subdirectory(gr2fonttest)' '# add_subdirectory(gr2fonttest)'
-        '';
+        substituteInPlace CMakeLists.txt \
+          --replace-fail 'add_subdirectory(tests)' '# add_subdirectory(tests)' \
+          --replace-fail 'add_subdirectory(gr2fonttest)' '# add_subdirectory(gr2fonttest)'
+      '';
     } // lib.optionalAttrs host.isStatic {
       postFixup = (oa.postFixup or "") + ''
         la="$out/lib/libgraphite2.la"

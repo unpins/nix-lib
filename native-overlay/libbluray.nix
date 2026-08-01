@@ -21,20 +21,20 @@
 pkgs:
 let
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-  isEngine = lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
+  isEngine = lib.isUnpinEngine pkgs;
 in
 pkgs.libbluray.overrideAttrs (oa:
-  if isEngine then {
-    postPatch = (oa.postPatch or "") + ''
-      sed -i 's/\bdec_init\b/bluray_internal_dec_init/g' \
-        src/libbluray/disc/dec.h src/libbluray/disc/dec.c src/libbluray/disc/disc.c
-    '';
-  } else {
-    postInstall = (oa.postInstall or "") + ''
-      echo "renaming dec_init -> bluray_internal_dec_init in libbluray.a"
-      $OBJCOPY ${if isDarwin
-        then "--redefine-sym=_dec_init=_bluray_internal_dec_init"
-        else "--redefine-sym=dec_init=bluray_internal_dec_init"} \
-        $out/lib/libbluray.a
-    '';
-  })
+if isEngine then {
+  postPatch = (oa.postPatch or "") + ''
+    sed -i 's/\bdec_init\b/bluray_internal_dec_init/g' \
+      src/libbluray/disc/dec.h src/libbluray/disc/dec.c src/libbluray/disc/disc.c
+  '';
+} else {
+  postInstall = (oa.postInstall or "") + ''
+    echo "renaming dec_init -> bluray_internal_dec_init in libbluray.a"
+    $OBJCOPY ${if isDarwin
+      then "--redefine-sym=_dec_init=_bluray_internal_dec_init"
+      else "--redefine-sym=dec_init=bluray_internal_dec_init"} \
+      $out/lib/libbluray.a
+  '';
+})

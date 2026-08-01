@@ -14,15 +14,16 @@
   autoWire = "static";
   apply = pkgs:
     let
-      isEngine = lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
+      isEngine = lib.isUnpinEngine pkgs;
     in
     if isEngine && pkgs.stdenv.hostPlatform.isAarch32 then
-      pkgs.libde265.overrideAttrs (oa: {
-        postPatch = (oa.postPatch or "") + ''
-          substituteInPlace libde265/arm/CMakeLists.txt \
-            --replace-fail '-DHAVE_AS_FUNC' ""
-        '';
-      })
+      pkgs.libde265.overrideAttrs
+        (oa: {
+          postPatch = (oa.postPatch or "") + ''
+            substituteInPlace libde265/arm/CMakeLists.txt \
+              --replace-fail '-DHAVE_AS_FUNC' ""
+          '';
+        })
     else
       pkgs.libde265;
 }

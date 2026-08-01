@@ -17,8 +17,8 @@ pkgs:
 let
   isMinGW = pkgs.stdenv.hostPlatform.isMinGW or false;
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-  isEngine = lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
-  dropNative = lib.filter
+  isEngine = lib.isUnpinEngine pkgs;
+  dropNative = builtins.filter
     (x: !(builtins.elem (x.pname or x.name or "") [ "gdk-pixbuf" "make-shell-wrapper-hook" ]));
 in
 pkgs.libavif.overrideAttrs (oa: {
@@ -31,9 +31,9 @@ pkgs.libavif.overrideAttrs (oa: {
   # darwin stdenv has xcrun and keeps its cached drv.
   postPatch = (oa.postPatch or "")
     + lib.optionalString (isDarwin && isEngine) ''
-      substituteInPlace cmake/Modules/merge_static_libs.cmake \
-        --replace-fail 'if(APPLE)' 'if(FALSE)'
-    '';
+    substituteInPlace cmake/Modules/merge_static_libs.cmake \
+      --replace-fail 'if(APPLE)' 'if(FALSE)'
+  '';
   nativeBuildInputs =
     if isMinGW then dropNative (oa.nativeBuildInputs or [ ]) else (oa.nativeBuildInputs or [ ]);
   cmakeFlags = [

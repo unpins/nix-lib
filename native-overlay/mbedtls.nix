@@ -38,17 +38,18 @@
 { lib }:
 {
   autoWire = "static";
-  apply = scope:
+  apply = pkgs:
     let
-      isEngine = lib.hasInfix "unpin-cc" (scope.stdenv.cc.name or "");
-      isDarwin = scope.stdenv.hostPlatform.isDarwin or false;
+      isEngine = lib.isUnpinEngine pkgs;
+      isDarwin = pkgs.stdenv.hostPlatform.isDarwin or false;
     in
-    scope.mbedtls.overrideAttrs (oa: {
+    pkgs.mbedtls.overrideAttrs (oa: {
       cmakeFlags =
         if isEngine
-        then builtins.filter
-          (f: !(lib.hasInfix "zero-init-padding-bits" (toString f)))
-          (oa.cmakeFlags or [ ])
+        then
+          builtins.filter
+            (f: !(lib.hasInfix "zero-init-padding-bits" (toString f)))
+            (oa.cmakeFlags or [ ])
         else oa.cmakeFlags or [ ];
       checkPhase = ''
         runHook preCheck

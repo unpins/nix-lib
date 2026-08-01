@@ -11,12 +11,12 @@ pkgs:
 let
   isMinGW = pkgs.stdenv.hostPlatform.isMinGW or false;
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-  isEngine = lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
+  isEngine = lib.isUnpinEngine pkgs;
   # asciidoc/doxygen everywhere (docs off); gdk-pixbuf + make-shell-wrapper-hook
   # only on mingw — they survive enablePlugins=false, and the wrapper hook
   # splices to a mingw bash that can't cross-compile (no sigset_t). Same trap
   # as libavif. Gated to mingw to keep native/darwin's cached closure.
-  dropNative = lib.filter
+  dropNative = builtins.filter
     (x: !(builtins.elem (x.pname or x.name or "")
       ([ "asciidoc" "doxygen" ] ++ lib.optionals isMinGW [ "gdk-pixbuf" "make-shell-wrapper-hook" ])));
   # buildInputs are mostly cjxl/djxl tool + benchmark/test deps, unused by the
@@ -29,7 +29,7 @@ let
   toolingDrops = [ "gperftools" ]
     ++ lib.optionals isMinGW
     [ "gtest" "giflib" "libjpeg-turbo" "libpng-apng" "libwebp" "gdk-pixbuf" "openexr" ];
-  dropTooling = lib.filter (x: !(builtins.elem (x.pname or x.name or "") toolingDrops));
+  dropTooling = builtins.filter (x: !(builtins.elem (x.pname or x.name or "") toolingDrops));
 in
 (pkgs.libjxl.override { enablePlugins = false; }).overrideAttrs (oa: {
   depsBuildBuild = [ ];
@@ -46,15 +46,15 @@ in
     "-DJPEGXL_ENABLE_TOOLS=OFF"
     "-DBUILD_TESTING=OFF"
   ]
-  # cross-darwin static: pkgsStatic's -DCMAKE_LINK_SEARCH_START_STATIC=ON makes
-  # every try-link probe link statically, but darwin has no static libSystem so
-  # link-probing REQUIRED find_package()s abort. Pre-seed the cache var each
-  # keys on (known-true on x86_64 darwin) so CMake skips the broken probe:
-  #   - FindThreads: pthreads live in libSystem (no lib flag).
-  #   - FindAtomics: x86_64 has lock-free atomics → no -latomic.
-  # Can't just flip LINK_SEARCH_START_STATIC off — pkgsStatic appends its ON
-  # after ours and wins; the pre-seed sidesteps the probe.
-  ++ lib.optionals isDarwin [
+    # cross-darwin static: pkgsStatic's -DCMAKE_LINK_SEARCH_START_STATIC=ON makes
+    # every try-link probe link statically, but darwin has no static libSystem so
+    # link-probing REQUIRED find_package()s abort. Pre-seed the cache var each
+    # keys on (known-true on x86_64 darwin) so CMake skips the broken probe:
+    #   - FindThreads: pthreads live in libSystem (no lib flag).
+    #   - FindAtomics: x86_64 has lock-free atomics → no -latomic.
+    # Can't just flip LINK_SEARCH_START_STATIC off — pkgsStatic appends its ON
+    # after ours and wins; the pre-seed sidesteps the probe.
+    ++ lib.optionals isDarwin [
     "-DCMAKE_HAVE_LIBC_PTHREAD=ON"
     "-DATOMICS_LOCK_FREE_INSTRUCTIONS=ON"
   ];

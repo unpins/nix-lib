@@ -34,37 +34,40 @@
 { lib }:
 let
   engineFix = pkgs: drv:
-    if lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "")
-    then drv.overrideAttrs (oa: {
-      configureFlags = (oa.configureFlags or [ ]) ++ [ "--disable-dependency-tracking" ];
-      makeFlags = (oa.makeFlags or [ ]) ++ [ "HAVE_GNU_STRIP=no" ];
-      preConfigure = (oa.preConfigure or "")
-        + lib.optionalString pkgs.stdenv.hostPlatform.isAarch32 ''
-          export AS="$CC -c"
-        '';
-    })
+    if lib.isUnpinEngine pkgs
+    then
+      drv.overrideAttrs
+        (oa: {
+          configureFlags = (oa.configureFlags or [ ]) ++ [ "--disable-dependency-tracking" ];
+          makeFlags = (oa.makeFlags or [ ]) ++ [ "HAVE_GNU_STRIP=no" ];
+          preConfigure = (oa.preConfigure or "")
+            + lib.optionalString pkgs.stdenv.hostPlatform.isAarch32 ''
+            export AS="$CC -c"
+          '';
+        })
     else drv;
 in
 pkgs:
 if pkgs.stdenv.hostPlatform.isDarwin
 then
-  engineFix pkgs ((pkgs.libvpx.override {
-    stdenv = pkgs.stdenv // {
-      hostPlatform = pkgs.stdenv.hostPlatform // {
-        osxMinVersion = "10.10";
+  engineFix pkgs
+    ((pkgs.libvpx.override {
+      stdenv = pkgs.stdenv // {
+        hostPlatform = pkgs.stdenv.hostPlatform // {
+          osxMinVersion = "10.10";
+        };
       };
-    };
-  }).overrideAttrs (oa: {
-    configureFlags =
-      (builtins.filter
-        (f: !(lib.hasPrefix "--target=x86_64-darwin" f
+    }).overrideAttrs (oa: {
+      configureFlags =
+        (builtins.filter
+          (f: !(lib.hasPrefix "--target=x86_64-darwin" f
           || lib.hasPrefix "--target=arm64-darwin" f
           || lib.hasPrefix "--target=aarch64-darwin" f))
-        oa.configureFlags)
-      ++ [
-        "--target=${
+          oa.configureFlags)
+        ++ [
+          "--target=${
           if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "x86_64"
         }-darwin23-gcc"
-      ];
-  }))
+        ];
+    }))
 else engineFix pkgs pkgs.libvpx

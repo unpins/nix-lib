@@ -9,8 +9,8 @@
 #
 # 2. nixpkgs propagates `llvmPackages.openmp` (clang `--enable-openmp` default),
 #    which mis-classifies its OMPD/GDB helpers as buildInputs → pulls
-#    pkgsStatic.python3 (broken on darwin). The structural fix ([[llvm-openmp]],
-#    `ompdGdbSupport = false`) would build openmp itself, pulling a broken
+#    pkgsStatic.python3 (broken on darwin). The structural fix — openmp's own
+#    `ompdGdbSupport = false` — would build openmp itself, pulling a broken
 #    llvm-static. Side-step with `emptyDirectory`; fftw keeps `--enable-threads`
 #    (pthread), which is what consumers exercise.
 #
@@ -24,7 +24,7 @@
 pkgs:
 let
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-  isEngine = lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
+  isEngine = lib.isUnpinEngine pkgs;
   stripGfortran = oa: builtins.filter
     (d: !(d.pname or null == "gfortran-wrapper"))
     (oa.nativeBuildInputs or [ ]);
@@ -35,10 +35,11 @@ if isDarwin || isEngine
 then
   (pkgs.fftw.override {
     llvmPackages = { openmp = pkgs.emptyDirectory; };
-  }).overrideAttrs (oa: {
-    buildInputs = [ ];
-    nativeBuildInputs = stripGfortran oa;
-    configureFlags =
-      builtins.filter (f: f != "--enable-openmp") oa.configureFlags;
-  })
+  }).overrideAttrs
+    (oa: {
+      buildInputs = [ ];
+      nativeBuildInputs = stripGfortran oa;
+      configureFlags =
+        builtins.filter (f: f != "--enable-openmp") oa.configureFlags;
+    })
 else pkgs.fftw.overrideAttrs (oa: { nativeBuildInputs = stripGfortran oa; })
