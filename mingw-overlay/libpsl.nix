@@ -9,15 +9,15 @@
 self: super:
 (super.libpsl.override {
   inherit (self) libidn2;
-}).overrideAttrs (old: {
-  propagatedBuildInputs = (old.propagatedBuildInputs or [ ])
+}).overrideAttrs (oa: {
+  propagatedBuildInputs = (oa.propagatedBuildInputs or [ ])
     ++ [ self.libunistring self.libiconv ];
-  postFixup = (old.postFixup or "") + ''
-    pc="$dev/lib/pkgconfig/libpsl.pc"
-    if [ -f "$pc" ]; then
-      sed -i '/^Libs:/c\
-Libs: -L''${libdir} -L${self.libunistring}/lib -L${self.libiconv}/lib -lpsl -lidn2 -lunistring -liconv -lws2_32
-' "$pc"
-    fi
+  postFixup = (oa.postFixup or "") + ''
+        pc="$dev/lib/pkgconfig/libpsl.pc"
+        if [ -f "$pc" ]; then
+          sed -i '/^Libs:/c\
+    Libs: -L''${libdir} -L${self.libunistring}/lib -L${self.libiconv}/lib -lpsl -lidn2 -lunistring -liconv -lws2_32
+    ' "$pc"
+        fi
   '';
 })

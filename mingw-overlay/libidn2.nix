@@ -6,11 +6,11 @@
 # consumers defining their own (git's usage.c); localize it.
 { lib }:
 self: super:
-super.libidn2.overrideAttrs (old: {
-  makeFlags = (old.makeFlags or [ ]) ++ [ "LDFLAGS=-all-static" ];
-  propagatedBuildInputs = (old.propagatedBuildInputs or [ ])
+super.libidn2.overrideAttrs (oa: {
+  makeFlags = (oa.makeFlags or [ ]) ++ [ "LDFLAGS=-all-static" ];
+  propagatedBuildInputs = (oa.propagatedBuildInputs or [ ])
     ++ [ self.libunistring ];
-  postInstall = (old.postInstall or "") + ''
+  postInstall = (oa.postInstall or "") + ''
     if [ -f "$out/lib/libidn2.a" ]; then
       chmod u+w "$out/lib/libidn2.a"
       $OBJCOPY --localize-symbol=error "$out/lib/libidn2.a"

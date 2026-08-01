@@ -4,8 +4,8 @@
 # so every consumer picks it up automatically.
 { lib }:
 self: super:
-super.flac.overrideAttrs (old: {
-  postFixup = (old.postFixup or "") + ''
+super.flac.overrideAttrs (oa: {
+  postFixup = (oa.postFixup or "") + ''
     for pc in $dev/lib/pkgconfig/*.pc; do
       [ -f "$pc" ] || continue
       if ! grep -q 'FLAC__NO_DLL' "$pc"; then

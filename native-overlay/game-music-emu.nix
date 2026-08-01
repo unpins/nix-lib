@@ -3,6 +3,6 @@
 # Drop postFixup; the `.a` carries no build-tool refs to scrub anyway.
 { lib }:
 pkgs:
-pkgs.game-music-emu.overrideAttrs (_oa: {
+pkgs.game-music-emu.overrideAttrs (_: {
   postFixup = "";
 })

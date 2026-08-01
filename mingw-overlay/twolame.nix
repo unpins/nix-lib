@@ -9,8 +9,8 @@
 # `_WIN32` instead (no DLL in the cross output anyway).
 { lib }:
 self: super:
-super.twolame.overrideAttrs (old: {
-  postInstall = (old.postInstall or "") + ''
+super.twolame.overrideAttrs (oa: {
+  postInstall = (oa.postInstall or "") + ''
     sed -i 's|^#ifdef _WIN32$|#ifdef _WIN32\n#define LIBTWOLAME_STATIC|' \
       $out/include/twolame.h
   '';

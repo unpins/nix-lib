@@ -4,8 +4,8 @@
 # Drop the import-lib install line.
 { lib }:
 self: super:
-super.giflib.overrideAttrs (old: {
-  postPatch = (old.postPatch or "") + ''
+super.giflib.overrideAttrs (oa: {
+  postPatch = (oa.postPatch or "") + ''
     sed -i '/libgif\.dll\.a/d' Makefile
   '';
 })

@@ -13,7 +13,7 @@
 self: super:
 (super.glib.override {
   libsysprof-capture = super.emptyDirectory;
-}).overrideAttrs (old: {
-  propagatedBuildInputs = (old.propagatedBuildInputs or [ ]) ++ [ self.pcre2 ];
-  mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Dsysprof=disabled" ];
+}).overrideAttrs (oa: {
+  propagatedBuildInputs = (oa.propagatedBuildInputs or [ ]) ++ [ self.pcre2 ];
+  mesonFlags = (oa.mesonFlags or [ ]) ++ [ "-Dsysprof=disabled" ];
 })

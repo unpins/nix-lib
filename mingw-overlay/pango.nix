@@ -17,12 +17,12 @@
 self: super:
 (super.pango.override {
   x11Support = false;
-}).overrideAttrs (old: {
-  mesonFlags = (old.mesonFlags or [ ]) ++ [
+}).overrideAttrs (oa: {
+  mesonFlags = (oa.mesonFlags or [ ]) ++ [
     "-Dfontconfig=disabled"
     "-Dfreetype=disabled"
   ];
-  propagatedBuildInputs = (old.propagatedBuildInputs or [ ]) ++ [
+  propagatedBuildInputs = (oa.propagatedBuildInputs or [ ]) ++ [
     self.fribidi
     self.libthai
   ];

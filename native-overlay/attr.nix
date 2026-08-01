@@ -11,7 +11,7 @@
 { lib }:
 {
   autoWire = "musl";
-  apply = scope: scope.attr.overrideAttrs (oa: {
+  apply = pkgs: pkgs.attr.overrideAttrs (oa: {
     makeFlags = (oa.makeFlags or [ ]) ++ [ "sysconfdir=/etc" ];
     installFlags = (oa.installFlags or [ ]) ++ [ "sysconfdir=${placeholder "out"}/etc" ];
   });

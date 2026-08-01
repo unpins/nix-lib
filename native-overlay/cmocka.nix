@@ -9,5 +9,5 @@
 { lib }:
 {
   autoWire = "static";
-  apply = scope: scope.cmocka.overrideAttrs (_: { doCheck = false; });
+  apply = pkgs: pkgs.cmocka.overrideAttrs (_: { doCheck = false; });
 }

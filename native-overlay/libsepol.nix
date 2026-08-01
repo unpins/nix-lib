@@ -12,12 +12,12 @@
 { lib }:
 {
   autoWire = "musl";
-  apply = scope: scope.libsepol.overrideAttrs (oa: {
+  apply = pkgs: pkgs.libsepol.overrideAttrs (oa: {
     postPatch = (oa.postPatch or "") + ''
-      substituteInPlace src/Makefile \
-        --replace-fail '# check for reallocarray(3) availability' \
-          '# check for reallocarray(3) availability
-override CFLAGS += -DHAVE_REALLOCARRAY'
+            substituteInPlace src/Makefile \
+              --replace-fail '# check for reallocarray(3) availability' \
+                '# check for reallocarray(3) availability
+      override CFLAGS += -DHAVE_REALLOCARRAY'
     '';
   });
 }

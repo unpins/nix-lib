@@ -4,12 +4,12 @@
 # <sys/types.h>). Nothing here gets wrapped anyway.
 { lib }:
 self: super:
-super.gdk-pixbuf.overrideAttrs (old: {
+super.gdk-pixbuf.overrideAttrs (oa: {
   # Setup-hooks lack a `pname` attribute; match on `name` instead.
   nativeBuildInputs = builtins.filter
     (d: !(builtins.elem (d.name or d.pname or null) [
       "make-shell-wrapper-hook"
       "makeWrapper"
     ]))
-    (old.nativeBuildInputs or [ ]);
+    (oa.nativeBuildInputs or [ ]);
 })

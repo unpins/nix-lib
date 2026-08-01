@@ -6,8 +6,8 @@
 # (which links clean — gettext's hook injects `-lintl` for it).
 { lib }:
 self: super:
-super.shared-mime-info.overrideAttrs (old: {
-  postPatch = (old.postPatch or "") + ''
+super.shared-mime-info.overrideAttrs (oa: {
+  postPatch = (oa.postPatch or "") + ''
     cat > src/meson.build <<'EOF'
     configure_file(
         output: 'config.h',

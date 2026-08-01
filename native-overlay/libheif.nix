@@ -18,7 +18,7 @@
 pkgs:
 let
   isMinGW = pkgs.stdenv.hostPlatform.isMinGW or false;
-  dropLibs = lib.filter
+  dropLibs = builtins.filter
     (x: !(builtins.elem (x.pname or x.name or "") [ "rav1e" "x265" "libaom" "gdk-pixbuf" ]));
 in
 pkgs.libheif.overrideAttrs (oa: {

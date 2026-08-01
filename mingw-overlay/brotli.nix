@@ -4,8 +4,8 @@
 # mingw (no DT_NEEDED fallback).
 { lib }:
 self: super:
-super.brotli.overrideAttrs (old: {
-  postInstall = (old.postInstall or "") + ''
+super.brotli.overrideAttrs (oa: {
+  postInstall = (oa.postInstall or "") + ''
     for pc in $lib/lib/pkgconfig/libbrotlidec.pc $lib/lib/pkgconfig/libbrotlienc.pc; do
       sed -i 's/^Requires\.private: libbrotlicommon/Requires: libbrotlicommon/' "$pc"
     done

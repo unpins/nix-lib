@@ -29,15 +29,17 @@
   autoWire = "static";
   apply = pkgs:
     if pkgs.stdenv.hostPlatform.isStatic
-    then pkgs.libbsd.overrideAttrs (old: {
-      doCheck = false;
-      postPatch = (old.postPatch or "") + ''
-        substituteInPlace configure.ac \
-          --replace-fail \
-            'LIBBSD_SELECT_ABI([transparent_libmd], [transparent libmd support])' \
-            'abi_transparent_libmd=no
-        LIBBSD_SELECT_ABI([transparent_libmd], [transparent libmd support])'
-      '';
-    })
+    then
+      pkgs.libbsd.overrideAttrs
+        (oa: {
+          doCheck = false;
+          postPatch = (oa.postPatch or "") + ''
+            substituteInPlace configure.ac \
+              --replace-fail \
+                'LIBBSD_SELECT_ABI([transparent_libmd], [transparent libmd support])' \
+                'abi_transparent_libmd=no
+            LIBBSD_SELECT_ABI([transparent_libmd], [transparent libmd support])'
+          '';
+        })
     else pkgs.libbsd;
 }

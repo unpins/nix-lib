@@ -15,8 +15,12 @@
 { lib }:
 {
   autoWire = "static";
-  apply = scope: scope.cjson.overrideAttrs (oa:
-    lib.optionalAttrs scope.stdenv.hostPlatform.isDarwin {
-      cmakeFlags = (oa.cmakeFlags or [ ]) ++ [ "-DENABLE_CUSTOM_COMPILER_FLAGS=OFF" ];
-    });
+  apply = pkgs:
+    if pkgs.stdenv.hostPlatform.isDarwin then
+      pkgs.cjson.overrideAttrs
+        (oa: {
+          cmakeFlags = (oa.cmakeFlags or [ ]) ++ [ "-DENABLE_CUSTOM_COMPILER_FLAGS=OFF" ];
+        })
+    else
+      pkgs.cjson;
 }

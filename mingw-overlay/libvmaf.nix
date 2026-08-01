@@ -7,9 +7,9 @@
 #    aren't winpthreads-aware, and no downstream needs them.
 { lib }:
 self: super:
-super.libvmaf.overrideAttrs (old: {
-  buildInputs = (old.buildInputs or [ ]) ++ [ self.windows.pthreads ];
-  mesonFlags = (old.mesonFlags or [ ]) ++ [
+super.libvmaf.overrideAttrs (oa: {
+  buildInputs = (oa.buildInputs or [ ]) ++ [ self.windows.pthreads ];
+  mesonFlags = (oa.mesonFlags or [ ]) ++ [
     "-Denable_tests=false"
   ];
 })

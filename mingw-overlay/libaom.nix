@@ -3,10 +3,10 @@
 # output too — with tools off it's empty and nixpkgs aborts on empty outputs.
 { lib }:
 self: super:
-super.libaom.overrideAttrs (old: {
-  cmakeFlags = (old.cmakeFlags or [ ]) ++ [
+super.libaom.overrideAttrs (oa: {
+  cmakeFlags = (oa.cmakeFlags or [ ]) ++ [
     "-DENABLE_TOOLS=OFF"
     "-DENABLE_EXAMPLES=OFF"
   ];
-  outputs = builtins.filter (o: o != "bin") (old.outputs or [ "out" ]);
+  outputs = builtins.filter (o: o != "bin") (oa.outputs or [ "out" ]);
 })

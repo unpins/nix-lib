@@ -9,7 +9,7 @@
 # sdl)` otherwise captures STDERR into CFLAGS when `sdl.pc` is absent.
 { lib }:
 pkgs:
-pkgs.quirc.overrideAttrs (_oa: {
+pkgs.quirc.overrideAttrs (_: {
   buildPhase = ''
     runHook preBuild
     make libquirc.a SDL_CFLAGS= SDL_LIBS=

@@ -9,8 +9,8 @@
 # and the `install` prerequisite need trimming.
 { lib }:
 self: super:
-super.zlib.overrideAttrs (old: {
-  postPatch = (old.postPatch or "") + ''
+super.zlib.overrideAttrs (oa: {
+  postPatch = (oa.postPatch or "") + ''
     sed -i \
       -e 's/^all: .*/all: $(STATICLIB)/' \
       -e '/^install:/ s/ $(IMPLIB)//' \

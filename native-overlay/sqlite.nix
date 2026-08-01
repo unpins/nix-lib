@@ -18,15 +18,16 @@
 { lib }:
 {
   autoWire = "static";
-  apply = scope:
-    if scope.stdenv.hostPlatform.isPower then
-      scope.sqlite.overrideAttrs (oa: {
-        postPatch = (oa.postPatch or "") + ''
-          substituteInPlace src/hwtime.h \
-            --replace-fail 'defined(__GNUC__) && defined(__ppc__)' \
-              'defined(__GNUC__) && defined(__ppc__) && 0'
-        '';
-      })
+  apply = pkgs:
+    if pkgs.stdenv.hostPlatform.isPower then
+      pkgs.sqlite.overrideAttrs
+        (oa: {
+          postPatch = (oa.postPatch or "") + ''
+            substituteInPlace src/hwtime.h \
+              --replace-fail 'defined(__GNUC__) && defined(__ppc__)' \
+                'defined(__GNUC__) && defined(__ppc__) && 0'
+          '';
+        })
     else
-      scope.sqlite;
+      pkgs.sqlite;
 }

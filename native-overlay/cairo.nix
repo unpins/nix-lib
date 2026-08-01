@@ -12,24 +12,25 @@
 pkgs:
 let
   isCrossDarwin = pkgs.stdenv.hostPlatform.isDarwin
-               && !(pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform);
+    && !(pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform);
 in
 if !isCrossDarwin
 then pkgs.cairo
-else pkgs.cairo.overrideAttrs (_oa: {
-  mesonFlags = [
-    "-Dgtk_doc=true"
-    "-Dsymbol-lookup=disabled"
-    "-Dspectre=disabled"
-    "-Dglib=enabled"
-    "-Dtests=disabled"
-    "-Dxlib=enabled"
-    "-Dxcb=enabled"
-    "-Ddefault_library=static"
-    "-Ddefault_both_libraries=static"
-    "--cross-file=${builtins.toFile "cairo-darwin-cross.conf" ''
+else
+  pkgs.cairo.overrideAttrs (_: {
+    mesonFlags = [
+      "-Dgtk_doc=true"
+      "-Dsymbol-lookup=disabled"
+      "-Dspectre=disabled"
+      "-Dglib=enabled"
+      "-Dtests=disabled"
+      "-Dxlib=enabled"
+      "-Dxcb=enabled"
+      "-Ddefault_library=static"
+      "-Ddefault_both_libraries=static"
+      "--cross-file=${builtins.toFile "cairo-darwin-cross.conf" ''
       [properties]
       ipc_rmid_deferred_release = 'false'
     ''}"
-  ];
-})
+    ];
+  })

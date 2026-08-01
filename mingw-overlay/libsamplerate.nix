@@ -9,7 +9,7 @@
 #    has DLL-only entry points). The lib itself doesn't need it.
 { lib }:
 self: super:
-super.libsamplerate.overrideAttrs (old: {
-  meta = (old.meta or { }) // { broken = false; };
+super.libsamplerate.overrideAttrs (oa: {
+  meta = (oa.meta or { }) // { broken = false; };
   buildInputs = [ ];
 })

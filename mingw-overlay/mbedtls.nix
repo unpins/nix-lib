@@ -18,10 +18,10 @@
 #      - x509_crt.c → `inet_pton` for IP SANs (-lws2_32)
 { lib }:
 self: super:
-super.mbedtls.overrideAttrs (old: {
-  propagatedBuildInputs = (old.propagatedBuildInputs or [ ]) ++ [ self.windows.pthreads ];
-  cmakeFlags = (old.cmakeFlags or [ ]) ++ [ "-DMBEDTLS_FATAL_WARNINGS=OFF" ];
-  postInstall = (old.postInstall or "") + ''
+super.mbedtls.overrideAttrs (oa: {
+  propagatedBuildInputs = (oa.propagatedBuildInputs or [ ]) ++ [ self.windows.pthreads ];
+  cmakeFlags = (oa.cmakeFlags or [ ]) ++ [ "-DMBEDTLS_FATAL_WARNINGS=OFF" ];
+  postInstall = (oa.postInstall or "") + ''
     for pc in $out/lib/pkgconfig/mbedcrypto.pc $out/lib/pkgconfig/mbedtls.pc $out/lib/pkgconfig/mbedx509.pc; do
       [ -f "$pc" ] || continue
       echo 'Libs.private: -lpthread -lbcrypt -lws2_32' >> "$pc"

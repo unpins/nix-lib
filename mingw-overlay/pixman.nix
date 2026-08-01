@@ -4,8 +4,8 @@
 # disable them.
 { lib }:
 self: super:
-super.pixman.overrideAttrs (old: {
-  mesonFlags = (old.mesonFlags or [ ]) ++ [
+super.pixman.overrideAttrs (oa: {
+  mesonFlags = (oa.mesonFlags or [ ]) ++ [
     "-Dtests=disabled"
   ];
 })

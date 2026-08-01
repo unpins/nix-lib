@@ -4,6 +4,6 @@
 # default buildInputs.
 { lib }:
 self: super:
-super.zvbi.overrideAttrs (old: {
-  buildInputs = (old.buildInputs or [ ]) ++ [ self.windows.pthreads ];
+super.zvbi.overrideAttrs (oa: {
+  buildInputs = (oa.buildInputs or [ ]) ++ [ self.windows.pthreads ];
 })

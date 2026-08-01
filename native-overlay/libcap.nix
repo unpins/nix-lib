@@ -10,7 +10,7 @@
 { lib }:
 {
   autoWire = "musl";
-  apply = scope: scope.libcap.overrideAttrs (oa: {
+  apply = pkgs: pkgs.libcap.overrideAttrs (oa: {
     nativeBuildInputs = builtins.filter (x: (x.pname or "") != "go")
       (oa.nativeBuildInputs or [ ]);
     makeFlags = (oa.makeFlags or [ ]) ++ [ "GOLANG=no" ];

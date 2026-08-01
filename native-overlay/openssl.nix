@@ -13,9 +13,9 @@
 { lib }:
 {
   autoWire = "static";
-  apply = scope:
+  apply = pkgs:
     let
-      base = scope.openssl.overrideAttrs
+      base = pkgs.openssl.overrideAttrs
         (lib.retargetOpenssl "/etc/ssl" "/etc/ssl/engines-3" "/etc/ssl/ossl-modules");
       # 32-bit ARM (armv7l/armv6): OpenSSL's Configure appends `-latomic` to its
       # own app/test link (apps/openssl etc.). A static-musl + compiler-rt
@@ -27,7 +27,7 @@
       # the arch-independent 8-byte `!<arch>\n`, so one stub serves any target.
       # 64-bit targets never emit `-latomic`, hence the isAarch32 gate — the drv
       # (and byte-identical output) of every other arch is untouched.
-      libatomicStub = scope.runCommand "libatomic-stub" { } ''
+      libatomicStub = pkgs.runCommand "libatomic-stub" { } ''
         mkdir -p "$out/lib"
         printf '!<arch>\n' > "$out/lib/libatomic.a"
       '';
@@ -54,7 +54,7 @@
         '';
       };
     in
-    if scope.stdenv.hostPlatform.isAarch32
+    if pkgs.stdenv.hostPlatform.isAarch32
     then base.overrideAttrs (o: (addStubL o) // (stripPcAtomic o))
     else base;
 }

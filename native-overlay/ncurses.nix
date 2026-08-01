@@ -33,7 +33,7 @@
   # mentions ncurses on any native platform. macOS ships /usr/share/terminfo, so
   # the default-terminfo-dir pin + --disable-db-install are valid there as well.
   autoWire = "static";
-  apply = scope: (lib.embedFallbackTerminfo scope.ncurses).overrideAttrs (oa: {
+  apply = pkgs: (lib.embedFallbackTerminfo pkgs.ncurses).overrideAttrs (oa: {
     configureFlags = (oa.configureFlags or [ ]) ++ [
       "--with-default-terminfo-dir=/usr/share/terminfo"
       "--disable-db-install"

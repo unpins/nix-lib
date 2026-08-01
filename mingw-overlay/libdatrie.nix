@@ -4,8 +4,8 @@
 # postInstall ordering vs. install re-creating the link is ambiguous).
 { lib }:
 self: super:
-super.libdatrie.overrideAttrs (old: {
-  preFixup = (old.preFixup or "") + ''
+super.libdatrie.overrideAttrs (oa: {
+  preFixup = (oa.preFixup or "") + ''
     if [ -L "$bin/bin/trietool-0.2" ] && [ ! -e "$bin/bin/trietool-0.2" ]; then
       rm "$bin/bin/trietool-0.2"
       ln -s trietool.exe "$bin/bin/trietool-0.2"

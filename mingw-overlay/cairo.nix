@@ -19,10 +19,10 @@ self: super:
 (super.cairo.override {
   x11Support = false;
   xcbSupport = false;
-}).overrideAttrs (old: {
-  NIX_CFLAGS_COMPILE = (old.NIX_CFLAGS_COMPILE or "")
+}).overrideAttrs (oa: {
+  NIX_CFLAGS_COMPILE = (oa.NIX_CFLAGS_COMPILE or "")
     + " -Wno-error=incompatible-pointer-types";
-  postInstall = (old.postInstall or "") + ''
+  postInstall = (oa.postInstall or "") + ''
     sed -i 's|^Requires: cairo, freetype2|Requires: cairo, fontconfig, freetype2|' \
       $out/lib/pkgconfig/cairo-ft.pc
     for pc in $out/lib/pkgconfig/cairo*.pc; do

@@ -21,10 +21,13 @@
 {
   autoWire = "static";
   apply = pkgs:
-    pkgs.zvbi.overrideAttrs (oa:
-      lib.optionalAttrs pkgs.stdenv.hostPlatform.isStatic {
-        postFixup = (oa.postFixup or "") + ''
-          rm -f "$out"/lib/libzvbi-chains.a "$out"/lib/libzvbi-chains.la
-        '';
-      });
+    if pkgs.stdenv.hostPlatform.isStatic then
+      pkgs.zvbi.overrideAttrs
+        (oa: {
+          postFixup = (oa.postFixup or "") + ''
+            rm -f "$out"/lib/libzvbi-chains.a "$out"/lib/libzvbi-chains.la
+          '';
+        })
+    else
+      pkgs.zvbi;
 }

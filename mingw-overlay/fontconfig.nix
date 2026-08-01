@@ -4,8 +4,8 @@
 # `Requires` (same pattern as brotli.nix / libtiff.nix).
 { lib }:
 self: super:
-super.fontconfig.overrideAttrs (old: {
-  postInstall = (old.postInstall or "") + ''
+super.fontconfig.overrideAttrs (oa: {
+  postInstall = (oa.postInstall or "") + ''
     # Merge `Requires.private: expat` INTO the existing
     # `Requires: freetype2 ...` line. A naive
     # `s/Requires\.private:/Requires:/` would leave two separate
@@ -22,5 +22,5 @@ super.fontconfig.overrideAttrs (old: {
   '';
   # Propagate expat to match the now-public `Requires:` (else consumers'
   # transitive pkg-config probe can't find `expat.pc`).
-  propagatedBuildInputs = (old.propagatedBuildInputs or [ ]) ++ [ self.expat ];
+  propagatedBuildInputs = (oa.propagatedBuildInputs or [ ]) ++ [ self.expat ];
 })

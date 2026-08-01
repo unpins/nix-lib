@@ -13,9 +13,9 @@
 { lib }:
 {
   autoWire = "static";
-  apply = scope:
+  apply = pkgs:
     let
-      stringsShim = scope.buildPackages.runCommand "unpin-strings-shim" { } ''
+      stringsShim = pkgs.buildPackages.runCommand "unpin-strings-shim" { } ''
         mkdir -p $out/bin
         cat > $out/bin/strings <<'EOF'
         #!/bin/sh
@@ -28,7 +28,7 @@
         chmod +x $out/bin/strings
       '';
     in
-    scope.x264.overrideAttrs (oa: {
+    pkgs.x264.overrideAttrs (oa: {
       preConfigure = (oa.preConfigure or "")
         + ''export STRINGS=${stringsShim}/bin/strings'' + "\n";
     });

@@ -13,8 +13,8 @@
 #    gdk-pixbuf-sys — which still follow `Requires.private`.)
 { lib }:
 self: super:
-super.libtiff.overrideAttrs (old: {
-  cmakeFlags = (old.cmakeFlags or [ ]) ++ [
+super.libtiff.overrideAttrs (oa: {
+  cmakeFlags = (oa.cmakeFlags or [ ]) ++ [
     "-Dlzma=OFF"
     "-Dzstd=OFF"
     "-Dwebp=OFF"
@@ -23,13 +23,13 @@ super.libtiff.overrideAttrs (old: {
     (d:
       let n = d.pname or d.name or ""; in
       n != "xz" && n != "zstd" && !lib.hasPrefix "libwebp" n)
-    (old.buildInputs or [ ]);
-  postInstall = (old.postInstall or "") + ''
+    (oa.buildInputs or [ ]);
+  postInstall = (oa.postInstall or "") + ''
     # Move libdeflate from Requires.private to public Requires.
     sed -i 's/^Requires\.private:  *zlib libdeflate libjpeg.*/Requires: libdeflate\nRequires.private: zlib libjpeg/' \
       $out/lib/pkgconfig/libtiff-4.pc
   '';
-  propagatedBuildInputs = (old.propagatedBuildInputs or [ ]) ++ [
+  propagatedBuildInputs = (oa.propagatedBuildInputs or [ ]) ++ [
     self.libdeflate
   ];
 })

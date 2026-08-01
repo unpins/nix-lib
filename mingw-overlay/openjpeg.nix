@@ -4,8 +4,8 @@
 # (ffmpeg) only consumes the `.a`, so disable the codec tools.
 { lib }:
 self: super:
-super.openjpeg.overrideAttrs (old: {
-  cmakeFlags = (old.cmakeFlags or [ ]) ++ [
+super.openjpeg.overrideAttrs (oa: {
+  cmakeFlags = (oa.cmakeFlags or [ ]) ++ [
     "-DBUILD_CODEC=OFF"
   ];
 })
