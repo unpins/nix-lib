@@ -1,16 +1,5 @@
-# Auto-discovery aggregator: each sibling is `{ lib }: pkgs: drv`, called by the
-# standalone native build when `mkStandaloneFlake { name = "<pkg>"; }` resolves
-# `<pkg>`. `lib` is unpins-lib's extended lib.
+# Each sibling is the native fix for the package it is named after: either a
+# bare `{ lib }: pkgs: drv` or the self-declaring `{ autoWire, apply }` shape
+# (see flake.nix, rawNativeFixes). `lib` is unpins-lib's extended lib.
 { lib }:
-let
-  entries = builtins.readDir ./.;
-  isFix = name: type:
-    type == "regular" && lib.hasSuffix ".nix" name && name != "default.nix";
-  fixNames = lib.attrNames (lib.filterAttrs isFix entries);
-in
-lib.listToAttrs (map
-  (file: {
-    name = lib.removeSuffix ".nix" file;
-    value = import (./. + "/${file}") { inherit lib; };
-  })
-  fixNames)
+lib.importFixDir { dir = ./.; inherit lib; }

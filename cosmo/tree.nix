@@ -3,8 +3,6 @@
 # table"). Override with `LDFLAGS=`; nixpkgs' stripPhase strips after apelink.
 { lib }:
 final: prev:
-if (prev.stdenv.hostPlatform.isCosmo or false) then {
-  tree = prev.tree.overrideAttrs (oa: {
-    makeFlags = (oa.makeFlags or [ ]) ++ [ "LDFLAGS=" ];
-  });
-} else { }
+prev.tree.overrideAttrs (oa: {
+  makeFlags = (oa.makeFlags or [ ]) ++ [ "LDFLAGS=" ];
+})

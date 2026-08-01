@@ -13,20 +13,16 @@
 #    never ship); cross-building bash 5.3 under cosmo fails on gcc-15's C23 bool.
 #    Use build-host copies — dead refs at runtime, keeps bash/grep/pcre2 out of
 #    the cosmo closure.
-#
-# Gated on isCosmo so buildPackages.zstd (linux-gnu) keeps its cache hash.
 { lib }:
 final: prev:
-if (prev.stdenv.hostPlatform.isCosmo or false) then {
-  zstd = (prev.zstd.override {
-    static = true;
-    bashNonInteractive = prev.buildPackages.bashNonInteractive;
-    gnugrep = prev.buildPackages.gnugrep;
-  }).overrideAttrs (oa: {
-    postPatch = (oa.postPatch or "") + ''
-      substituteInPlace build/cmake/lib/CMakeLists.txt --replace-fail \
-        'set(DecompressSources ''${DecompressSources} ''${LIBRARY_DIR}/decompress/huf_decompress_amd64.S)' \
-        'add_compile_options(-DZSTD_DISABLE_ASM)'
-    '';
-  });
-} else { }
+(prev.zstd.override {
+  static = true;
+  bashNonInteractive = prev.buildPackages.bashNonInteractive;
+  gnugrep = prev.buildPackages.gnugrep;
+}).overrideAttrs (oa: {
+  postPatch = (oa.postPatch or "") + ''
+    substituteInPlace build/cmake/lib/CMakeLists.txt --replace-fail \
+      'set(DecompressSources ''${DecompressSources} ''${LIBRARY_DIR}/decompress/huf_decompress_amd64.S)' \
+      'add_compile_options(-DZSTD_DISABLE_ASM)'
+  '';
+})
