@@ -870,12 +870,12 @@
         # hit C23 where bash-5.3's `typedef unsigned char bool` is rejected — force
         # them onto gnu17. Drv-level so it reaches whichever variant a consumer
         # pulls; idempotent via the `unpinNativeFixed` marker.
-        unpinBashBuildFix = scope: drv:
+        unpinBashBuildFix = pkgs: drv:
           let
             host = drv.stdenv.hostPlatform;
             buildp = drv.stdenv.buildPlatform;
             cc = drv.stdenv.cc;
-            buildCC = scope.buildPackages.stdenv.cc;
+            buildCC = pkgs.buildPackages.stdenv.cc;
             isCross = buildp.system != host.system;
             # CC_FOR_BUILD runs on the builder, so never the engine target cc.
             #   cross         → the build-platform cc.
@@ -896,16 +896,16 @@
           # own codegen). The isMusl-gated call sites keep this inert on darwin
           # until the darwin engine set calls it (below).
           if !(host.isLinux || host.isDarwin) || (drv.unpinNativeFixed or false) then drv
-          else drv.overrideAttrs (old: {
-            passthru = (old.passthru or { }) // { unpinNativeFixed = true; };
-            preConfigure = (old.preConfigure or "") + ''
+          else drv.overrideAttrs (oa: {
+            passthru = (oa.passthru or { }) // { unpinNativeFixed = true; };
+            preConfigure = (oa.preConfigure or "") + ''
               export CC=${cc}/bin/cc
               export CXX=${cc}/bin/c++
             '';
-            makeFlags = (old.makeFlags or [ ]) ++ [ "CC=${cc}/bin/cc" ];
+            makeFlags = (oa.makeFlags or [ ]) ++ [ "CC=${cc}/bin/cc" ];
             # CC_FOR_BUILD has a space → can't ride in word-split `makeFlags`; the
             # `makeFlagsArray` bash array keeps it intact.
-            preBuild = (old.preBuild or "") + ''
+            preBuild = (oa.preBuild or "") + ''
               makeFlagsArray+=( "CC_FOR_BUILD=${ccForBuild} -std=gnu17${ldPathFlag}" )
             '';
           });
@@ -1043,8 +1043,8 @@
                 preConfigureHooks+=(_unpinsMesonBuildCC)
               '');
           in
-          drv.overrideAttrs (o: {
-            nativeBuildInputs = (o.nativeBuildInputs or [ ]) ++ [ hook ];
+          drv.overrideAttrs (oa: {
+            nativeBuildInputs = (oa.nativeBuildInputs or [ ]) ++ [ hook ];
           });
 
         # DNS fallback (linux-static). A tiny C archive providing
@@ -1146,7 +1146,7 @@
                  || !(super ? ${pkgName}) then { }
               else {
                 ${pkgName} = (appendLinkFlags super.${pkgName}
-                  lldStdOpts).overrideAttrs (old: {
+                  lldStdOpts).overrideAttrs (oa: {
                   # Use the pre-`.extend` host lld (`basePkgs.buildPackages`),
                   # NOT `super.buildPackages.lld`. In a cross scope `super` is
                   # the *extended* pkgsStatic whose buildPackages carries this
@@ -1158,7 +1158,7 @@
                   # uses the un-overridden bash — same lld binary, no cycle.
                   # lldRSafe (the -r-safe ld.lld wrapper) so a `$CC -r` in the
                   # build doesn't choke on lldStdOpts' --icf.
-                  nativeBuildInputs = (old.nativeBuildInputs or [ ])
+                  nativeBuildInputs = (oa.nativeBuildInputs or [ ])
                     ++ [ (lldRSafe basePkgs.buildPackages) ];
                 });
               });
@@ -1173,8 +1173,8 @@
         dropSharedLibs = drv:
           let isStatic = drv.stdenv.hostPlatform.isStatic or false;
           in if isStatic then drv
-          else drv.overrideAttrs (old: {
-            postFixup = (old.postFixup or "") + ''
+          else drv.overrideAttrs (oa: {
+            postFixup = (oa.postFixup or "") + ''
               for o in $outputs; do
                 d="''${!o}"
                 [ -d "$d/lib" ] || continue
