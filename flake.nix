@@ -1272,16 +1272,15 @@
         #     otherwise pass for the dylib; a plain flag is stripped on darwin).
         unpinLibarchive = pkgs:
           let
-            l = nixpkgs.lib;
             isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
             isLinux = pkgs.stdenv.hostPlatform.isLinux;
             static = pkgs.pkgsStatic;
-            noOpenssl = l.filter (d: !(l.hasInfix "openssl" (d.name or "")));
+            noOpenssl = nixpkgs.lib.filter (d: !(nixpkgs.lib.hasInfix "openssl" (d.name or "")));
           in
-          (static.libarchive.override { xarSupport = false; }).overrideAttrs (o: {
+          (static.libarchive.override { xarSupport = false; }).overrideAttrs (oa: {
             doCheck = false;
-            buildInputs = noOpenssl (o.buildInputs or [ ])
-              ++ l.optional isDarwin static.libiconvReal;
+            buildInputs = noOpenssl (oa.buildInputs or [ ])
+              ++ nixpkgs.lib.optional isDarwin static.libiconvReal;
             # mbedtls is PROPAGATED (not a plain buildInput) so every consumer's
             # link environment carries its -L: e2fsprogs' configure copies
             # libarchive's `-lmbedcrypto` into its own Makefiles (it doesn't read
@@ -1289,9 +1288,9 @@
             # way. Propagation also lands mbedcrypto.a in each consumer's manifest
             # depInputDirs, so the mega has it available — tar's applet references
             # it (pulled), e2fsprogs' format_tar-only applet does not (left out).
-            propagatedBuildInputs = noOpenssl (o.propagatedBuildInputs or [ ])
-              ++ l.optional isLinux static.mbedtls;
-            configureFlags = (o.configureFlags or [ ]) ++ [ "--without-openssl" ]
+            propagatedBuildInputs = noOpenssl (oa.propagatedBuildInputs or [ ])
+              ++ nixpkgs.lib.optional isLinux static.mbedtls;
+            configureFlags = (oa.configureFlags or [ ]) ++ [ "--without-openssl" ]
               ++ [ (if isLinux then "--with-mbedtls" else "--without-mbedtls") ];
             # libtool records libarchive's optional deps in the installed .la's
             # dependency_libs as bare `-l` flags with no `-L`; a consumer that
@@ -1304,12 +1303,12 @@
             preFixup = ''
               sed -i $lib/lib/libarchive.la \
                 -e 's|-llzo2|-L${static.lzo}/lib -llzo2|'
-            '' + l.optionalString isLinux ''
+            '' + nixpkgs.lib.optionalString isLinux ''
               sed -i $lib/lib/libarchive.la \
-                -e 's|-lmbedcrypto|-L${l.getLib static.mbedtls}/lib -lmbedcrypto|'
+                -e 's|-lmbedcrypto|-L${nixpkgs.lib.getLib static.mbedtls}/lib -lmbedcrypto|'
             '';
-          } // l.optionalAttrs isDarwin {
-            preConfigure = (o.preConfigure or "") + ''
+          } // nixpkgs.lib.optionalAttrs isDarwin {
+            preConfigure = (oa.preConfigure or "") + ''
               configureFlagsArray+=("--disable-shared")
             '';
           });
