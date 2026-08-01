@@ -821,25 +821,40 @@
                 if isDarwinTarget then [ ] else (old.extraBuildInputs or [ ]);
             }));
 
-        # Append `flags` (string or list) to NIX_CFLAGS_COMPILE. structuredAttrs
-        # drvs carry it inside `env`; a top-level write on top of that collides
-        # ("attribute set cannot contain any attributes passed to derivation"), so
-        # append wherever the existing value lives, never both.
-        appendCFlags = drv: flags:
+        # Append `flags` (string or list) to one of the cc-wrapper's flag
+        # variables. A structuredAttrs drv presets the variable inside `env`, and
+        # writing it at top level as well collides ("attribute set cannot contain
+        # any attributes passed to derivation") — so append wherever the existing
+        # value already lives, never both. `oa ? env && oa.env ? <var>` is the
+        # only usable test: `__structuredAttrs` is invisible in overrideAttrs'
+        # argument. A top-level scalar exports fine when the variable is absent.
+        appendDrvFlags = var: drv: flags:
           let
             flagStr = builtins.concatStringsSep " "
               (if builtins.isList flags then flags else [ flags ]);
           in
-          drv.overrideAttrs (old:
-            if old ? env && old.env ? NIX_CFLAGS_COMPILE then {
-              env = old.env // {
-                NIX_CFLAGS_COMPILE = old.env.NIX_CFLAGS_COMPILE + " " + flagStr;
-              };
-            } else if old ? NIX_CFLAGS_COMPILE then {
-              NIX_CFLAGS_COMPILE = old.NIX_CFLAGS_COMPILE + " " + flagStr;
+          drv.overrideAttrs (oa:
+            if oa ? env && oa.env ? ${var} then {
+              env = oa.env // { ${var} = oa.env.${var} + " " + flagStr; };
+            } else if oa ? ${var} then {
+              ${var} = oa.${var} + " " + flagStr;
             } else {
-              NIX_CFLAGS_COMPILE = flagStr;
+              ${var} = flagStr;
             });
+
+        appendCFlags = appendDrvFlags "NIX_CFLAGS_COMPILE";
+
+        # cc-wrapper LINK-time flags. Unlike NIX_LDFLAGS these reach ONLY
+        # $CC-driven links, never a direct `ld -r`, so --gc-sections/--icf are
+        # safe here.
+        appendLinkFlags = appendDrvFlags "NIX_CFLAGS_LINK";
+
+        # Raw `ld` flags. Unlike NIX_CFLAGS_LINK these survive a build that wipes
+        # NIX_CFLAGS_LINK in postConfigure (nixpkgs' whois drops the bootstrap
+        # `-static` that way), and it's the mechanism fastfetch already uses for
+        # its `--wrap=dlopen`. Entries are passed straight to ld, so use
+        # `--wrap=…` (not `-Wl,…`).
+        appendLdFlags = appendDrvFlags "NIX_LDFLAGS";
 
         # Bash build-correctness override (`bash`/`bashInteractive`/
         # `bashNonInteractive`). Two faults: configure bakes a bare `CC=gcc` that
@@ -1074,35 +1089,6 @@
           drv.overrideAttrs (o: {
             nativeBuildInputs = (o.nativeBuildInputs or [ ]) ++ [ hook ];
           });
-
-        # Append to NIX_CFLAGS_LINK (cc-wrapper LINK-time flags),
-        # structuredAttrs-aware like appendCFlags. Unlike NIX_LDFLAGS this reaches
-        # ONLY $CC-driven links, never a direct `ld -r`, so --gc-sections/--icf
-        # are safe here. The `old ? env && old.env ? VAR` test (NOT
-        # `old.__structuredAttrs`, invisible in overrideAttrs' `old`) routes the
-        # append into `env` when a structuredAttrs build presets it there (a
-        # top-level dup would be rejected); a top-level scalar exports fine when
-        # the var is absent.
-        appendLinkFlags = drv: flagStr:
-          drv.overrideAttrs (old:
-            if old ? env && old.env ? NIX_CFLAGS_LINK then {
-              env = old.env // { NIX_CFLAGS_LINK = old.env.NIX_CFLAGS_LINK + " " + flagStr; };
-            } else if old ? NIX_CFLAGS_LINK then {
-              NIX_CFLAGS_LINK = old.NIX_CFLAGS_LINK + " " + flagStr;
-            } else { NIX_CFLAGS_LINK = flagStr; });
-
-        # Append raw `ld` flags to NIX_LDFLAGS, structuredAttrs-aware. Unlike
-        # NIX_CFLAGS_LINK this survives a build that wipes NIX_CFLAGS_LINK in
-        # postConfigure (nixpkgs' whois drops the bootstrap `-static` that way),
-        # and it's the mechanism fastfetch already uses for its `--wrap=dlopen`.
-        # Entries are passed straight to ld, so use `--wrap=…` (not `-Wl,…`).
-        appendLdFlags = drv: flagStr:
-          drv.overrideAttrs (old:
-            if old ? env && old.env ? NIX_LDFLAGS then {
-              env = old.env // { NIX_LDFLAGS = old.env.NIX_LDFLAGS + " " + flagStr; };
-            } else if old ? NIX_LDFLAGS then {
-              NIX_LDFLAGS = old.NIX_LDFLAGS + " " + flagStr;
-            } else { NIX_LDFLAGS = flagStr; });
 
         # DNS fallback (linux-static). A tiny C archive providing
         # __wrap_getaddrinfo / __wrap_freeaddrinfo. musl's resolver can't reach
