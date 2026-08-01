@@ -1642,10 +1642,13 @@
                 ++ nixpkgs.lib.optional manEnabled
                   pkgs.buildPackages.python3Minimal;  # mkmeta.py builds the man tree
 
-              # Lets mkStandaloneFlake see that man is already handled here
-              # and skip its own withMan application (one pack, not two).
+              # Lets mkStandaloneFlake see what this build already packed: `man` so
+              # it skips its own withMan (one pack, not two), `aliases` so
+              # unpinEmbedWrap knows there is a list to read back out of the
+              # binary — without the marker it would have to probe every base.
               passthru = (old.passthru or { })
-                // nixpkgs.lib.optionalAttrs manEnabled { unpinEmbedsMan = true; };
+                // nixpkgs.lib.optionalAttrs manEnabled { unpinEmbedsMan = true; }
+                // nixpkgs.lib.optionalAttrs aliasesActive { unpinEmbedsAliases = true; };
 
               postInstall = (old.postInstall or "")
                 + nixpkgs.lib.optionalString hasAuto ''
@@ -1819,6 +1822,18 @@
               else "${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm llvm-strip --strip-all";
             hasExplicitAliases = aliases != null;
             explicitCsv = if hasExplicitAliases then nixpkgs.lib.concatStringsSep "," aliases else "";
+            # The wrap's own alias discovery — sibling symlinks of the primary,
+            # like the multicall `.a` glob. Shared by both non-explicit branches
+            # below (it is also the fallback when the base packed an empty list).
+            harvestAliasesSh = ''
+              if [ -d "${binOut}/bin" ]; then
+                for f in "${binOut}/bin"/*; do
+                  [ -L "$f" ] || continue
+                  __unpin_n="$(basename "$f")"
+                  [ "$__unpin_n" = "${primary}" ] && continue
+                  __unpin_al="''${__unpin_al:+$__unpin_al,}$__unpin_n"
+                done
+              fi'';   # no trailing newline: the callers supply their own
           in
           pkgs.runCommand (base.name or "${base.pname or primary}-${base.version or "0"}")
             {
@@ -1898,16 +1913,33 @@
               # primary. Sets $__unpin_al for the shared stage snippet to write.
               ${if hasExplicitAliases then ''
               __unpin_al='${explicitCsv}'
+              '' else if base.unpinEmbedsAliases or false then ''
+              # This base packed its own list during the build (lib.withAliases),
+              # and that list cannot survive the wrap: strip rebuilds the copy
+              # from its sections and drops the EOF ZIP, and where strip is a
+              # no-op (stripCmd = ":") the stage below appends a SECOND ZIP whose
+              # EOCD shadows the first. The harvest can't stand in for it either —
+              # aliasesFromSymlinksIn deletes the very symlinks it read. Only the
+              # PRISTINE base still has the names, so read them back.
+              #
+              # A bespoke windowsBuild fold is what needs this: its applet set is
+              # its own (usbutils folds lsusb alone on mingw — no sigaction) and
+              # nothing outside that build knows it.
+              __unpin_al=""
+              for __unpin_v in "${primary}" "${primary}.exe" "${primary}.ape"; do
+                [ -f "${binOut}/bin/$__unpin_v" ] || continue
+                # `|| true`: unzip exits 9 when the variant carries no container
+                # at all, and the stdenv shell runs with pipefail.
+                __unpin_al="$( { unzip -p "${binOut}/bin/$__unpin_v" unpin/aliases 2>/dev/null || true; } \
+                  | tr '\n' ',' | sed 's/,*$//')"
+                [ -n "$__unpin_al" ] && break
+              done
+              if [ -z "$__unpin_al" ]; then
+              ${harvestAliasesSh}
+              fi
               '' else ''
               __unpin_al=""
-              if [ -d "${binOut}/bin" ]; then
-                for f in "${binOut}/bin"/*; do
-                  [ -L "$f" ] || continue
-                  __unpin_n="$(basename "$f")"
-                  [ "$__unpin_n" = "${primary}" ] && continue
-                  __unpin_al="''${__unpin_al:+$__unpin_al,}$__unpin_n"
-                done
-              fi
+              ${harvestAliasesSh}
               ''}
               # Stage runtime tree + aliases + man into $__unpin_stage. The man
               # candidates are RESOLVED STORE PATHS (manOut/binOut/outOut),
@@ -4382,7 +4414,23 @@ CBODY
                 # build (passthru.unpinEmbedsMan) — kept working during the migration.
                 useEmbedWrap = !selfFold && !(base.unpinEmbedsMan or false)
                   && (embedMan || runtimeEmbedNative != null);
+                # The aliases the shipped binary advertises to `unpin install`.
+                # Declared ONCE, in `multicall.programs` (already platform-filtered
+                # into mcPrograms above) — declaring them a second time inside
+                # `build` does not reach the binary, since this wrap repacks over
+                # whatever that produced.
+                #
+                # No `multicall` means no declared list (busybox ships 396 upstream
+                # symlinks and names none of them), and those keep the wrap's own
+                # symlink harvest. Where a list exists it is the better source, not
+                # merely the tidier one: coreutils installs a `stdbuf` symlink the
+                # harvest embeds, but stdbuf works by LD_PRELOADing libstdbuf.so
+                # and cannot function in a static single binary — `programs` omits
+                # it deliberately.
+                declaredAliases = nixpkgs.lib.filter (a: a != binName)
+                  (nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) mcPrograms);
                 nativeEmbedOpts = { primary = binName; man = embedMan; removeReferences = removeReferences ++ (if multicall == null then [ ] else multicall.removeReferences or [ ]); }
+                  // nixpkgs.lib.optionalAttrs (declaredAliases != [ ]) { aliases = declaredAliases; }
                   // (if runtimeEmbedNative != null then runtimeEmbedNative pkgs base else { });
                 # Legacy in-build man embed, retained ONLY for un-migrated
                 # unpinEmbedsMan flakes during the migration (deleted once all 9 VFS
@@ -4590,6 +4638,27 @@ CBODY
             # no man, so the man source is `winManRoot` (explicit) or the
             # version-locked nixpkgs graft (`winManGraft`). cosmoSymtabTrim drops
             # cosmo's `.symtab.amd64` ZIP member (no-op on mingw).
+            # Windows counterpart of `declaredAliases` — but ONLY where nix-lib
+            # itself did the fold, because only then does it know the applet set.
+            # A cosmo build dispatches the table `multicallCosmo` declares, which
+            # can differ from the linux one (coreutils drops `hostid`: cosmo has no
+            # gethostid); `wantWindowsModule` folds `multicall.programs` verbatim.
+            # Neither is mcPrograms — that is filtered against the NATIVE host.
+            #
+            # Everything else on windows comes from the flake's own `windowsBuild`,
+            # whose applet set is NOT `multicall.programs`: usbutils folds lsusb
+            # alone (usbhid-dump needs sigaction), and less folds nothing at all.
+            # Asserting the native list there ships names that dispatch to the
+            # default applet. That build embeds what it really folded and
+            # unpinEmbedWrap carries it over, so say nothing here.
+            windowsDeclaredAliases =
+              let names =
+                if multicallCosmo != null
+                then [ multicallCosmo.program ] ++ (multicallCosmo.aliases or [ ])
+                else if wantWindowsModule
+                then nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) multicall.programs
+                else [ ];
+              in nixpkgs.lib.filter (a: a != binName) names;
             windowsEmbedOpts = {
               primary = binName;
               man = embedMan;
@@ -4597,7 +4666,8 @@ CBODY
               manFallback = if winManGraft == null then null else "${winManGraft}";
               stripCmd = ":";
               cosmoSymtabTrim = true;
-            } // (if runtimeEmbedWindows != null then runtimeEmbedWindows windowsPkgs windowsForEmbed else { });
+            } // nixpkgs.lib.optionalAttrs (windowsDeclaredAliases != [ ]) { aliases = windowsDeclaredAliases; }
+              // (if runtimeEmbedWindows != null then runtimeEmbedWindows windowsPkgs windowsForEmbed else { });
             windowsPkg0 = withLicense (
               # Un-migrated flake that still embeds in its own windowsBuild keeps the
               # legacy in-build embed + strippedOrJoined (deleted post-migration).
