@@ -572,7 +572,9 @@ static cl::SubCommand LinkSub(LinkSubName, "Link LLVM bitcode/IR modules");' \
 
           meta = {
             description = "LLVM C/C++ suite (clang, lld, llvm-tools) as a single self-contained binary";
-            license = origPkgs.lib.licenses.ncsa; # placeholder; real: Apache-2.0 WITH LLVM-exception
+            # Taken from the package whose `monorepoSrc` this builds, so the two
+            # can't disagree about what we are shipping.
+            inherit (origPkgs.llvmPackages_21.libllvm.meta) license;
             platforms = origPkgs.lib.platforms.linux ++ origPkgs.lib.platforms.darwin;
           };
         }).overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
