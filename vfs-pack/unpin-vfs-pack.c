@@ -44,6 +44,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ftw.h>
+#include <sys/stat.h>
 
 #define ZDICT_ENTRY ".unpin/zdict"
 
@@ -218,12 +219,21 @@ static long file_size(const char *path) {
 }
 
 /* Copy every entry of FILE's (possibly file-adjusted / SFX) ZIP into g_zip
- * verbatim, except cosmo's unused ".symtab.amd64". Sets *out_base to where
- * FILE's ZIP begins -- its lowest local-header offset -- so the rebuilt archive
- * is appended at exactly that point. If FILE has no trailing ZIP (a plain
- * executable), copies nothing and sets *out_base to FILE's size (append after
- * it). Returns 0 on success, -1 on a real error. */
-static int carry_from(const char *file, unsigned long *out_base) {
+ * verbatim, except cosmo's unused ".symtab.amd64" and any name ROOT is about to
+ * supply -- the new tree SUPERSEDES what the binary already carried, and two
+ * members of one name is the state the one-ZIP invariant exists to prevent.
+ * Sets *out_base to where FILE's ZIP begins -- its lowest local-header offset --
+ * so the rebuilt archive is appended at exactly that point. If FILE has no
+ * trailing ZIP (a plain executable), copies nothing and sets *out_base to
+ * FILE's size (append after it). Returns 0 on success, -1 on a real error. */
+static int carried_is_superseded(const char *root, const char *name) {
+    char p[4096];
+    struct stat sb;
+    if (snprintf(p, sizeof p, "%s/%s", root, name) >= (int)sizeof p) return 0;
+    return lstat(p, &sb) == 0;
+}
+
+static int carry_from(const char *file, const char *root, unsigned long *out_base) {
     mz_zip_archive src;
     memset(&src, 0, sizeof src);
     if (!mz_zip_reader_init_file(&src, file, 0)) {
@@ -244,6 +254,7 @@ static int carry_from(const char *file, unsigned long *out_base) {
         if ((unsigned long)st.m_local_header_ofs < minofs)
             minofs = (unsigned long)st.m_local_header_ofs;
         if (!strcmp(st.m_filename, ".symtab.amd64")) continue;  /* drop cosmo symtab */
+        if (carried_is_superseded(root, st.m_filename)) continue;
         if (!mz_zip_writer_add_from_zip_reader(&g_zip, &src, i)) {
             fprintf(stderr, "carry: copy failed for %s\n", st.m_filename);
             rc = -1; break;
@@ -293,7 +304,7 @@ int main(int argc, char **argv) {
     /* Carry an existing tail-ZIP (cosmo's `/zip/` store) in first, verbatim,
      * and default the base to where it began. */
     unsigned long carry_base = 0;
-    if (carry && carry_from(carry, &carry_base) != 0) { free(dict); return 1; }
+    if (carry && carry_from(carry, root, &carry_base) != 0) { free(dict); return 1; }
 
     /* The dict must be readable WITHOUT the dict, so store it (method 0). */
     if (dict)
