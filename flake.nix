@@ -1859,8 +1859,8 @@
               ++ nixpkgs.lib.optional cosmoSymtabTrim pkgs.buildPackages.zip
               ++ nixpkgs.lib.optional nukeRefs pkgs.buildPackages.removeReferencesTo;
               # Carry the base passthru (notably `module` for a multicall fold and
-              # version/pname) so the mega manifest and withLicense/withDescription
-              # still resolve against the shipped drv.
+              # version/pname) so the mega manifest and withMetaPins still resolve
+              # against the shipped drv.
               passthru = (base.passthru or { })
                 // nixpkgs.lib.optionalAttrs (base ? module) { inherit (base) module; };
               # Carry upstream meta (license/description) but pin outputsToInstall to
@@ -3889,7 +3889,6 @@ CBODY
           # in the embedded ZIP (embedMan), so `share/` is redundant.
           # Set true only for a package that genuinely needs a side asset.
           , package_data ? false
-          , bootstrap_naming ? false
           , own_software ? false
           # Embed the package's own man pages into the binary via `withMan`
           # (as `unpin/man/*` ZIP entries), so `unpin man <pkg>` works offline with
@@ -4063,8 +4062,6 @@ CBODY
             optimize_ = { lto = false; opt = null; ssp = true; gc = true; } // optimize;
             inherit (optimize_) lto opt ssp gc;
             ltoOpt = if opt == null then "-O2" else opt;
-            # LTO/GC overlays apply on Linux only; darwin/cross fall back to stock
-            # pkgs. LTO subsumes gc (lto wins when both set).
             # Plain nixpkgs import. Darwin dep fixes are NOT wired here as
             # `overlays` — an overlay on the nixpkgs IMPORT joins the
             # stdenv-bootstrap fixpoint and re-hashes the whole darwin base closure
@@ -4072,6 +4069,8 @@ CBODY
             # ncurses <sys/ttydev.h> fix rides inside embedFallbackTerminfoOnly).
             importNixpkgs = system:
               if sharedPkgs != null then sharedPkgs else import nixpkgs { inherit system; };
+            # LTO/GC overlays apply on Linux only; darwin/cross fall back to stock
+            # pkgs. LTO subsumes gc (lto wins when both set).
             nixpkgsFor = forAllNative (system:
               # unpin-llvm replaces the whole stdenv, so the gc/lto overlays would
               # be silent no-ops; use plain nixpkgs.
@@ -4096,17 +4095,16 @@ CBODY
                     ++ (if ssp then [ ] else [ "stackprotector" ]);
                 });
 
-            # Pin the artifact's meta.license to the caller-supplied SPDX id(s)
-            # when `license` is set; otherwise keep whatever strippedOrJoined
-            # carried from upstream. meta isn't hashed, so this never rebuilds.
-            withLicense = drv:
-              if license == null then drv
-              else drv // { meta = (drv.meta or { }) // { license = license; }; };
-
-            # Same pinning for meta.description; meta isn't hashed either.
-            withDescription = drv:
-              if description == null then drv
-              else drv // { meta = (drv.meta or { }) // { description = description; }; };
+            # Pin the caller-supplied meta fields; unset ones keep whatever
+            # strippedOrJoined carried from upstream. meta isn't hashed, so this
+            # never rebuilds. ONE entry point, applied once per artifact — a
+            # per-field wrapper invites an artifact that pins some and not others
+            # (the windows binary went a release without `description`).
+            withMetaPins = drv:
+              let pins = nixpkgs.lib.filterAttrs (_: v: v != null)
+                { inherit license description; };
+              in if pins == { } then drv
+                 else drv // { meta = (drv.meta or { }) // pins; };
 
             defaultRawBuild = nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
             # Does this host build on the engine? Linux (native or cross — one
@@ -4116,6 +4114,65 @@ CBODY
             # fold, in sibling scopes — one definition so the two can't drift.
             isEngineHost = pkgs: engine == "unpin-llvm"
               && (pkgs.stdenv.hostPlatform.isLinux || pkgs.stdenv.hostPlatform.isDarwin);
+            # A `multicall` option may be written as a plain value or as a
+            # `pkgs:` function, so a target resolves store paths in its own scope.
+            inScope = pkgs: v: if builtins.isFunction v then v pkgs else v;
+            # A program may be built on some targets only — binutils' gold/dwp have
+            # no RISC-V backend (gold's configure.tgt omits it; gold is frozen,
+            # superseded by lld), so binutils' own configure skips them on a riscv64
+            # host and no `ld-new`/`dwp` link sidecar exists there. `supportedTarget`
+            # (target `hostPlatform` → bool) drops such a program. It filters every
+            # consumer of a program list — module hook, manifest applets, dispatcher
+            # — so the fold matches exactly what upstream built, with no
+            # missing-sidecar hard-error and no dangling dispatcher entry. Purely
+            # eval-time (no IFD): the arch is a target-platform property, so
+            # evaluating the flake never forces a build.
+            supportedOn = platform: nixpkgs.lib.filter
+              (p: (p.supportedTarget or (_: true)) platform);
+            appletsOf = nixpkgs.lib.concatMap
+              (p:
+                let entry = "unpin__${sanCSym name}__${sanCSym p.name}_main"; in
+                [{ name = p.name; inherit entry; }]
+                ++ map (al: { name = al; inherit entry; }) (p.aliases or [ ]));
+            # The bitcode manifest a mega folds. The native/darwin fold and the
+            # mingw one differ only in which build carries the `module`, which
+            # programs it folded, and which scope resolves a `pkgs:` option — so it
+            # is written once: two copies let an option declared on `multicall`
+            # reach one target and silently skip the other.
+            bitcodeManifest = { drv, programs, pkgs }: {
+              package = name;
+              # ONE module.bc, with internalArchives already folded in.
+              moduleFormat = "bitcode";
+              moduleArchive = "${drv.module}/lib/module.bc";
+              # Native (asm/SIMD) objects the bitcode link dropped, rescued into a
+              # sidecar the mega-link adds alongside module.bc. Always present,
+              # possibly empty.
+              nativeArchive = "${drv.module}/lib/module_native.a";
+              # Verbatim store paths: a passthru reference, NOT linked into the
+              # shipped binary.
+              depArchives = inScope pkgs (multicall.depArchives or [ ]);
+              # Auto-derived external dep DIRS (pure store paths, no IFD); the mega
+              # builder globs <dir>/lib/*.a at build time. `depArchives` stays as an
+              # additive override for archives not in the closure.
+              depInputDirs = multicallExternalDepDirs drv;
+              applets = appletsOf programs;
+              requires = { cxx = false; group = true; } // (multicall.requires or { });
+              # Basenames to rescue from the auto-derive's libc-split skip list
+              # (e.g. "libcrypt.a" for a package that folds libxcrypt). Empty by
+              # default — only libxcrypt-consuming folds (shadow) set it.
+              keepAutoArchives = multicall.keepAutoArchives or [ ];
+              # Man source for the mega to MERGE: the built drv's man-bearing output
+              # (split `man`, else out). null when this build ships no man; the
+              # merge skips nulls.
+              manRoot = if embedMan then "${drv.man or drv}" else null;
+              # Runtime-data source for the mega to MERGE (file's magic.mgc). null
+              # when the package ships none.
+              runtimeDataRoot = inScope pkgs (multicall.runtimeDataRoot or null);
+              # Name-substring patterns whose store refs are DEAD baked paths to
+              # scrub from the shipped binary. Empty by default → no scrub, drv
+              # byte-identical.
+              removeReferences = multicall.removeReferences or [ ];
+            };
             rawBuild = pkgs:
               let
                 useEngine = isEngineHost pkgs;
@@ -4174,22 +4231,7 @@ CBODY
                      && multicall ? darwinPrograms
                   then multicall.darwinPrograms
                   else (if multicall == null then [ ] else multicall.programs);
-                # A program may be built on some targets only — binutils' gold/dwp
-                # have no RISC-V backend (gold's configure.tgt omits it; gold is
-                # frozen, superseded by lld), so binutils' own configure skips them
-                # on a riscv64 host and no `ld-new`/`dwp` link sidecar exists there.
-                # A `supportedTarget` predicate (target `hostPlatform` → bool) drops
-                # such a program on unsupported targets. It filters the ONE list that
-                # feeds the module hook, the manifest applets AND the dispatcher
-                # (all `mcPrograms` below), so they stay consistent — the fold then
-                # matches exactly what upstream built (gold/dwp on the 5 arches that
-                # have it, skipped on riscv64), with no missing-sidecar hard-error
-                # and no dangling dispatcher entry. Purely eval-time (no IFD): the
-                # arch is a target-platform property, so evaluating the flake never
-                # forces a build. Default (no predicate) = always included.
-                mcPrograms = nixpkgs.lib.filter
-                  (p: (p.supportedTarget or (_: true)) pkgs.stdenv.hostPlatform)
-                  mcProgramsRaw;
+                mcPrograms = supportedOn pkgs.stdenv.hostPlatform mcProgramsRaw;
                 # The module is BITCODE, so it exists exactly where the engine
                 # compiled the objects — `isEngineHost`. There is no per-package
                 # darwin opt-out: a darwin build that genuinely ships fewer
@@ -4387,59 +4429,11 @@ CBODY
                   if useEmbedWrap then unpinEmbedWrap pkgs nativeEmbedOpts base
                   else if selfFold then strippedOrJoined pkgs name selfFolded
                   else strippedOrJoined pkgs name legacyMaybeMan;
-                result = withLicense (withDescription shipped);
-                # The manifest the mega-builder consumes. moduleArchive/gnulib
-                # depArchives reference the `module` output of the same built drv;
-                # external depArchives are verbatim store paths (passthru, NOT
-                # linked into the shipped binary).
-                multicallManifest = {
-                  package = name;
-                  # ONE module.bc, with internalArchives already folded in.
-                  moduleFormat = "bitcode";
-                  moduleArchive = "${moduleSource.module}/lib/module.bc";
-                  # Native (asm/SIMD) objects the bitcode link dropped, rescued into
-                  # a sidecar the mega-link adds alongside module.bc. Always present,
-                  # possibly empty.
-                  nativeArchive = "${moduleSource.module}/lib/module_native.a";
-                  depArchives =
-                    let d = multicall.depArchives or [ ];
-                    in if builtins.isFunction d then d pkgs else d;
-                  applets = nixpkgs.lib.concatMap
-                    (p:
-                      let entry = "unpin__${sanCSym name}__${sanCSym p.name}_main"; in
-                      [{ name = p.name; inherit entry; }]
-                      ++ map (al: { name = al; inherit entry; }) (p.aliases or [ ]))
-                    mcPrograms;
-                  requires = { cxx = false; group = true; } // (multicall.requires or { });
-                  # Auto-derived external dep DIRS (pure store paths, no IFD); the
-                  # mega builder globs <dir>/lib/*.a at build time. `depArchives`
-                  # stays as an additive override for archives not in the closure.
-                  depInputDirs = multicallExternalDepDirs moduleSource;
-                  # Basenames to rescue from the auto-derive's libc-split skip list
-                  # (e.g. "libcrypt.a" for a package that folds libxcrypt). Empty by
-                  # default — only libxcrypt-consuming folds (shadow) set it.
-                  keepAutoArchives = multicall.keepAutoArchives or [ ];
-                  # Man source for the mega to MERGE: the built drv's man-bearing
-                  # output (split `man`, else out). null when this build ships no
-                  # man; the merge skips nulls.
-                  manRoot =
-                    if embedMan
-                    then "${moduleSource.man or moduleSource}"
-                    else null;
-                  # Runtime-data source for the mega to MERGE (file's magic.mgc).
-                  # `multicall.runtimeDataRoot` is a store path or a `pkgs:` function
-                  # for cross. null when the package ships none.
-                  runtimeDataRoot =
-                    let r = multicall.runtimeDataRoot or null;
-                    in
-                    if r == null then null
-                    else if builtins.isFunction r then r pkgs
-                    else r;
-                  # Name-substring patterns whose store refs are DEAD baked paths to
-                  # scrub from the shipped binary (single-program via unpinEmbedWrap;
-                  # multi-program/mega via mkMegaMulticall's embed). Empty by default
-                  # → no scrub, drv byte-identical.
-                  removeReferences = multicall.removeReferences or [ ];
+                result = withMetaPins shipped;
+                multicallManifest = bitcodeManifest {
+                  drv = moduleSource;
+                  programs = mcPrograms;
+                  inherit pkgs;
                 };
               in
               if wantModule then result // { multicallModule = multicallManifest; } else result;
@@ -4494,6 +4488,10 @@ CBODY
             # heavy engine-swapped set is the shared thunk. Byte-identical.
             windowsEnginePkgs =
               if !wantWindowsModule then windowsPkgs else windowsEnginePkgsShared;
+            # The programs the mingw fold builds — `multicall.programs` filtered
+            # against the PE host, not the native one `mcPrograms` uses.
+            windowsPrograms = supportedOn
+              windowsPkgs.pkgsCross.mingwW64.stdenv.hostPlatform multicall.programs;
             windowsRawHooked = pkgs:
               if wantCosmoModule
               then multicallModuleHookCosmo
@@ -4508,7 +4506,7 @@ CBODY
               then multicallModuleHookLTO
                 {
                   package = name;
-                  inherit (multicall) programs;
+                  programs = windowsPrograms;
                   internalArchives = multicall.internalArchives or [ ];
                   inferLinkInputs = multicall.inferLinkInputs or true;
                   foldSharedArchives = multicall.foldSharedArchives or false;
@@ -4524,7 +4522,7 @@ CBODY
             # when the cross build ships none of its own (the rare help2man package);
             # an explicit `winManRoot` wins outright. `winManGraft` is null for
             # custom-named multicall packages (no matching nixpkgs attr).
-            winManNixpkgs = nixpkgs.legacyPackages.${"x86_64-linux"};
+            winManNixpkgs = nixpkgs.legacyPackages.x86_64-linux;
             winManGraft =
               let p = winManNixpkgs.${pkgsAttr} or null;
               in if p == null then null else (p.man or p.out or p);
@@ -4537,17 +4535,12 @@ CBODY
             # build, so the manifests reference the very build the binary ships from
             # (the [bin out] forcing the linux path used for the same reason).
             windowsForEmbed = windowsBase.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; });
-            # Windows embed defaults; a VFS flake's `runtimeEmbed.windows` overrides
-            # (manRoot graft, runtimeStage, explicit aliases). The cross build ships
-            # no man, so the man source is `winManRoot` (explicit) or the
-            # version-locked nixpkgs graft (`winManGraft`). cosmoSymtabTrim drops
-            # cosmo's `.symtab.amd64` ZIP member (no-op on mingw).
             # Windows counterpart of `declaredAliases`. Where nix-lib itself did
             # the fold it knows the whole applet set: a cosmo build dispatches the
             # table `multicallCosmo` declares (which can differ from the linux one
             # — coreutils drops `hostid`, cosmo has no gethostid), and
-            # `wantWindowsModule` folds `multicall.programs` verbatim. Neither is
-            # mcPrograms, which is filtered against the NATIVE host.
+            # `wantWindowsModule` folds `windowsPrograms`. Neither is mcPrograms,
+            # which is filtered against the NATIVE host.
             #
             # Otherwise the binary comes from the flake's own `windowsBuild`, whose
             # applet set is NOT `multicall.programs` — usbutils folds lsusb alone
@@ -4569,12 +4562,17 @@ CBODY
                 if multicallCosmo != null
                 then [ multicallCosmo.program ] ++ (multicallCosmo.aliases or [ ])
                 else if wantWindowsModule
-                then nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) multicall.programs
+                then nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) windowsPrograms
                 else if multicall != null && !(windowsBase.unpinEmbedsAliases or false)
                 then nixpkgs.lib.concatMap (p: p.aliases or [ ])
                   (nixpkgs.lib.filter (p: p.name == binName) multicall.programs)
                 else [ ];
               in nixpkgs.lib.filter (a: a != binName) names;
+            # Windows embed defaults; a VFS flake's `runtimeEmbed.windows` overrides
+            # (manRoot graft, runtimeStage, explicit aliases). The cross build ships
+            # no man, so the man source is `winManRoot` (explicit) or the
+            # version-locked nixpkgs graft (`winManGraft`). cosmoSymtabTrim drops
+            # cosmo's `.symtab.amd64` ZIP member (no-op on mingw).
             windowsEmbedOpts = {
               primary = binName;
               man = embedMan;
@@ -4584,7 +4582,7 @@ CBODY
               cosmoSymtabTrim = true;
             } // nixpkgs.lib.optionalAttrs (windowsDeclaredAliases != [ ]) { aliases = windowsDeclaredAliases; }
               // (if runtimeEmbedWindows != null then runtimeEmbedWindows windowsPkgs windowsForEmbed else { });
-            windowsPkg0 = withLicense (
+            windowsPkg0 = withMetaPins (
               # Un-migrated flake that still embeds in its own windowsBuild keeps the
               # legacy in-build embed + strippedOrJoined (deleted post-migration).
               if windowsBase.unpinEmbedsMan or false
@@ -4602,9 +4600,7 @@ CBODY
                 moduleObjs = "${windowsForEmbed.module}/objs";
                 appletDir = "${windowsForEmbed.module}/applet";
                 gnulibDir = "${windowsForEmbed.module}/gnulib";
-                depArchives =
-                  let d = multicallCosmo.depArchives or [ ];
-                  in if builtins.isFunction d then d windowsPkgs else d;
+                depArchives = inScope windowsPkgs (multicallCosmo.depArchives or [ ]);
                 # Auto-derived from the cosmo cross build's input closure
                 # (e.g. bash → cosmo readline/ncurses); globbed at build time.
                 depInputDirs = multicallExternalDepDirs windowsForEmbed;
@@ -4613,34 +4609,10 @@ CBODY
                   ++ map (al: { name = al; inherit entry; }) (multicallCosmo.aliases or [ ]);
                 requires = { cxx = false; } // (multicallCosmo.requires or { });
               };
-            # Bitcode multicall manifest the mega folds (mingw counterpart of the
-            # linux/cosmo manifests). moduleArchive/nativeArchive reference the same
-            # built drv's `module`; external depArchives are verbatim store paths
-            # (passthru, NOT linked into the shipped windows binary).
-            windowsMulticallManifest = {
-              package = name;
-              moduleFormat = "bitcode";
-              moduleArchive = "${windowsForEmbed.module}/lib/module.bc";
-              nativeArchive = "${windowsForEmbed.module}/lib/module_native.a";
-              depArchives =
-                let d = multicall.depArchives or [ ];
-                in if builtins.isFunction d then d windowsEnginePkgs else d;
-              depInputDirs = multicallExternalDepDirs windowsForEmbed;
-              applets = nixpkgs.lib.concatMap
-                (p:
-                  let entry = "unpin__${sanCSym name}__${sanCSym p.name}_main"; in
-                  [{ name = p.name; inherit entry; }]
-                  ++ map (al: { name = al; inherit entry; }) (p.aliases or [ ]))
-                multicall.programs;
-              requires = { cxx = false; group = true; } // (multicall.requires or { });
-              manRoot =
-                if embedMan then "${windowsForEmbed.man or windowsForEmbed}" else null;
-              runtimeDataRoot =
-                let r = multicall.runtimeDataRoot or null;
-                in
-                if r == null then null
-                else if builtins.isFunction r then r windowsEnginePkgs
-                else r;
+            windowsMulticallManifest = bitcodeManifest {
+              drv = windowsForEmbed;
+              programs = windowsPrograms;
+              pkgs = windowsEnginePkgs;
             };
             windowsPkg =
               if wantCosmoModule
@@ -4654,6 +4626,14 @@ CBODY
             # nixpkgs `meta.platforms` excludes darwin (kmod, util-linux, shadow,
             # procps-ng — Linux-only kernel APIs).
             wantsNative = system: nativeBuild && !(linuxOnly && isDarwinSys system);
+            # A cross artifact. The nixpkgs set is `sharedCrossPkgs.<attr>` when a
+            # catalog mega prebuilt it (one fixpoint shared across the fold), else
+            # the one spelled out at the call site. withLLDLink: the gc overlay is
+            # Linux-native only, so the cross scopes get the standard lld link via
+            # NIX_CFLAGS_LINK here — keeps the linker uniform across every non-mac
+            # target.
+            crossPkg = attr: fallback:
+              stripped (withLLDLink pkgsAttr (sharedCrossPkgs.${attr} or fallback));
           in
           {
             packages = forAllNative (system:
@@ -4663,25 +4643,17 @@ CBODY
                 "darwin-x86_64" = stripped pkgs.pkgsCross.x86_64-darwin;
               }
               // nixpkgs.lib.optionalAttrs (nativeBuild && system == "x86_64-linux") {
-                # withLLDLink: the gc overlay is Linux-native only, so the cross
-                # scopes get the standard lld link via NIX_CFLAGS_LINK here — keeps
-                # the linker uniform across every non-mac target. The cross nixpkgs
-                # set is `sharedCrossPkgs.<attr>` when the catalog mega prebuilt it
-                # (one fixpoint shared across the fold), else imported per-flake.
-                "linux-i686" = stripped (withLLDLink pkgsAttr
-                  (sharedCrossPkgs."linux-i686" or pkgs.pkgsCross.musl32));
+                "linux-i686" = crossPkg "linux-i686" pkgs.pkgsCross.musl32;
                 # musl-power = powerpc64le-unknown-linux-musl. Debian calls it
                 # "ppc64el" but uname returns "ppc64le" and the Rust ecosystem
                 # (rustup, binstall) labels it the same way — we follow uname.
-                "linux-ppc64le" = stripped (withLLDLink pkgsAttr
-                  (sharedCrossPkgs."linux-ppc64le" or pkgs.pkgsCross.musl-power));
+                "linux-ppc64le" = crossPkg "linux-ppc64le" pkgs.pkgsCross.musl-power;
                 # riscv64 has no pre-cooked musl variant in nixpkgs.pkgsCross
                 # (only glibc). Spell the crossSystem out by triple.
-                "linux-riscv64" = stripped (withLLDLink pkgsAttr
-                  (sharedCrossPkgs."linux-riscv64" or (import nixpkgs {
-                    inherit system;
-                    crossSystem = { config = "riscv64-unknown-linux-musl"; };
-                  })));
+                "linux-riscv64" = crossPkg "linux-riscv64" (import nixpkgs {
+                  inherit system;
+                  crossSystem = { config = "riscv64-unknown-linux-musl"; };
+                });
               }
               // nixpkgs.lib.optionalAttrs (nativeBuild && system == "aarch64-linux") {
                 # armv7l-unknown-linux-musleabihf: pkgsCross has no musl example
@@ -4695,11 +4667,10 @@ CBODY
                 # Rust convention. Drops armv6 (Pi 1/Zero) — worth it, since 64-bit
                 # atomics (libssh2, glib ≥ 2.68) fail to link on armv6 (musl ships
                 # no libatomic in pkgsStatic).
-                "linux-armv7l" = stripped (withLLDLink pkgsAttr
-                  (sharedCrossPkgs."linux-armv7l" or (import nixpkgs {
-                    inherit system;
-                    crossSystem = { config = "armv7l-unknown-linux-musleabihf"; };
-                  })));
+                "linux-armv7l" = crossPkg "linux-armv7l" (import nixpkgs {
+                  inherit system;
+                  crossSystem = { config = "armv7l-unknown-linux-musleabihf"; };
+                });
               }
               // nixpkgs.lib.optionalAttrs (windowsEnabled && system == "x86_64-linux") {
                 "windows-x86_64" = windowsPkg;
@@ -4723,26 +4694,24 @@ CBODY
             # its musl triple, built like the official crosses. Add one per arch
             # AFTER validating it builds + smoke-runs under qemu.
             cross = let
-              mk = triple: stripped (withLLDLink pkgsAttr (import nixpkgs {
+              mk = crossSystem: stripped (withLLDLink pkgsAttr (import nixpkgs {
                 system = "x86_64-linux";
-                crossSystem = { config = triple; };
+                inherit crossSystem;
                 # `.#cross` is best-effort: a niche arch may be absent from a
                 # package's `meta.platforms` whitelist only because no maintainer
                 # blessed it, so bypass the gate (like the windows block). No-op for
                 # already-whitelisted arches.
                 config.allowUnsupportedSystem = true;
               }));
+              byTriple = builtins.mapAttrs (_: config: mk { inherit config; });
               # x86-64 micro-architecture feature levels (psABI 2020): same triple
               # as default x86_64, higher `-march` baseline via gcc.arch. A vN binary
               # SIGILLs below its level, so this is a perf OPT-IN, not portability
               # (default x86_64 stays v1, the "runs anywhere" floor). v2≈Nehalem
               # (SSE4.2), v3≈Haswell (AVX2/FMA), v4 (AVX-512).
-              mkV = arch: stripped (withLLDLink pkgsAttr (import nixpkgs {
-                system = "x86_64-linux";
-                crossSystem = { config = "x86_64-unknown-linux-musl"; gcc.arch = arch; };
-                config.allowUnsupportedSystem = true;
-              }));
-            in nixpkgs.lib.optionalAttrs nativeBuild (builtins.mapAttrs (_: mk) {
+              byArch = builtins.mapAttrs
+                (_: arch: mk { config = "x86_64-unknown-linux-musl"; gcc.arch = arch; });
+            in nixpkgs.lib.optionalAttrs nativeBuild (byTriple {
               # ── Official CI targets, mirrored so `.#cross.<arch>` is a UNIFORM
               # interface. These spell out the exact triples the official
               # `.#packages` crosses use, so the derivations are IDENTICAL (cache
@@ -4807,8 +4776,8 @@ CBODY
               # alone would force an applyPatches on the catalog-wide nixpkgs. Not
               # worth the niche. (Smoke also needs qemu-system; qemu-user has no x32.)
             }
-            // builtins.mapAttrs (_: mkV) {
-              # x86-64 perf feature levels (see mkV above). v1 == default x86_64.
+            // byArch {
+              # x86-64 perf feature levels (see byArch above). v1 == default x86_64.
               "x86_64-v2" = "x86-64-v2";
               "x86_64-v3" = "x86-64-v3";
               "x86_64-v4" = "x86-64-v4";
@@ -4816,12 +4785,12 @@ CBODY
 
             # Read by unpins/action-build to drive CI config.
             manifest = {
-              inherit name package_data bootstrap_naming own_software nativeBuild;
+              inherit name package_data own_software nativeBuild;
               # null unless the caller opted in; otherwise a list of CLI args,
               # JSON-encoded so build.yml runs `<bin> <args>` after each build.
-              smoke = if smoke == null then null else smoke;
+              inherit smoke;
               # Optional grep-E pattern matching the smoke command's stdout+stderr.
-              smoke_pattern = if smokePattern == null then null else smokePattern;
+              smoke_pattern = smokePattern;
               # Per-package darwin portability exception (PrivateFramework names).
               darwin_allow_private_frameworks = darwinAllowPrivateFrameworks;
             };
