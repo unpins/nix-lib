@@ -270,12 +270,11 @@
         #     musl. The copy lets new variants build on demand.
         #
         # lto: the cc/c++ shims append `-flto` so every object is LLVM BITCODE,
-        # the prerequisite for the bitcode-LTO module emitter
-        # (multicallModuleHookLTO). Off by default (the normal path is -O2 ELF,
-        # which the objcopy-based multicallModuleHook needs). The cpp (-E) shim
-        # omits it (clang warns "argument unused" under -E, which a -Werror probe
-        # reads as unsupported). Bitcode app objs + ELF musl libc.a is the
-        # standard LTO-app/non-LTO-libc case.
+        # the prerequisite for the module emitter (multicallModuleHookLTO). Off by
+        # default — a package opts in. The cpp (-E) shim omits it (clang warns
+        # "argument unused" under -E, which a -Werror probe reads as unsupported).
+        # Bitcode app objs + ELF musl libc.a is the standard
+        # LTO-app/non-LTO-libc case.
 
         # Is this package set built by the engine cc? Every per-target fix that
         # works around a clang-vs-gcc difference gates on it, so it has ONE
@@ -2186,13 +2185,10 @@ CBODY
       } > multicall/dispatcher.c'';
 
         # ── Multicall MODULE artifact (the `.a`-generation scheme) ──────────
-        # Add a `module` output carrying a self-describing multicall module:
-        # `module.a` (the package's objects, `main`→`unpin__<pkg>__<prog>_main`,
-        # every other defined global namespaced) plus the package's PRIVATE
-        # bundled archives (gnulib) with their callbacks rewritten to the
-        # namespaced names. Produced by `objcopy --redefine-syms` over the
-        # already-compiled objects — no recompile, rides the shipped binary's
-        # builder.
+        # Add a `module` output carrying a self-describing multicall module: the
+        # package's code with `main`→`unpin__<pkg>__<prog>_main` and every other
+        # defined global namespaced, so N packages can be linked into one binary
+        # without symbol collisions.
         #
         # The manifest (applets/depArchives/requires) is assembled by the caller
         # (mkStandaloneFlake's `multicall` arg, attached as
@@ -2200,61 +2196,11 @@ CBODY
         # binary. A PRIVATE bundled lib (gnulib: `internalArchives`, callbacks
         # namespaced but own defs untouched so they stay dedupable) is
         # distinguished from a CLEAN external dep (`depArchives`, never touched,
-        # deduped at mega-link). Linux native only for now. See docs/multicall.md.
-        multicallModuleHook =
-          { package                 # "grep" — namespace component
-          , programs                # [ { name; objs = [ "src/x.o" ]; } ]
-          , internalArchives ? [ ]  # builddir-relative private .a (gnulib)
-          , isTargetDarwin ? false
-          }: drv:
-          let
-            pfxOf = p: "unpin__${sanCSym package}__${sanCSym p.name}";
-            emitRedef = p: ''
-              {
-                echo "main ${pfxOf p}_main"
-                $NM --defined-only -g ${nixpkgs.lib.concatStringsSep " " p.objs} 2>/dev/null \
-                  | awk -v t="${pfxOf p}" -v strip=${if isTargetDarwin then "1" else "0"} '
-                      $2 ~ /^[TBDRWVCS]$/ {
-                        sym = $3
-                        if (strip && sym ~ /^_/) sym = substr(sym, 2)
-                        if (sym ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && sym != "main" && !seen[sym]++)
-                          print sym " " t "__" sym
-                      }'
-              } > multicall/${sanCSym p.name}.redef
-            '';
-            # Per-program: rename the program's own objects with its own map.
-            renameObjs = p: ''
-              ${nixpkgs.lib.concatMapStringsSep "\n"
-                  (o: ''$OBJCOPY --redefine-syms=multicall/${sanCSym p.name}.redef "${o}" "multicall/objs/${sanCSym p.name}_$(echo '${o}' | tr / _)"'')
-                  p.objs}
-            '';
-          in
-          drv.overrideAttrs (old: {
-            outputs = (old.outputs or [ "out" ]) ++ [ "module" ];
-            postBuild = (old.postBuild or "") + ''
-              set -e
-              mkdir -p multicall/objs
-              ${nixpkgs.lib.concatMapStringsSep "\n" emitRedef programs}
-              ${nixpkgs.lib.concatMapStringsSep "\n" renameObjs programs}
-              mkdir -p "$module/lib"
-              $AR rcs "$module/lib/module.a" multicall/objs/*.o
-              # Union map for the private bundled archives: rewrites their
-              # callbacks into the program (gnulib dfa.o -> dfaerror, …) to the
-              # namespaced names. gnulib's OWN defs aren't in the map -> untouched.
-              cat multicall/*.redef > multicall/all.redef
-              ${nixpkgs.lib.concatMapStringsSep "\n"
-                  (a: ''
-                    cp "${a}" "$module/lib/$(basename ${a})"
-                    chmod +w "$module/lib/$(basename ${a})"
-                    $OBJCOPY --redefine-syms=multicall/all.redef "$module/lib/$(basename ${a})"
-                  '')
-                  internalArchives}
-            '';
-          });
-
-        # Bitcode-LTO variant of multicallModuleHook for engine = "unpin-llvm".
-        # The adapter compiled every object as LLVM BITCODE, so objcopy
-        # --redefine-syms can't apply (llvm-objcopy refuses bitcode). Per program:
+        # deduped at mega-link). See docs/multicall.md.
+        #
+        # The adapter compiled every object as LLVM BITCODE, so a symbol rename
+        # over the finished objects can't apply (llvm-objcopy refuses bitcode).
+        # Per program:
         #
         #   1. a tiny trampoline `unpin__<pkg>__<prog>_main` calls the program's
         #      `main` (only the trampoline is compiled; bitcode objs used as-is);
@@ -2956,8 +2902,8 @@ CBODY
         # mkMegaMulticall: fold N package multicall MODULES (the
         # passthru.multicallModule manifests) into ONE busybox-style binary
         # "unpinbox". Each manifest carries:
-        #   moduleFormat  "bitcode" (-flto emitter) | "elf-archive" (objcopy)
-        #   moduleArchive  store path to module.bc / module.a
+        #   moduleFormat  "bitcode" (-flto emitter) | "cosmo-elf" (cosmocc)
+        #   moduleArchive  store path to module.bc / the renamed ELF objs
         #   depArchives    external clean .a (pcre2, zlib) — passthru store paths
         #   applets        [ { name; entry } ]  entry = unpin__<pkg>__<prog>_main
         #   requires       { cxx; group; … }
@@ -2977,12 +2923,6 @@ CBODY
           , defaultApplet ? null     # applet name to run bare (null = list)
           , toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
           , target ? pkgs.pkgsStatic.stdenv.hostPlatform.config
-          # Which link backend folds this mega (see `engines` below). NOT derived
-          # from moduleFormat: the cross megas carry `elf-archive` modules but
-          # still link through the unpin-llvm adapter, so format and backend are
-          # independent axes. Defaults to the engine every caller uses today; a
-          # cosmo module set overrides it (cosmo objects can't go through lld).
-          , engine ? "unpin-llvm"
           }:
           let
             renamedName = a: nameOverrides.${a.name} or a.name;
@@ -3004,17 +2944,18 @@ CBODY
                 in if m == null
                    then throw "mkMegaMulticall: defaultApplet '${defaultApplet}' is not an applet of any module"
                    else sanOf m;
-            anyBitcode = builtins.any (m: (m.moduleFormat or "elf-archive") == "bitcode") modules;
-            # engine = "cosmocc": modules emitted by multicallModuleHookCosmo,
-            # linked NATIVELY through cosmocc + apelink (no lld, no adapter).
-            cosmoMode = builtins.any (m: (m.moduleFormat or "elf-archive") == "cosmo-elf") modules;
+            anyBitcode = builtins.any (m: m.moduleFormat == "bitcode") modules;
+            # Cosmo modules (multicallModuleHookCosmo) link NATIVELY through
+            # cosmocc + apelink — no lld, no adapter — so they pick the backend
+            # themselves. Every other module set goes through the engine.
+            cosmoMode = builtins.any (m: m.moduleFormat == "cosmo-elf") modules;
             anyCxx = builtins.any (m: m.requires.cxx or false) modules;
             anyGroup = builtins.any (m: m.requires.group or false) modules;
             moduleArchives = map (m: m.moduleArchive) modules;
             # Native (asm/SIMD) sidecars rescued by the bitcode hook — one per
             # bitcode module, linked in the back-ref group alongside depArchives so
             # the asm code the bitcode module references resolves. null on the
-            # cosmo/elf-archive paths (those carry native objects directly).
+            # null on the cosmo path (it carries native objects directly).
             nativeArchives = nixpkgs.lib.filter (x: x != null)
               (map (m: m.nativeArchive or null) modules);
             depArchives = nixpkgs.lib.unique
@@ -3083,11 +3024,10 @@ CBODY
             isDarwinHost = pkgs.stdenv.hostPlatform.isDarwin or false;
             stripLinkFlag = if isDarwinHost then "-Wl,-x" else "-Wl,-s";
             # Bitcode libc: musl's `malloc` is a WEAK alias of the strong
-            # `__libc_malloc`. When a mega's modules are NATIVE objects (elf-archive,
-            # the cross megas) their references to `malloc` are invisible to the
-            # `-flto` link's LTO, so it internalizes/drops the weak `malloc` from the
-            # codegen'd libc → `undefined symbol: malloc` at final resolution. (Megas
-            # with BITCODE modules — x86_64 native — escape it: LTO sees the use.)
+            # `__libc_malloc`. NATIVE objects in the link — the asm/SIMD sidecars
+            # the bitcode hook rescues — reference `malloc` invisibly to the
+            # `-flto` link's LTO, so it internalizes/drops the weak `malloc` from
+            # the codegen'd libc → `undefined symbol: malloc` at final resolution.
             # `-u malloc` both pulls the defining object AND adds `malloc` to the LTO
             # preserve set so it survives into the output for the native objects to
             # bind. Gate on a linux host (every linux engine mega links the bitcode
@@ -3189,7 +3129,7 @@ CBODY
                 '';
               };
             };
-            engineRec = engines.${if cosmoMode then "cosmocc" else engine};
+            engineRec = engines.${if cosmoMode then "cosmocc" else "unpin-llvm"};
 
             # Cosmo helpers, referenced by the "cosmocc" engine record above.
             cosmo = cosmoStdenv pkgs;
@@ -4238,19 +4178,18 @@ CBODY
                 mcPrograms = nixpkgs.lib.filter
                   (p: (p.supportedTarget or (_: true)) pkgs.stdenv.hostPlatform)
                   mcProgramsRaw;
-                # The bitcode module rides the engine's -flto objects, on linux and
-                # darwin alike. There is no per-package darwin opt-out: a darwin
-                # build that genuinely ships fewer applets narrows the list with
-                # `darwinPrograms` above, which keeps the fold and fixes the cause.
-                # Emitted NATIVELY on a darwin host, never cross-built from linux.
+                # The module is BITCODE, so it exists only where the engine
+                # compiled the objects: linux and darwin alike, and only under
+                # engine = "unpin-llvm". There is no per-package darwin opt-out —
+                # a darwin build that genuinely ships fewer applets narrows the
+                # list with `darwinPrograms` above, which keeps the fold and fixes
+                # the cause. Emitted NATIVELY on a darwin host, never cross-built.
                 wantModule = multicall != null
+                  && engine == "unpin-llvm"
                   && (pkgs.stdenv.hostPlatform.isLinux
                       || pkgs.stdenv.hostPlatform.isDarwin);
-                # engine = "unpin-llvm" → bitcode objects → use the bitcode-LTO
-                # emitter (llvm-link + opt -internalize); "default" keeps objcopy.
-                useBitcodeModule = wantModule && engine == "unpin-llvm";
                 rawHooked =
-                  if useBitcodeModule
+                  if wantModule
                   then multicallModuleHookLTO
                     {
                       package = name;
@@ -4260,15 +4199,6 @@ CBODY
                       foldSharedArchives = multicall.foldSharedArchives or false;
                       machoAsm = pkgs.stdenv.hostPlatform.isDarwin or false;
                       llvm = "${tc pkgs.stdenv.buildPlatform.system}/bin/llvm";
-                    }
-                    (rawBuild pkgs)
-                  else if wantModule
-                  then multicallModuleHook
-                    {
-                      package = name;
-                      programs = mcPrograms;
-                      internalArchives = multicall.internalArchives or [ ];
-                      isTargetDarwin = false;
                     }
                     (rawBuild pkgs)
                   else rawBuild pkgs;
@@ -4453,25 +4383,16 @@ CBODY
                 # linked into the shipped binary).
                 multicallManifest = {
                   package = name;
-                  # Bitcode: ONE module.bc with internalArchives folded in.
-                  # ELF/objcopy: module.a + renamed private archives as depArchives.
-                  moduleFormat = if useBitcodeModule then "bitcode" else "elf-archive";
-                  moduleArchive =
-                    if useBitcodeModule
-                    then "${moduleSource.module}/lib/module.bc"
-                    else "${moduleSource.module}/lib/module.a";
+                  # ONE module.bc, with internalArchives already folded in.
+                  moduleFormat = "bitcode";
+                  moduleArchive = "${moduleSource.module}/lib/module.bc";
                   # Native (asm/SIMD) objects the bitcode link dropped, rescued into
-                  # a sidecar the mega-link adds alongside module.bc. Always present
-                  # (possibly empty) on the bitcode path; null otherwise.
-                  nativeArchive =
-                    if useBitcodeModule
-                    then "${moduleSource.module}/lib/module_native.a"
-                    else null;
+                  # a sidecar the mega-link adds alongside module.bc. Always present,
+                  # possibly empty.
+                  nativeArchive = "${moduleSource.module}/lib/module_native.a";
                   depArchives =
-                    (if useBitcodeModule then [ ]
-                     else map (a: "${moduleSource.module}/lib/${baseNameOf a}") (multicall.internalArchives or [ ]))
-                    ++ (let d = multicall.depArchives or [ ];
-                        in if builtins.isFunction d then d pkgs else d);
+                    let d = multicall.depArchives or [ ];
+                    in if builtins.isFunction d then d pkgs else d;
                   applets = nixpkgs.lib.concatMap
                     (p:
                       let entry = "unpin__${sanCSym name}__${sanCSym p.name}_main"; in
