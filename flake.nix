@@ -60,6 +60,41 @@
               | sed "s|$out/cache/unpin-llvm/||"
           '';
 
+        # The ONE way to hand a build the baked sysroot, shared by both stdenv
+        # routes. Nothing may point XDG_CACHE_HOME at `${sysroot}/cache` directly:
+        # the bake is a store path (read-only) but the driver builds missing
+        # variants ON DEMAND at link time, keyed by a per-flag variant hash, so a
+        # flag combo the bake didn't cover tries to write into the store. That
+        # write fails WITHOUT failing the build — the link falls back to a broken
+        # dynamic musl and a configure probe reads it as "flag unsupported", green.
+        sysrootSeedHook = { pkgs, sysroot }: pkgs.makeSetupHook
+          { name = "unpin-seed-sysroot-cache"; substitutions = { sysrootCache = "${sysroot}/cache"; }; }
+          (pkgs.writeText "unpin-seed-sysroot-cache.sh" ''
+            unpinSeedSysrootCache() {
+              if [ -z "''${_unpinCacheSeeded:-}" ]; then
+                export XDG_CACHE_HOME="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-cache"
+                mkdir -p "$XDG_CACHE_HOME"
+                if [ -d "@sysrootCache@/unpin-llvm" ]; then
+                  cp -r "@sysrootCache@/unpin-llvm" "$XDG_CACHE_HOME/" 2>/dev/null || true
+                  chmod -R u+w "$XDG_CACHE_HOME"
+                fi
+                _unpinCacheSeeded=1
+              fi
+            }
+            preConfigureHooks+=(unpinSeedSysrootCache)
+            preBuildHooks+=(unpinSeedSysrootCache)
+            # Also seed NOW, at hook-source time (before any phase). runHook
+            # fires the package's own `preConfigure`/`postPatch` ATTR before the
+            # preConfigureHooks array, and such an attr can already compile+link
+            # (e.g. x265 multibitdepth's `cmake -B build-10bits` runs a
+            # CMakeTestCCompiler probe). Without XDG_CACHE_HOME seeded that early
+            # the linux sysroot copy is missing (ld.lld: cannot open crt1.o /
+            # -lgcc / -lc) and the darwin on-demand sysroot build falls back to
+            # $HOME/.cache = /homeless-shelter and fails. The _unpinCacheSeeded
+            # guard makes the later hook runs no-ops.
+            unpinSeedSysrootCache
+          '');
+
         # The vendored `unpin-llvm` build, from nix-lib's OWN pinned nixpkgs, so
         # the toolchain's LLVM version is locked together with nix-lib. Lazy.
         # `origPkgs` replicates the gc-sections-overlay scope mkStandaloneFlake's
@@ -236,8 +271,13 @@
               export NM=$out/bin/llvm-nm
               export STRIP=$out/bin/llvm-strip
               export LD=$out/bin/ld.lld
-              export XDG_CACHE_HOME=${sysroot}/cache
               EOF
+              # Propagate the seed rather than exporting XDG_CACHE_HOME here, so
+              # it reaches any build using this cc, not only `mkDerivation` below.
+              # Written by hand: a runCommand runs the build phase alone, so no
+              # fixup turns a `propagatedBuildInputs` attr into this file.
+              echo ${sysrootSeedHook { inherit pkgs sysroot; }} \
+                > $out/nix-support/propagated-build-inputs
             '';
           in
           {
@@ -263,11 +303,8 @@
         #     brings its own compiler-rt/libc++/musl. Same trick cosmocc uses.
         #  2. The shims append ${optClass} after "$@" (route-A parity) so every
         #     invocation hits the SAME on-demand sysroot variant the seed warms.
-        #  3. A writable, build-local XDG_CACHE_HOME seeded from the RO sysroot.
-        #     unpin-llvm's sysroot is keyed by a per-flag variant hash; a generic
-        #     recipe uses flag combos the bake didn't cover, and writing into the
-        #     RO store path fails → link silently falls back to a broken dynamic
-        #     musl. The copy lets new variants build on demand.
+        #  3. `sysrootSeedHook` — a generic recipe uses flag combos the bake
+        #     didn't cover, so the cache has to be writable.
         #
         # lto: the cc/c++ shims append `-flto` so every object is LLVM BITCODE,
         # the prerequisite for the module emitter (multicallModuleHookLTO). Off by
@@ -679,33 +716,7 @@
               inherit bintools; cc = ccUnwrapped; libc = null; extraPackages = [ ];
               extraBuildCommands = ccExtraBuildCommands;
             } // appleSdkOverride);
-            seedHook = pkgs.makeSetupHook
-              { name = "unpin-seed-sysroot-cache"; substitutions = { sysrootCache = "${sysroot}/cache"; }; }
-              (pkgs.writeText "unpin-seed-sysroot-cache.sh" ''
-                unpinSeedSysrootCache() {
-                  if [ -z "''${_unpinCacheSeeded:-}" ]; then
-                    export XDG_CACHE_HOME="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-cache"
-                    mkdir -p "$XDG_CACHE_HOME"
-                    if [ -d "@sysrootCache@/unpin-llvm" ]; then
-                      cp -r "@sysrootCache@/unpin-llvm" "$XDG_CACHE_HOME/" 2>/dev/null || true
-                      chmod -R u+w "$XDG_CACHE_HOME"
-                    fi
-                    _unpinCacheSeeded=1
-                  fi
-                }
-                preConfigureHooks+=(unpinSeedSysrootCache)
-                preBuildHooks+=(unpinSeedSysrootCache)
-                # Also seed NOW, at hook-source time (before any phase). runHook
-                # fires the package's own `preConfigure`/`postPatch` ATTR before the
-                # preConfigureHooks array, and such an attr can already compile+link
-                # (e.g. x265 multibitdepth's `cmake -B build-10bits` runs a
-                # CMakeTestCCompiler probe). Without XDG_CACHE_HOME seeded that early
-                # the linux sysroot copy is missing (ld.lld: cannot open crt1.o /
-                # -lgcc / -lc) and the darwin on-demand sysroot build falls back to
-                # $HOME/.cache = /homeless-shelter and fails. The _unpinCacheSeeded
-                # guard makes the later hook runs no-ops.
-                unpinSeedSysrootCache
-              '');
+            seedHook = sysrootSeedHook { inherit pkgs sysroot; };
             captureHook = pkgs.makeSetupHook { name = "unpin-capture-links"; }
               (pkgs.writeText "unpin-capture-links.sh" ''
                 export UNPIN_CAPTURE_LINKS=1
