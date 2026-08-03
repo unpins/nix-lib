@@ -3113,12 +3113,11 @@ CBODY
             darwinFrameworkFlags = nixpkgs.lib.optionalString
               (isDarwinHost && darwinFrameworks != [ ])
               (nixpkgs.lib.concatMapStringsSep " " (f: "-framework ${f}") darwinFrameworks);
-            # The mega's link backend, as DATA. The mega has always had two of them
-            # (unpin-llvm below, cosmocc after it); they differ on a fixed set of
-            # axes, so name the axes once instead of writing one builder per
-            # backend. A third backend (gcc/binutils) is then a record entry, not a
-            # new builder. Selected by module format — the producer side already
-            # tags every manifest (`moduleFormat`).
+            # The mega's link backend, as DATA. There are two (unpin-llvm below,
+            # cosmocc after it) and they differ on a fixed set of axes, so name the
+            # axes once instead of writing one builder per backend — a third one is
+            # then a record entry, not a new builder. Selected by module format —
+            # the producer side already tags every manifest (`moduleFormat`).
             #
             #   stdenv    which stdenv performs the link
             #   prelude   shell emitted before autoDepsPrelude
@@ -3152,32 +3151,6 @@ CBODY
                   # the strip. Explicit depArchives + auto-derived (autodeps) ride in
                   # one group (empty on darwin — ld64 resolves back-refs multi-pass).
                   ${face} -fuse-ld=lld ${stripLinkFlag} ${bitcodeLibcForce}-o ${binFile} \
-                    multicall/dispatcher.c \
-                    ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
-                    ${groupOpen} ${nixpkgs.lib.concatStringsSep " " nativeArchives} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose} \
-                    ${darwinFrameworkFlags}
-                '';
-                postLink = "";
-                install = ''
-                  install -m755 ${binFile} "$out/bin/${binFile}"
-                '';
-              };
-              # Stock nixpkgs static toolchain (gcc + binutils, ld.bfd). Consumes
-              # the `elf-archive` modules the objcopy/NM emitter
-              # (multicallModuleHook) already produces for every non-unpin-llvm
-              # engine, so the producer side needs nothing new. No -fuse-ld (bfd is
-              # the default), and no bitcodeLibcForce: that one exists to keep a
-              # weak musl `malloc` alive across an -flto link, and there is no LTO
-              # link here. UNBUILT — reachable only by passing engine = "gcc"; the
-              # entry is the seam, not a validated target.
-              "gcc" = {
-                stdenv = pkgs.pkgsStatic.stdenv;
-                prelude = "";
-                linkLine = ''
-                  # -static is belt-and-braces: pkgsStatic's cc-wrapper already links
-                  # static for an isStatic host, and a duplicate is a no-op. Explicit
-                  # depArchives + auto-derived (autodeps) ride in one group.
-                  ${face} -static ${stripLinkFlag} -o ${binFile} \
                     multicall/dispatcher.c \
                     ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
                     ${groupOpen} ${nixpkgs.lib.concatStringsSep " " nativeArchives} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose} \
@@ -4265,13 +4238,14 @@ CBODY
                 mcPrograms = nixpkgs.lib.filter
                   (p: (p.supportedTarget or (_: true)) pkgs.stdenv.hostPlatform)
                   mcProgramsRaw;
-                # The bitcode module rides the engine's -flto objects. Linux and
-                # darwin both default-on (the darwin standalone already builds
-                # regardless); a package sets multicall.darwin = false to opt out.
+                # The bitcode module rides the engine's -flto objects, on linux and
+                # darwin alike. There is no per-package darwin opt-out: a darwin
+                # build that genuinely ships fewer applets narrows the list with
+                # `darwinPrograms` above, which keeps the fold and fixes the cause.
                 # Emitted NATIVELY on a darwin host, never cross-built from linux.
                 wantModule = multicall != null
                   && (pkgs.stdenv.hostPlatform.isLinux
-                      || (pkgs.stdenv.hostPlatform.isDarwin && (multicall.darwin or true)));
+                      || pkgs.stdenv.hostPlatform.isDarwin);
                 # engine = "unpin-llvm" → bitcode objects → use the bitcode-LTO
                 # emitter (llvm-link + opt -internalize); "default" keeps objcopy.
                 useBitcodeModule = wantModule && engine == "unpin-llvm";
