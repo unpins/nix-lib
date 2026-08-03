@@ -4531,25 +4531,37 @@ CBODY
             # no man, so the man source is `winManRoot` (explicit) or the
             # version-locked nixpkgs graft (`winManGraft`). cosmoSymtabTrim drops
             # cosmo's `.symtab.amd64` ZIP member (no-op on mingw).
-            # Windows counterpart of `declaredAliases` — but ONLY where nix-lib
-            # itself did the fold, because only then does it know the applet set.
-            # A cosmo build dispatches the table `multicallCosmo` declares, which
-            # can differ from the linux one (coreutils drops `hostid`: cosmo has no
-            # gethostid); `wantWindowsModule` folds `multicall.programs` verbatim.
-            # Neither is mcPrograms — that is filtered against the NATIVE host.
+            # Windows counterpart of `declaredAliases`. Where nix-lib itself did
+            # the fold it knows the whole applet set: a cosmo build dispatches the
+            # table `multicallCosmo` declares (which can differ from the linux one
+            # — coreutils drops `hostid`, cosmo has no gethostid), and
+            # `wantWindowsModule` folds `multicall.programs` verbatim. Neither is
+            # mcPrograms, which is filtered against the NATIVE host.
             #
-            # Everything else on windows comes from the flake's own `windowsBuild`,
-            # whose applet set is NOT `multicall.programs`: usbutils folds lsusb
-            # alone (usbhid-dump needs sigaction), and less folds nothing at all.
-            # Asserting the native list there ships names that dispatch to the
-            # default applet. That build embeds what it really folded and
-            # unpinEmbedWrap carries it over, so say nothing here.
+            # Otherwise the binary comes from the flake's own `windowsBuild`, whose
+            # applet set is NOT `multicall.programs` — usbutils folds lsusb alone
+            # (usbhid-dump needs sigaction), less folds nothing. Two rules keep the
+            # shipped list honest there:
+            #
+            #   1. only the PRIMARY program's aliases. An alias is a second name
+            #      for the same binary, not a second applet, so it holds whatever
+            #      that build folded: mawk is mawk, hence `awk`. Announcing another
+            #      program's name is what ships a link that falls through to the
+            #      default applet; announcing the primary's own aliases cannot.
+            #   2. only when that build packed NO list of its own. Where it did,
+            #      it is the better source — unzip really folds `funzip`, which no
+            #      declaration of the primary's aliases can say. unpinEmbedWrap
+            #      recovers that list from the base; saying anything here would
+            #      just append a second, poorer copy.
             windowsDeclaredAliases =
               let names =
                 if multicallCosmo != null
                 then [ multicallCosmo.program ] ++ (multicallCosmo.aliases or [ ])
                 else if wantWindowsModule
                 then nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) multicall.programs
+                else if multicall != null && !(windowsBase.unpinEmbedsAliases or false)
+                then nixpkgs.lib.concatMap (p: p.aliases or [ ])
+                  (nixpkgs.lib.filter (p: p.name == binName) multicall.programs)
                 else [ ];
               in nixpkgs.lib.filter (a: a != binName) names;
             windowsEmbedOpts = {
