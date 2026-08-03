@@ -2001,6 +2001,12 @@
             '';
           });
 
+        # A package or program name as a C identifier component — every emitter
+        # below builds symbols (`unpin__<pkg>__<prog>_main`) and per-program file
+        # names out of it, so they must all spell it the same way.
+        sanCSym = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
+        spaceSep = nixpkgs.lib.concatStringsSep " ";
+
         # Recipe-A multicall dispatcher generator (the `ld -r` family:
         # e2fsprogs/util-linux/shadow/findutils/procps-ng). The caller writes
         # `multicall/applets.list` as a TSV (the NAME→FUNCTION table is
@@ -2202,8 +2208,7 @@ CBODY
           , isTargetDarwin ? false
           }: drv:
           let
-            san = n: nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ] n;
-            pfxOf = p: "unpin__${san package}__${san p.name}";
+            pfxOf = p: "unpin__${sanCSym package}__${sanCSym p.name}";
             emitRedef = p: ''
               {
                 echo "main ${pfxOf p}_main"
@@ -2215,12 +2220,12 @@ CBODY
                         if (sym ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && sym != "main" && !seen[sym]++)
                           print sym " " t "__" sym
                       }'
-              } > multicall/${san p.name}.redef
+              } > multicall/${sanCSym p.name}.redef
             '';
             # Per-program: rename the program's own objects with its own map.
             renameObjs = p: ''
               ${nixpkgs.lib.concatMapStringsSep "\n"
-                  (o: ''$OBJCOPY --redefine-syms=multicall/${san p.name}.redef "${o}" "multicall/objs/${san p.name}_$(echo '${o}' | tr / _)"'')
+                  (o: ''$OBJCOPY --redefine-syms=multicall/${sanCSym p.name}.redef "${o}" "multicall/objs/${sanCSym p.name}_$(echo '${o}' | tr / _)"'')
                   p.objs}
             '';
           in
@@ -2339,9 +2344,7 @@ CBODY
                                     # Hence this note lives out here.
           }: drv:
           let
-            san = n: nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ] n;
-            entryOf = p: "unpin__${san package}__${san p.name}_main";
-            spaceSep = nixpkgs.lib.concatStringsSep " ";
+            entryOf = p: "unpin__${sanCSym package}__${sanCSym p.name}_main";
             # Fold the program's bitcode objs + trampoline + PRIVATE archives
             # into one module with a REAL linker (ld.lld -r), not llvm-link.
             # llvm-link has no archive semantics: it whole-loads (duplicate strong
@@ -2355,7 +2358,7 @@ CBODY
             # internalizes everything but the entry.
             perProgram = p:
               let
-                linkBc = "multicall/link_${san p.name}.bc";
+                linkBc = "multicall/link_${sanCSym p.name}.bc";
                 infer = inferLinkInputs && (p.objs or null) == null;
                 # dedup LOCALA: a gnulib archive double-listed for circular refs
                 # folds to one — lld -r resolves back-references without it.
@@ -2368,9 +2371,9 @@ CBODY
                 '';
                 linkLine =
                   if infer
-                  then ''${llvm} ld.lld -r $__objs multicall/tramp_${san p.name}.bc $__arch \
+                  then ''${llvm} ld.lld -r $__objs multicall/tramp_${sanCSym p.name}.bc $__arch \
                   --lto-emit-llvm -o ${linkBc}''
-                  else ''${llvm} ld.lld -r ${spaceSep (p.objs or [ ])} multicall/tramp_${san p.name}.bc ${spaceSep internalArchives} \
+                  else ''${llvm} ld.lld -r ${spaceSep (p.objs or [ ])} multicall/tramp_${sanCSym p.name}.bc ${spaceSep internalArchives} \
                   --lto-emit-llvm -o ${linkBc}'';
                 # SIMD/asm rescue: native ELF objects (NASM/yasm asm) can't live in
                 # a .bc, so --lto-emit-llvm silently drops them and their symbols go
@@ -2426,8 +2429,8 @@ CBODY
                 # same as the dispatcher→entry call). A 2-arg trampoline instead
                 # dropped env → a 3-arg main received NULL (verified) → SIGSEGV.
                 printf 'extern int main(int,char**,char**);\nint %s(int c,char**v,char**e){return main(c,v,e);}\n' \
-                  '${entryOf p}' > multicall/tramp_${san p.name}.c
-                $CC -flto -O2 -c multicall/tramp_${san p.name}.c -o multicall/tramp_${san p.name}.bc
+                  '${entryOf p}' > multicall/tramp_${sanCSym p.name}.c
+                $CC -flto -O2 -c multicall/tramp_${sanCSym p.name}.c -o multicall/tramp_${sanCSym p.name}.bc
                 ${nixpkgs.lib.optionalString infer inferSetup}
                 ${linkLine}
                 ${natCollect}
@@ -2451,18 +2454,18 @@ CBODY
                 if ${llvm} llvm-ar t "$module/lib/module_native.a" >/dev/null 2>&1 \
                    && [ -n "$(${llvm} llvm-ar t "$module/lib/module_native.a" 2>/dev/null)" ]; then
                   ${llvm} llvm-nm --undefined-only "$module/lib/module_native.a" 2>/dev/null \
-                    | awk '$1=="U"{print $2}' | sort -u > multicall/nat_${san p.name}.u
+                    | awk '$1=="U"{print $2}' | sort -u > multicall/nat_${sanCSym p.name}.u
                   # defined externals of the OWN OBJECTS only (skip the "file:"
                   # headers llvm-nm prints when handed several files).
                   ${llvm} llvm-nm --defined-only --extern-only ${progObjs} 2>/dev/null \
-                    | awk '$NF ~ /:$/ {next} {print $NF}' | sort -u > multicall/obj_${san p.name}.d
-                  __extra=$(comm -12 multicall/nat_${san p.name}.u multicall/obj_${san p.name}.d)
+                    | awk '$NF ~ /:$/ {next} {print $NF}' | sort -u > multicall/obj_${sanCSym p.name}.d
+                  __extra=$(comm -12 multicall/nat_${sanCSym p.name}.u multicall/obj_${sanCSym p.name}.d)
                   for __s in $__extra; do keeplist="$keeplist,$__s"; done
                   [ -n "$__extra" ] && echo "multicall(${p.name}): keeping asm-referenced bitcode syms external:" $__extra >&2 || true
                 fi
                 ${stripStep}
                 ${llvm} opt -passes=internalize -internalize-public-api-list="$keeplist" \
-                  ${internalizeIn} -o multicall/mod_${san p.name}.bc
+                  ${internalizeIn} -o multicall/mod_${sanCSym p.name}.bc
               '';
 
             # ── option A: shared-archive fold (foldSharedArchives, multi-prog) ──
@@ -2490,12 +2493,12 @@ CBODY
             # pointer); no catalog shared-code package violates this.
             foldShared = foldSharedArchives && builtins.length programs > 1;
             entriesCsv = nixpkgs.lib.concatMapStringsSep "," entryOf programs;
-            modsList = spaceSep (map (p: "multicall/mod_${san p.name}.bc") programs);
+            modsList = spaceSep (map (p: "multicall/mod_${sanCSym p.name}.bc") programs);
             perProgramShared = p:
               let
                 entry = entryOf p;
                 infer = inferLinkInputs && (p.objs or null) == null;
-                partial = "multicall/partial_${san p.name}.bc";
+                partial = "multicall/partial_${sanCSym p.name}.bc";
                 readInputs =
                   if infer then ''
                     __side="$UNPIN_LINK_DIR/${p.name}.link"
@@ -2510,14 +2513,14 @@ CBODY
               in
               ''
                 printf 'extern int main(int,char**,char**);\nint %s(int c,char**v,char**e){return main(c,v,e);}\n' \
-                  '${entry}' > multicall/tramp_${san p.name}.c
-                $CC -flto -O2 -c multicall/tramp_${san p.name}.c -o multicall/tramp_${san p.name}.bc
+                  '${entry}' > multicall/tramp_${sanCSym p.name}.c
+                $CC -flto -O2 -c multicall/tramp_${sanCSym p.name}.c -o multicall/tramp_${sanCSym p.name}.bc
                 ${readInputs}
                 for __a in $__arch; do echo "$__a" >> multicall/union.arch.raw; done
-                ${llvm} ld.lld -r $__objs multicall/tramp_${san p.name}.bc \
+                ${llvm} ld.lld -r $__objs multicall/tramp_${sanCSym p.name}.bc \
                   --lto-emit-llvm -o ${partial}
                 ${llvm} opt -passes=internalize -internalize-public-api-list='${entry}' \
-                  ${partial} -o multicall/mod_${san p.name}.bc
+                  ${partial} -o multicall/mod_${sanCSym p.name}.bc
                 # rescue native asm from a program's OWN objects (none for ffmpeg;
                 # general-safety for other shared-code packages)
                 _unpin_collect "$module/lib/module_native.a" $__objs
@@ -2680,7 +2683,7 @@ CBODY
               else
                 ${llvm} llvm-ar rc "$module/lib/module_native.a"
               fi
-              ${llvm} llvm-link ${spaceSep (map (p: "multicall/mod_${san p.name}.bc") programs)} \
+              ${llvm} llvm-link ${spaceSep (map (p: "multicall/mod_${sanCSym p.name}.bc") programs)} \
                 -o "$module/lib/module.bc"
               ''}
             '';
@@ -2714,18 +2717,16 @@ CBODY
           , gnulibArchives ? [ ]     # builddir-relative .a (gnulib), scanned AFTER
           }: drv:
           let
-            san = n: nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ] n;
-            pfx = "unpin__${san package}__";
-            entry = "${pfx}${san program}_main";
-            sp = nixpkgs.lib.concatStringsSep " ";
+            pfx = "unpin__${sanCSym package}__";
+            entry = "${pfx}${sanCSym program}_main";
           in
           drv.overrideAttrs (old: {
             outputs = (old.outputs or [ "out" ]) ++ [ "module" ];
             postBuild = (old.postBuild or "") + ''
               set -e
               mkdir -p multicall "$module/objs" "$module/applet" "$module/gnulib"
-              progobjs="${sp programObjs}"
-              ag="${sp appletArchives}"; gg="${sp gnulibArchives}"
+              progobjs="${spaceSep programObjs}"
+              ag="${spaceSep appletArchives}"; gg="${spaceSep gnulibArchives}"
               # nullglob-safe: a bare `ls` with no args lists the cwd, so only
               # run it when the glob list is non-empty.
               applet=$([ -n "$ag" ] && ls $ag 2>/dev/null || true)
@@ -2741,19 +2742,19 @@ CBODY
                         if (sym ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && sym != "main" && !seen[sym]++)
                           print sym " " p sym
                       }'
-              } > multicall/${san package}.redef
+              } > multicall/${sanCSym package}.redef
               rename_into() { # $1=destdir ; reads a file list on stdin
                 local n=0 a d
                 while read -r a; do
                   [ -n "$a" ] || continue
                   d="$1/$(printf '%03d' $n)-$(basename "$a")"
                   cp "$a" "$d"; chmod +w "$d"
-                  $OBJCOPY --redefine-syms=multicall/${san package}.redef "$d"; n=$((n+1))
+                  $OBJCOPY --redefine-syms=multicall/${sanCSym package}.redef "$d"; n=$((n+1))
                 done
               }
               n=0
               for o in $progobjs; do
-                $OBJCOPY --redefine-syms=multicall/${san package}.redef "$o" \
+                $OBJCOPY --redefine-syms=multicall/${sanCSym package}.redef "$o" \
                   "$module/objs/$(printf '%03d' $n)-$(basename "$o")"; n=$((n+1))
               done
               printf '%s\n' $applet | rename_into "$module/applet"
@@ -2801,7 +2802,6 @@ CBODY
           , isWindows ? false       # mingw PE: bin/<pkg>.exe, embedded aliases (no symlinks)
           }:
           let
-            san = name: nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ] name;
             # Windows (mingw or cosmo) ships one .exe with the applet names
             # embedded as aliases — no in-store symlinks. mingw x86_64 keeps the
             # --start-group/-lgcc (no Mach-O/APE constraints; libgcc is present);
@@ -2822,24 +2822,24 @@ CBODY
             libgcc = if noGroup then "" else "-lgcc";
 
             appletLines =
-              (map (p: "${p.name}\t${san p.name}") programs)
-              ++ (map (a: "${a.name}\t${san a.target}") aliases);
+              (map (p: "${p.name}\t${sanCSym p.name}") programs)
+              ++ (map (a: "${a.name}\t${sanCSym a.target}") aliases);
 
             # Phase A: discover defined globals per program (canonical names,
             # before any recompile) and emit the rename header.
             renameHeader = p: ''
               {
                 echo "/* multicall rename header: ${p.name} */"
-                echo "#define main ${san p.name}_main"
+                echo "#define main ${sanCSym p.name}_main"
                 $NM --defined-only -g ${nixpkgs.lib.concatStringsSep " " p.objs} 2>/dev/null \
-                  | awk -v t="${san p.name}" -v strip=${if isTargetDarwin then "1" else "0"} '
+                  | awk -v t="${sanCSym p.name}" -v strip=${if isTargetDarwin then "1" else "0"} '
                       $2 ~ /^[TBDRWVCS]$/ {
                         sym = $3
                         if (strip && sym ~ /^_/) sym = substr(sym, 2)
                         if (sym ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && sym != "main" && !seen[sym]++)
                           print "#define " sym " " t "__" sym
                       }'
-              } > multicall/${san p.name}.rename.h
+              } > multicall/${sanCSym p.name}.rename.h
             '';
 
             # Phase B: rm the program's objects, recompile them with the rename
@@ -2854,10 +2854,10 @@ CBODY
               in ''
                 rm -f ${nixpkgs.lib.concatStringsSep " " p.objs}
                 make -C ${dir} -j''${NIX_BUILD_CORES:-1} ${nixpkgs.lib.concatStringsSep " " targets} \
-                  NIX_CFLAGS_COMPILE="$_orig_NIX_CFLAGS_COMPILE -include $PWD/multicall/${san p.name}.rename.h"
-                mkdir -p multicall/obj_${san p.name}
+                  NIX_CFLAGS_COMPILE="$_orig_NIX_CFLAGS_COMPILE -include $PWD/multicall/${sanCSym p.name}.rename.h"
+                mkdir -p multicall/obj_${sanCSym p.name}
                 ${nixpkgs.lib.concatMapStringsSep "\n      "
-                    (o: ''cp "${o}" "multicall/obj_${san p.name}/$(echo '${o}' | tr / _)"'')
+                    (o: ''cp "${o}" "multicall/obj_${sanCSym p.name}/$(echo '${o}' | tr / _)"'')
                     p.objs}
               '';
 
@@ -4234,7 +4234,6 @@ CBODY
                 # `module` output by post-processing the objects the build
                 # already compiled (no recompile), riding the same builder as
                 # the shipped binary. No-op when `multicall == null` or off-Linux.
-                sanMc = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
                 # Per-platform program set. Most packages ship the same programs
                 # everywhere, so `multicall.programs` is authoritative. A package
                 # whose darwin build is a genuine SUBSET (no /proc analogue, so it
@@ -4501,7 +4500,7 @@ CBODY
                         in if builtins.isFunction d then d pkgs else d);
                   applets = nixpkgs.lib.concatMap
                     (p:
-                      let entry = "unpin__${sanMc name}__${sanMc p.name}_main"; in
+                      let entry = "unpin__${sanCSym name}__${sanCSym p.name}_main"; in
                       [{ name = p.name; inherit entry; }]
                       ++ map (al: { name = al; inherit entry; }) (p.aliases or [ ]))
                     mcPrograms;
@@ -4569,7 +4568,6 @@ CBODY
             # build with multicallModuleHookCosmo (renamed ELF objs — cosmo objects
             # are ELF before apelink) and emit `passthru.cosmoMulticallModule` from
             # the same build the `windows-x86_64` artifact ships.
-            sanMcW = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
             wantCosmoModule = multicallCosmo != null && (windowsCosmo || windowsBuild != null);
             # Mingw BITCODE multicall MODULE opt-in — the engine counterpart of
             # the cosmo path. When engine + multicall + a mingw (NOT cosmo) windows
@@ -4680,7 +4678,7 @@ CBODY
             # depArchives are verbatim store paths (passthru, NOT linked into the
             # shipped binary).
             cosmoMulticallManifest =
-              let entry = "unpin__${sanMcW name}__${sanMcW multicallCosmo.program}_main";
+              let entry = "unpin__${sanCSym name}__${sanCSym multicallCosmo.program}_main";
               in {
                 moduleFormat = "cosmo-elf";
                 moduleObjs = "${windowsForEmbed.module}/objs";
@@ -4712,7 +4710,7 @@ CBODY
               depInputDirs = multicallExternalDepDirs windowsForEmbed;
               applets = nixpkgs.lib.concatMap
                 (p:
-                  let entry = "unpin__${sanMcW name}__${sanMcW p.name}_main"; in
+                  let entry = "unpin__${sanCSym name}__${sanCSym p.name}_main"; in
                   [{ name = p.name; inherit entry; }]
                   ++ map (al: { name = al; inherit entry; }) (p.aliases or [ ]))
                 multicall.programs;
