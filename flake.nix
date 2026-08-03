@@ -275,62 +275,6 @@
         # "argument unused" under -E, which a -Werror probe reads as unsupported).
         # Bitcode app objs + ELF musl libc.a is the standard
         # LTO-app/non-LTO-libc case.
-
-        # Is this package set built by the engine cc? Every per-target fix that
-        # works around a clang-vs-gcc difference gates on it, so it has ONE
-        # definition: the cc is named by `unpinCC`/`ccUnwrapped` below, and a
-        # rename there must not silently turn a dozen fixes into no-ops.
-        isUnpinEngine = pkgs:
-          nixpkgs.lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
-
-        # meson refuses `add_languages('objc')` in cross mode unless the cross
-        # file names objc/objcpp, and nixpkgs' darwin cross file omits both — so
-        # a linux→darwin cross-eval aborts for any package that calls it (glib,
-        # pango). Emitted at build time so `$CC`/`$CXX` expand there. meson
-        # REPLACES (not merges) a [host_machine] a later --cross-file redefines,
-        # hence the full section rather than just `subsystem` — which is the
-        # second half of the fix, since it cannot autodetect in cross mode
-        # ("Subsystem not defined or could not be autodetected").
-        #
-        # ATTACH PER-PACKAGE, never by overriding the global `meson`. gnutar's
-        # checkPhase closure transitively pulls `meson`, so ANY change to the
-        # `meson` derivation re-hashes the whole darwin stdenv closure — gnutar
-        # included — forcing a from-source rebuild on the GHA macos-14 runner
-        # where gnutar test 155 (time01 "tricky time stamps") fails, cascading to
-        # EVERY darwin build.
-        withDarwinMesonObjc = pkgs: drv:
-          let hp = pkgs.stdenv.hostPlatform; in
-          drv.overrideAttrs (oa: {
-            preConfigure = (oa.preConfigure or "") + ''
-              cat > "$NIX_BUILD_TOP/objc-cross.conf" <<EOF
-              [binaries]
-              objc = '$CC'
-              objcpp = '$CXX'
-
-              [host_machine]
-              system = 'darwin'
-              cpu_family = '${if hp.isAarch64 then "aarch64" else "x86_64"}'
-              cpu = '${hp.parsed.cpu.name}'
-              endian = 'little'
-              subsystem = 'macos'
-              EOF
-              mesonFlagsArray+=("--cross-file=$NIX_BUILD_TOP/objc-cross.conf")
-            '';
-          });
-
-        # Loader shared by the three per-target fix directories: `<pkg>.nix` is
-        # the fix for `<pkg>`, so there is no index to drift from the files.
-        importFixDir = { dir, lib }:
-          nixpkgs.lib.mapAttrs'
-            (file: _: nixpkgs.lib.nameValuePair
-              (nixpkgs.lib.removeSuffix ".nix" file)
-              (import (dir + "/${file}") { inherit lib; }))
-            (nixpkgs.lib.filterAttrs
-              (file: type: type == "regular"
-                && file != "default.nix"
-                && nixpkgs.lib.hasSuffix ".nix" file)
-              (builtins.readDir dir));
-
         unpinAdapterStdenv =
           { pkgs, toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
           , target, optClass ? "-O2", cxx ? true, native ? false, lto ? false
@@ -651,12 +595,7 @@
                 [ -e "$out/bin/$u" ] || ln -s "$b" "$out/bin/$u"
               done
             '';
-            # Windows: the engine resolves default CRT import libs from its VFS,
-            # but EXTRA `-l<dll>` libs (bcrypt, ws2_32) are synthesized in-memory
-            # from VFS .def files and that synthesis FAILS in the build sandbox
-            # ("unable to find library"). nixpkgs' mingw-w64 ships them as real
-            # ABI-neutral import stubs; curate ONLY the extras into a link-path dir
-            # — NOT kernel32/CRT, so the engine's startup objects aren't shadowed.
+            # windows (PE) target: the mingw and windows-gnu triple spellings.
             isWinTarget =
               nixpkgs.lib.hasInfix "windows" target || nixpkgs.lib.hasInfix "mingw" target;
             # darwin (Mach-O) target: arm64/x86_64-apple-darwin / -macos.
@@ -686,9 +625,19 @@
               nixpkgs.lib.optionalString isDarwinTarget " -idirafter ${darwinHeaderStubs}/include";
             # (No `-lm`/`-lpthread` stub libs: the engine adds `-L <sdk>/usr/lib`
             # at link, where the SDK's libm.tbd/libpthread.tbd resolve them.)
+            # Windows: the engine resolves default CRT import libs from its VFS,
+            # but EXTRA `-l<dll>` libs (bcrypt, ws2_32) are synthesized in-memory
+            # from VFS .def files and that synthesis FAILS in the build sandbox
+            # ("unable to find library"). nixpkgs' mingw-w64 ships them as real
+            # ABI-neutral import stubs; curate ONLY the extras into a link-path dir
+            # — NOT kernel32/CRT, so the engine's startup objects aren't shadowed.
+            # ONE list: the search dir here and the force-link `-l` line in
+            # ccExtraBuildCommands must name the same set, or a stub sits on the
+            # path and is never pulled — or an `-l` finds nothing.
+            winExtraLibs = [ "bcrypt" "ws2_32" "userenv" "secur32" "crypt32" "shlwapi" ];
             winImportLibs = pkgs.runCommand "unpin-win-implibs-${target}" { } ''
               mkdir -p $out/lib
-              for L in bcrypt ws2_32 userenv secur32 crypt32 shlwapi; do
+              for L in ${nixpkgs.lib.concatStringsSep " " winExtraLibs}; do
                 ln -s ${pkgs.windows.mingw_w64}/lib/lib$L.a $out/lib/
               done
             '';
@@ -721,7 +670,7 @@
                 # magic dir from the exe path; the per-package link gets it from
                 # file's own LIBS, but the mega-link only knows depArchives, so add
                 # it here too (no-op for packages that don't reference it).
-                echo "-lbcrypt -lws2_32 -luserenv -lsecur32 -lcrypt32 -lshlwapi" >> $out/nix-support/cc-ldflags
+                echo "${nixpkgs.lib.concatMapStringsSep " " (l: "-l${l}") winExtraLibs}" >> $out/nix-support/cc-ldflags
               '';
             bintools = staticBuild.wrapBintoolsWith ({
               bintools = bintoolsUnwrapped; libc = null; extraBuildCommands = unprefixAliases;
@@ -827,6 +776,13 @@
               extraBuildInputs =
                 if isDarwinTarget then [ ] else (old.extraBuildInputs or [ ]);
             }));
+
+        # Is this package set built by the engine cc? Every per-target fix that
+        # works around a clang-vs-gcc difference gates on it, so it has ONE
+        # definition: the cc is named by `unpinCC`/`ccUnwrapped` above, and a
+        # rename there must not silently turn a dozen fixes into no-ops.
+        isUnpinEngine = pkgs:
+          nixpkgs.lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
 
         # Append `flags` (string or list) to one of the cc-wrapper's flag
         # variables. A structuredAttrs drv presets the variable inside `env`, and
@@ -1000,6 +956,54 @@
         lldFinalLink = pkgs:
           if isLLDTarget pkgs then [ (lldRSafe pkgs.buildPackages) ]
           else [ ];
+
+        # Loader shared by the three per-target fix directories: `<pkg>.nix` is
+        # the fix for `<pkg>`, so there is no index to drift from the files.
+        importFixDir = { dir, lib }:
+          nixpkgs.lib.mapAttrs'
+            (file: _: nixpkgs.lib.nameValuePair
+              (nixpkgs.lib.removeSuffix ".nix" file)
+              (import (dir + "/${file}") { inherit lib; }))
+            (nixpkgs.lib.filterAttrs
+              (file: type: type == "regular"
+                && file != "default.nix"
+                && nixpkgs.lib.hasSuffix ".nix" file)
+              (builtins.readDir dir));
+
+        # meson refuses `add_languages('objc')` in cross mode unless the cross
+        # file names objc/objcpp, and nixpkgs' darwin cross file omits both — so
+        # a linux→darwin cross-eval aborts for any package that calls it (glib,
+        # pango). Emitted at build time so `$CC`/`$CXX` expand there. meson
+        # REPLACES (not merges) a [host_machine] a later --cross-file redefines,
+        # hence the full section rather than just `subsystem` — which is the
+        # second half of the fix, since it cannot autodetect in cross mode
+        # ("Subsystem not defined or could not be autodetected").
+        #
+        # ATTACH PER-PACKAGE, never by overriding the global `meson`. gnutar's
+        # checkPhase closure transitively pulls `meson`, so ANY change to the
+        # `meson` derivation re-hashes the whole darwin stdenv closure — gnutar
+        # included — forcing a from-source rebuild on the GHA macos-14 runner
+        # where gnutar test 155 (time01 "tricky time stamps") fails, cascading to
+        # EVERY darwin build.
+        withDarwinMesonObjc = pkgs: drv:
+          let hp = pkgs.stdenv.hostPlatform; in
+          drv.overrideAttrs (oa: {
+            preConfigure = (oa.preConfigure or "") + ''
+              cat > "$NIX_BUILD_TOP/objc-cross.conf" <<EOF
+              [binaries]
+              objc = '$CC'
+              objcpp = '$CXX'
+
+              [host_machine]
+              system = 'darwin'
+              cpu_family = '${if hp.isAarch64 then "aarch64" else "x86_64"}'
+              cpu = '${hp.parsed.cpu.name}'
+              endian = 'little'
+              subsystem = 'macos'
+              EOF
+              mesonFlagsArray+=("--cross-file=$NIX_BUILD_TOP/objc-cross.conf")
+            '';
+          });
 
         # armv7l (aarch32) engine cross: nothing sets CC_FOR_BUILD, so meson
         # auto-detects the engine's unprefixed `cc` (an arm-TARGETING clang) as
@@ -3380,14 +3384,18 @@ CBODY
               (drv.meta or { });
           };
 
-        # The engine adapter stdenv for a (pkgs, toolchain) — lifted out of
-        # mkStandaloneFlake so the catalog mega can build it ONCE and share it.
-        engineStdenvForShared = { pkgs, toolchain }: unpinAdapterStdenv {
-          inherit pkgs toolchain;
+        # THE engine adapter stdenv for a (pkgs, toolchain): every engine build
+        # in the catalog comes through here, so a standalone package and the same
+        # package folded into the catalog mega get a byte-identical stdenv.
+        # lto/captureLinks are unconditional for that reason — a dep must not
+        # differ by who is consuming it. `lto = false` is the SAME stdenv
+        # otherwise; the deps that must opt out (libjpeg-turbo, x264) take this
+        # door rather than a second copy of the arguments.
+        engineStdenv = { pkgs, toolchain, lto ? true }: unpinAdapterStdenv {
+          inherit pkgs toolchain lto;
           target = pkgs.pkgsStatic.stdenv.hostPlatform.config;
           native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
           cxx = true;
-          lto = true;
           captureLinks = true;
         };
 
@@ -3399,7 +3407,7 @@ CBODY
         # standalone path calls it the same way → byte-identical .drv.
         enginePkgsStaticFor = { pkgs, toolchain }:
           let
-            engStdenv = engineStdenvForShared { inherit pkgs toolchain; };
+            engStdenv = engineStdenv { inherit pkgs toolchain; };
             # libjpeg-turbo: the engine's full -flto MISCOMPILES it — CTest #121
             # bmpsizetest hangs (its 65500² whole-image path allocs ~12GB) → OOM
             # (thin-LTO instead segfaults lld; only no-LTO is clean, byte-for-byte
@@ -3409,14 +3417,7 @@ CBODY
             # in native-overlay/libjpeg-turbo.nix, because the lto=false engine
             # stdenv needs the BASE pkgs the adapter wraps — an autoWire `apply`
             # only sees the post-swap set. See that overlay file for the rationale.
-            engStdenvNoLto = unpinAdapterStdenv {
-              inherit pkgs toolchain;
-              target = pkgs.pkgsStatic.stdenv.hostPlatform.config;
-              native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
-              cxx = true;
-              lto = false;
-              captureLinks = true;
-            };
+            engStdenvNoLto = engineStdenv { inherit pkgs toolchain; lto = false; };
             # libjpeg-turbo 3.1.x's `simdcoverage` helper references jsimd_can_*
             # entry points its RVV port lacks (jsimd_can_encode_mcu_AC_refine_
             # prepare), so on riscv64 the build aborts on -Wimplicit-function-
@@ -3509,6 +3510,25 @@ CBODY
                   else
                     l.genAttrs (l.filter (n: prev ? ${n}) users)
                       (n: swap prev.${n}));
+            # Is this scope the engine set? The guard is LOAD-BEARING, not a
+            # tidiness check: these overlays also reach `buildPackages`, and an
+            # unguarded swap forces the engine onto the BUILD host, which trips
+            # `isFromBootstrapFiles`. `isMusl` selects the linux target host;
+            # darwin has no musl split, but its pkgsStatic host is `isStatic`
+            # (buildPackages/bootstrap are not) — hence both, said once here
+            # instead of at each layer below.
+            isEngineScope = prev:
+              prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic;
+            # Every set-wide layer below has the same shape: a gate on the scope,
+            # a curated list of attribute names, and a `pkgs: drv -> drv` fix.
+            # `prev ? ${n}` skips names a given set lacks, and a false gate leaves
+            # the identity overlay — byte-identical where the layer doesn't apply.
+            engineLayer = { gate, names, fix }: scope:
+              scope.extend (_final: prev:
+                if !(gate prev) then { }
+                else nixpkgs.lib.genAttrs
+                  (nixpkgs.lib.filter (n: prev ? ${n}) names)
+                  (n: fix prev prev.${n}));
             # Base (pre-swap) gnu static-musl stdenv — pins pkg-config off the
             # engine (below). Captured from the pristine pkgs so the pin is an
             # absolute value the pkgsStatic splice can't re-resolve to engStdenv.
@@ -3516,7 +3536,7 @@ CBODY
             engineBashAttrs = [ "bash" "bashInteractive" "bashNonInteractive" ];
             withEngineStdenv = pkgs.pkgsStatic.extend
               (_final: prev:
-                if prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic
+                if isEngineScope prev
                 then {
                   stdenv = engStdenv;
                   # pkg-config is a BUILD tool (a nativeBuildInput), never linked
@@ -3549,24 +3569,26 @@ CBODY
                 // nixpkgs.lib.optionalAttrs (prev ? x264)
                   { x264 = prev.x264.override { stdenv = engStdenvNoLto; }; }
                 else { });
-            withBashFix = withEngineStdenv.extend
-              (_final: prev:
-                if prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic
-                then builtins.listToAttrs
-                  (map (n: { name = n; value = unpinBashBuildFix prev prev.${n}; })
-                    (builtins.filter (n: prev ? ${n}) engineBashAttrs))
-                else { });
+            withBashFix = engineLayer {
+              gate = isEngineScope;
+              names = engineBashAttrs;
+              fix = unpinBashBuildFix;
+            } withEngineStdenv;
+            # Each autoWired fix carries its OWN gate — a dep that only breaks
+            # under `pkgsStatic` declares `autoWire = "static"`, the rest musl.
             withDepFixes = builtins.foldl'
               (acc: name:
                 let entry = autoWiredFixes.${name}; in
-                acc.extend
-                  (_final: prev:
-                    if (if entry.autoWire == "static"
-                        then (prev.stdenv.hostPlatform.isStatic or false)
-                        else prev.stdenv.hostPlatform.isMusl)
-                       && prev ? ${name}
-                    then { ${name} = entry.apply prev; }
-                    else { }))
+                engineLayer {
+                  gate = prev:
+                    if entry.autoWire == "static"
+                    then (prev.stdenv.hostPlatform.isStatic or false)
+                    else prev.stdenv.hostPlatform.isMusl;
+                  names = [ name ];
+                  # The fix rebuilds the attr from the scope, so the current drv
+                  # is not an input.
+                  fix = prev: _drv: entry.apply prev;
+                } acc)
               withBashFix
               (builtins.attrNames autoWiredFixes);
             # See withMesonBuildCC above. armv7l is the only cross built on a
@@ -3596,14 +3618,13 @@ CBODY
               "harfbuzz"
               "libvmaf"
             ];
-            withMesonBuildCcFix = withDepFixes.extend
-              (_final: prev:
-                if prev.stdenv.hostPlatform.isAarch32
-                   && prev.stdenv.buildPlatform != prev.stdenv.hostPlatform
-                then builtins.listToAttrs
-                  (map (n: { name = n; value = withMesonBuildCC prev prev.${n}; })
-                    (builtins.filter (n: prev ? ${n}) mesonBuildCcPkgs))
-                else { });
+            withMesonBuildCcFix = engineLayer {
+              gate = prev:
+                prev.stdenv.hostPlatform.isAarch32
+                && prev.stdenv.buildPlatform != prev.stdenv.hostPlatform;
+              names = mesonBuildCcPkgs;
+              fix = withMesonBuildCC;
+            } withDepFixes;
             # Swap libjpeg-turbo to the lto=false engine stdenv set-wide (see
             # engStdenvNoLto above). nixpkgs' `libjpeg` aliases `libjpeg_turbo`;
             # override the concrete attr and re-point the alias so consumers of
@@ -3611,8 +3632,7 @@ CBODY
             # other set-wide engine fixes; identity on non-engine hosts.
             withLibjpegNoLto = withMesonBuildCcFix.extend
               (_final: prev:
-                if (prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic)
-                   && (prev ? libjpeg_turbo || prev ? libjpeg)
+                if isEngineScope prev && (prev ? libjpeg_turbo || prev ? libjpeg)
                 then
                   let lj0 = (prev.libjpeg_turbo or prev.libjpeg).override { stdenv = engStdenvNoLto; };
                       # riscv64: also drop the broken RVV simdcoverage helper (rides
@@ -3641,8 +3661,7 @@ CBODY
             # the other set-wide engine fixes; identity where librsvg is absent.
             withRustDeps = withLibjpegNoLto.extend
               (_final: prev:
-                if (prev.stdenv.hostPlatform.isMusl || prev.stdenv.hostPlatform.isStatic)
-                   && prev ? librsvg
+                if isEngineScope prev && prev ? librsvg
                 then {
                   # librsvg pulls libjpeg_turbo transitively (gdk-pixbuf/libtiff/
                   # libwebp) from this PRISTINE scope, which never passes through
@@ -4080,38 +4099,20 @@ CBODY
               else drv // { meta = (drv.meta or { }) // { description = description; }; };
 
             defaultRawBuild = nativeFixes.${pkgsAttr} or (pkgs: pkgs.pkgsStatic.${pkgsAttr});
-            # The unpin-llvm engine swaps the recipe's `stdenv` for our adapter.
-            # A CUSTOM `build` (opaque closure) instead gets a `pkgs` whose
-            # pkgsStatic.<pkgsAttr> is already on the engine stdenv, so the recipe
-            # reads as off-engine with no per-package plumbing. linux-static host
-            # only; darwin/cross/off-engine untouched (byte-identical).
-            # Delegates to the lifted lib-level helper, threading the shared
-            # toolchain. (Construction unchanged → byte-identical .drv.) The
-            # engine swap is set-wide on pkgsStatic + unconditional lto/capture so
-            # a dep is byte-identical whether it ships standalone or folded into a
-            # multicall consumer; the capture shim is runtime-gated on
-            # $UNPIN_CAPTURE_LINKS and inert for non-multicall builds.
-            engineStdenvFor = pkgs: engineStdenvForShared {
-              inherit pkgs;
-              toolchain = tc pkgs.stdenv.buildPlatform.system;
-            };
+            # Does this host build on the engine? Linux (native or cross — one
+            # LLVM toolchain cross-emits every target via `clang -target`, no
+            # qemu) and a NATIVE darwin host; both ride the stdenv swap on
+            # `pkgsStatic`. Asked by the build itself and again by the module
+            # fold, in sibling scopes — one definition so the two can't drift.
+            isEngineHost = pkgs: engine == "unpin-llvm"
+              && (pkgs.stdenv.hostPlatform.isLinux || pkgs.stdenv.hostPlatform.isDarwin);
             rawBuild = pkgs:
               let
-                # Engine on linux (native or cross — one LLVM toolchain
-                # cross-emits every target via `clang -target`, no qemu) and on a
-                # native darwin host. Both ride a stdenv swap on `pkgsStatic`
-                # (Layer A below).
-                useEngine = engine == "unpin-llvm"
-                  && (pkgs.stdenv.hostPlatform.isLinux || pkgs.stdenv.hostPlatform.isDarwin);
+                useEngine = isEngineHost pkgs;
                 # SET-LEVEL stdenv swap so the top package AND its whole link
                 # closure compile on the engine (all-deps-bitcode; a shallow `//`
-                # would leave deps gcc ELF). The `isMusl || isStatic` guard is
-                # load-bearing: the overlay also reaches buildPackages, and an
-                # unguarded swap forces the engine onto the build host → trips
-                # `isFromBootstrapFiles`. isMusl selects the linux target host;
-                # darwin has no musl split but its pkgsStatic host is isStatic
-                # (buildPackages/bootstrap aren't), so isStatic selects it.
-                # Byte-identical on linux.
+                # would leave deps gcc ELF). Which scopes the swap may touch is
+                # `isEngineScope`, next to the layers it gates.
                 #
                 # The engine-swapped pkgsStatic (Layers A/B/C). Now a lib-level
                 # helper (enginePkgsStaticFor) so the catalog mega can build it ONCE
@@ -4143,10 +4144,11 @@ CBODY
               else defaultRawBuild pkgs;
             stripped = pkgs:
               let
-                # multicall MODULE opt-in: native-linux only. The hook adds a
-                # `module` output by post-processing the objects the build
-                # already compiled (no recompile), riding the same builder as
-                # the shipped binary. No-op when `multicall == null` or off-Linux.
+                # multicall MODULE opt-in. The hook adds a `module` output by
+                # post-processing the objects the build already compiled (no
+                # recompile), riding the same builder as the shipped binary.
+                # Where it applies is `wantModule` below.
+                #
                 # Per-platform program set. Most packages ship the same programs
                 # everywhere, so `multicall.programs` is authoritative. A package
                 # whose darwin build is a genuine SUBSET (no /proc analogue, so it
@@ -4178,16 +4180,12 @@ CBODY
                 mcPrograms = nixpkgs.lib.filter
                   (p: (p.supportedTarget or (_: true)) pkgs.stdenv.hostPlatform)
                   mcProgramsRaw;
-                # The module is BITCODE, so it exists only where the engine
-                # compiled the objects: linux and darwin alike, and only under
-                # engine = "unpin-llvm". There is no per-package darwin opt-out —
-                # a darwin build that genuinely ships fewer applets narrows the
-                # list with `darwinPrograms` above, which keeps the fold and fixes
-                # the cause. Emitted NATIVELY on a darwin host, never cross-built.
-                wantModule = multicall != null
-                  && engine == "unpin-llvm"
-                  && (pkgs.stdenv.hostPlatform.isLinux
-                      || pkgs.stdenv.hostPlatform.isDarwin);
+                # The module is BITCODE, so it exists exactly where the engine
+                # compiled the objects — `isEngineHost`. There is no per-package
+                # darwin opt-out: a darwin build that genuinely ships fewer
+                # applets narrows the list with `darwinPrograms` above, which
+                # keeps the fold and fixes the cause.
+                wantModule = multicall != null && isEngineHost pkgs;
                 rawHooked =
                   if wantModule
                   then multicallModuleHookLTO
@@ -4267,7 +4265,10 @@ CBODY
                       # the flag.
                       iconvCompat =
                         (pkgs.pkgsStatic.libiconvReal.override {
-                          stdenv = engineStdenvFor pkgs;
+                          stdenv = engineStdenv {
+                            inherit pkgs;
+                            toolchain = tc pkgs.stdenv.buildPlatform.system;
+                          };
                         }).overrideAttrs (o: {
                           postInstall = (o.postInstall or "") + ''
                             cat > compat.c <<'EOF'
