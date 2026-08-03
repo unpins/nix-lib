@@ -1656,18 +1656,26 @@
               postInstall = (old.postInstall or "")
                 + nixpkgs.lib.optionalString hasAuto ''
                 # Harvest every multi-call symlink (skipping the primary, which
-                # is the real binary) and embed the names verbatim. No name
-                # filtering here: alias policy — charset/length rules,
-                # Windows-reserved names, blocklist, the catalog-owner gate, the
-                # MAX_ALIASES cap — lives solely in unpin and runs at install
-                # time (`validate_alias` in unpin/src/aliases.rs). The build
-                # just records which applets the package ships; the installer
-                # decides which are safe to link.
+                # is the real binary). No name filtering here: alias policy —
+                # charset/length rules, Windows-reserved names, blocklist, the
+                # catalog-owner gate, the MAX_ALIASES cap — lives solely in
+                # unpin and runs at install time (`validate_alias` in
+                # unpin/src/aliases.rs). The build just records which applets
+                # the package ships; the installer decides which are safe to
+                # link.
+                #
+                # An alias is a LOGICAL name; `.exe` is the platform's spelling
+                # of it. `unpin` appends the suffix itself when it creates the
+                # link (platform::link_filename), so a harvested `play.exe`
+                # installs as `play.exe.exe` — verified on Windows: `play.exe`
+                # runs sox in play mode, `play.exe.exe` falls back to plain sox,
+                # silently. Strip it here, the same way the dispatcher strips it
+                # off argv[0] on the way in.
                 __unpin_aliases=""
                 for f in "''${${binOutputName}}/${aliasesFromSymlinksIn}"/*; do
                   [ -L "$f" ] || continue
-                  n="$(basename "$f")"
-                  [ "$n" = "${primary}" ] && continue
+                  n="$(basename "$f")"; n="''${n%.exe}"
+                  [ "$n" = "${nixpkgs.lib.removeSuffix ".exe" primary}" ] && continue
                   __unpin_aliases="''${__unpin_aliases:+$__unpin_aliases,}$n"
                 done
                 printf '%s' "$__unpin_aliases" > "$NIX_BUILD_TOP/.unpin-aliases"
@@ -1828,12 +1836,14 @@
             # The wrap's own alias discovery — sibling symlinks of the primary,
             # like the multicall `.a` glob. Shared by both non-explicit branches
             # below (it is also the fallback when the base packed an empty list).
+            # `.exe` stripped for the same reason withUnpinEmbed's harvest strips
+            # it: the embedded name is LOGICAL, and `unpin` re-adds the suffix.
             harvestAliasesSh = ''
               if [ -d "${binOut}/bin" ]; then
                 for f in "${binOut}/bin"/*; do
                   [ -L "$f" ] || continue
-                  __unpin_n="$(basename "$f")"
-                  [ "$__unpin_n" = "${primary}" ] && continue
+                  __unpin_n="$(basename "$f")"; __unpin_n="''${__unpin_n%.exe}"
+                  [ "$__unpin_n" = "${nixpkgs.lib.removeSuffix ".exe" primary}" ] && continue
                   __unpin_al="''${__unpin_al:+$__unpin_al,}$__unpin_n"
                 done
               fi'';   # no trailing newline: the callers supply their own
