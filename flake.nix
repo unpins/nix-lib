@@ -1493,6 +1493,36 @@
             truncate -s "$__ues_base" "$__ues_bin"
             cat "$__ues_d/m.zip" >> "$__ues_bin"
             rm -rf "$__ues_d"
+
+            # Read the container back out of the binary we just wrote and require
+            # every staged file to be in it. Twice an embed silently never reached
+            # the shipped binary — stdenv strip rebuilt the copy from its sections
+            # and dropped the EOF ZIP; a second appended ZIP shadowed the first on
+            # windows — and nothing ever looked at the result, so both shipped.
+            # Listing only (`-Z1`), which reads a zstd-method archive fine and
+            # needs no execution: this holds on cross and windows targets too.
+            # `|| true`: the case this guard exists to catch is "no container at
+            # all", and unzip exits 9 on that — under pipefail it would abort with
+            # an opaque error instead of the diagnostic below.
+            { unzip -Z1 "$__ues_bin" 2>/dev/null || true; } | LC_ALL=C sort > "$__ues_acc.have"
+            (cd "$__ues_acc" && find . -mindepth 1 -type f | sed 's|^\./||') \
+              | LC_ALL=C sort > "$__ues_acc.want"
+            __ues_gone="$(LC_ALL=C comm -23 "$__ues_acc.want" "$__ues_acc.have" | tr '\n' ' ')"
+            if [ -n "$__ues_gone" ]; then
+              echo "unpin embed: staged entries absent from $__ues_bin: $__ues_gone" >&2
+              exit 1
+            fi
+
+            # An embedded alias is a LOGICAL name — `unpin` re-adds the platform
+            # suffix at install, so a harvested `play.exe` materializes as
+            # `play.exe.exe`. Any suffix that survived a harvest is that bug.
+            if [ -f "$__ues_acc/unpin/aliases" ]; then
+              __ues_suffixed="$( { grep -E '\.(exe|ape)$' "$__ues_acc/unpin/aliases" || true; } | tr '\n' ' ')"
+              if [ -n "$__ues_suffixed" ]; then
+                echo "unpin embed: aliases carry a platform suffix: $__ues_suffixed" >&2
+                exit 1
+              fi
+            fi
           }
         '';
 
