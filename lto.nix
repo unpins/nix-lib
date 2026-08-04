@@ -50,6 +50,11 @@ let
     else (appendCFlags drv ltoCFlags).overrideAttrs (old: {
     hardeningDisable = (old.hardeningDisable or [ ])
       ++ (if ssp then [ ] else [ "stackprotector" ]);
+    # Hand-rolled rather than `appendLdFlags`, for the same reason
+    # `withDarwinIconv` is: the helper writes a bare `-u …` where this writes
+    # " -u …", so the link line is identical and the hash is not. Unifying is a
+    # deliberate rebuild, and nothing would catch an accidental one — no
+    # drv-diff target sets `optimize`.
     NIX_LDFLAGS = (old.NIX_LDFLAGS or "")
       + " ${ltoLDFlags}";
     AR = "${triple}-gcc-ar";
