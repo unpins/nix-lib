@@ -284,6 +284,15 @@
   unpin_vfs_core.cpp
   unpin_musl.cpp'
 
+            # `cc`/`c++` are driver faces we ship in `unpin/aliases`, so unpin
+            # materializes those symlinks at install — but the multicall table is
+            # built from CLANG_LINKS_TO_CREATE, and upstream's default omits
+            # them: argv[0] "cc" matched no entry, so the binary printed its
+            # subcommand list and exited 1. Autotools probes `cc` first.
+            substituteInPlace ../clang/tools/driver/CMakeLists.txt \
+              --replace-fail 'set(CLANG_LINKS_TO_CREATE clang++ clang-cl clang-cpp)' \
+                'set(CLANG_LINKS_TO_CREATE clang++ clang-cl clang-cpp cc c++)'
+
             # Patch 1 — cc1: diagnostics on the overlay + pre-create the
             # FileManager on it before ExecuteCompilerInvocation (else the action
             # recreates it on RealFS and the embedded headers are invisible).
