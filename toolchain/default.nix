@@ -41,27 +41,6 @@
           # release zig bundles (__MINGW64_VERSION_MAJOR 13, MINOR 0).
           mingwCrtTar = origPkgs.pkgsCross.mingwW64.windows.mingw_w64.src;
 
-          # Recipe/version stamp baked in as UNPIN_CACHE_TAG and folded into the
-          # on-demand cache key (Variant in unpin_musl.cpp). Must change whenever
-          # anything affecting the built libc/libc++/builtins changes, so a new
-          # binary never reuses a stale cached library — hence hashing the recipe
-          # plus the embedded source store paths.
-          cacheTag = builtins.substring 0 16 (builtins.hashString "sha256"
-            (builtins.concatStringsSep ":" [
-              version
-              (builtins.hashFile "sha256" ./unpin_musl.cpp)
-              (builtins.hashFile "sha256" ./musl_sources.inc)
-              (builtins.hashFile "sha256" ./builtins_sources.inc)
-              (builtins.hashFile "sha256" ./cxx_sources.inc)
-              (builtins.hashFile "sha256" ./mingw_sources.inc)
-              (builtins.hashFile "sha256" ./cxx_config_site.h)
-              (builtins.hashFile "sha256" ./cxx_config_site_win.h)
-              (builtins.hashFile "sha256" ./cxx_config_site_darwin.h)
-              (toString monorepoSrc)
-              (toString zigLibc)
-              (toString muslTar)
-            ]));
-
           # Build-host-native packer (zstd-in-zip, ZIP method 93). Build-only;
           # never linked in. Driven DIRECTLY (no dict) because our in-binary
           # reader is one-shot ZSTD_decompress.
@@ -88,16 +67,16 @@
 
           # Stage the embedded tree and append it as the binary's single EOF ZIP.
           # Deliberately a SEPARATE derivation from the LLVM compile: the packer,
-          # the mingw CRT tarball and this staging recipe would otherwise re-hash
+          # the payload sources and this staging recipe would otherwise re-hash
           # hours of clang for a payload edit. `core` is a build input, never a
           # runtime reference (the bytes are copied), so a change here substitutes
           # the compile instead of repeating it — provided `core` is in the binary
           # cache, which is what the split costs.
           #
-          # NOT fully decoupled: zigLibc/muslTar/__config_site still reach the
-          # compile through `cacheTag`, which is #define'd into unpin_musl.cpp.
-          # Serving the tag from the VFS instead would close that (and would cover
-          # mingwCrtTar, which the tag omits today).
+          # The decoupling is complete: the on-demand cache stamp is computed here
+          # and served from the payload (`cache-tag`), so zigLibc, muslTar,
+          # mingwCrtTar and the __config_site headers no longer reach the compile
+          # at all.
           #
           # `buildCommand` skips the phase machinery entirely, fixupPhase
           # included — stdenv's strip would rewrite the ELF and take the appended
@@ -262,10 +241,38 @@
               fi
 
               chmod -R u+w "$__stage"
+
+              # Recipe stamp for the on-demand library cache, read back at runtime
+              # from `cache-tag` (variantHash in unpin_musl.cpp). Two halves,
+              # each covering what the other cannot: the staged tree is every
+              # source the libc/libc++/builtins get built FROM — including the
+              # mingw CRT fill and this recipe's own staging decisions — and the
+              # core's store path is the compiler that will build them. Hashed
+              # here rather than in nix precisely so a staging change with no input
+              # change still moves the stamp; the old nix-side list could not see
+              # one. tar because the staged trees contain symlinks: --sort=name
+              # plus zeroed metadata makes the digest content-only.
+              #
+              # At the VFS root, NOT under `unpin/`: that namespace belongs to the
+              # installer, which eagerly decodes every `unpin/*` entry it finds and
+              # has no use for this one. `.unpin/` is not an option either — the
+              # in-binary reader skips that prefix by design. STORED, because the
+              # reader decodes only stored and zstd (a deflate entry here would be
+              # unreadable at runtime — `unpin/aliases` is deflate precisely
+              # because only the installer reads it), and because a zstd frame
+              # around 16 bytes costs more than it saves.
+              __tag=$(
+                { tar --sort=name --numeric-owner --owner=0 --group=0 \
+                      --mtime='@0' --format=gnu -cf - -C "$__stage" . | sha256sum
+                  printf '%s\n' "${core}"
+                } | sha256sum | cut -c1-16)
+              printf '%s' "$__tag" > "$__stage/cache-tag"
+
               __vfs_base=$(wc -c < "$out/bin/llvm")
               __vfs_zip=$(mktemp -d)
               ${packTool}/bin/unpin-vfs-pack "$__vfs_zip/payload.zip" "$__stage" \
-                --base "$__vfs_base" --deflate unpin/aliases >/dev/null
+                --base "$__vfs_base" --deflate unpin/aliases \
+                --store cache-tag >/dev/null
               cat "$__vfs_zip/payload.zip" >> "$out/bin/llvm"
               rm -rf "$__stage" "$__vfs_zip"
             '';
@@ -302,9 +309,6 @@
             cp ${./cxx_sources.inc}       ../clang/tools/driver/cxx_sources.inc
             # Windows: mingw-w64 runtime recipe (#included by unpin_musl.cpp).
             cp ${./mingw_sources.inc}     ../clang/tools/driver/mingw_sources.inc
-            # Recipe/version stamp for the on-demand cache key (UNPIN_CACHE_TAG).
-            echo '#define UNPIN_CACHE_TAG "${cacheTag}"' \
-              > ../clang/tools/driver/unpin_build_tag.h
 
             # Register the TUs into the driver target (folds into `llvm`).
             substituteInPlace ../clang/tools/driver/CMakeLists.txt \

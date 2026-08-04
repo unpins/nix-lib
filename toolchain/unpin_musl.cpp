@@ -22,18 +22,6 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 
-// Recipe/version stamp baked by nix (postPatch generates unpin_build_tag.h over
-// the recipe sources). Optional so the file still builds standalone; the cache
-// then falls back to "dev". See cache key (Variant) below.
-#if defined(__has_include)
-#  if __has_include("unpin_build_tag.h")
-#    include "unpin_build_tag.h"
-#  endif
-#endif
-#ifndef UNPIN_CACHE_TAG
-#define UNPIN_CACHE_TAG "dev"
-#endif
-
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -158,8 +146,8 @@ std::string cacheBase() {
 
 // A cache-key "manifest", in the spirit of zig's Cache.Manifest: the axes that
 // change the built libc/libc++/builtins for a given triple. The recipe/version
-// stamp UNPIN_CACHE_TAG is folded into the hash (so a new binary never reuses an
-// old library — the version-safety property); cpuFlags/fast/pic are the
+// stamp (`cacheTag`, below) is folded into the hash (so a new binary never
+// reuses an old library — the version-safety property); cpuFlags/fast/pic are the
 // per-compile codegen axes lifted from the user's command line. Sanitizers and
 // single-threaded are deferred (they need instrumented runtimes we don't build).
 struct Variant {
@@ -181,10 +169,39 @@ struct Variant {
                      // honest + fast). HASH axis: both libc.a's coexist in cache.
 };
 
+// Recipe/version stamp, SERVED FROM THE PAYLOAD (`cache-tag`, VFS root) rather
+// than #define'd in. What the stamp must cover is what the on-demand libraries
+// are built FROM — the musl/libc++/mingw source trees, the zig libc tree, the
+// __config_site headers — and none of that is part of the LLVM compile. Baking
+// it in made every one of those inputs re-hash hours of clang, and it still
+// missed the mingw CRT tarball, which changed the payload without changing the
+// tag (a stale libmingw32.a could be reused). The payload computes it over
+// itself plus the compile's identity, so both halves are covered exactly once.
+//
+// "dev" when there is no payload: an unpacked standalone build, where nothing
+// else works either. Read once.
+const std::string &cacheTag() {
+  static const std::string T = [] () -> std::string {
+    static const char kPath[] = "cache-tag";
+    long i = unpin_vfs_find(kPath, sizeof(kPath) - 1);
+    if (i < 0)
+      return "dev";
+    uint64_t n = 0;
+    const void *d = unpin_vfs_data(static_cast<size_t>(i), &n);
+    if (!d || !n)
+      return "dev";
+    return StringRef(static_cast<const char *>(d), static_cast<size_t>(n))
+        .trim()
+        .str();
+  }();
+  return T;
+}
+
 // 16-hex cache-dir token for a variant. Non-crypto xxh3 is plenty for a cache
-// key; UNPIN_CACHE_TAG makes any recipe-source change invalidate every variant.
+// key; the recipe stamp makes any payload or compiler change invalidate every
+// variant.
 std::string variantHash(const Variant &V) {
-  std::string s = UNPIN_CACHE_TAG;
+  std::string s = cacheTag();
   auto sep = [&] { s.push_back('\0'); };
   sep();
   s += V.triple;

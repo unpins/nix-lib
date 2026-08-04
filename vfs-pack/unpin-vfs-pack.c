@@ -2,7 +2,7 @@
  * from a directory tree. Build-time tool; not shipped in the final binary.
  *
  *   unpin-vfs-pack OUT.zip ROOTDIR [--dict DICT] [--level N]
- *                  [--base N] [--carry FILE] [--deflate NAME]...
+ *                  [--base N] [--carry FILE] [--deflate NAME]... [--store NAME]...
  *
  * Every regular file under ROOTDIR is stored under its ROOTDIR-relative path,
  * compressed with zstd. With --dict, a trained zstd dictionary (from
@@ -17,7 +17,10 @@
  * archive (`zip -A` semantics), which is also the only convention cosmo's
  * zipos accepts. --deflate NAME (repeatable, exact ROOTDIR-relative match)
  * stores that entry with plain deflate instead of zstd -- for entries that
- * pre-zstd readers must still decode (unpin/aliases).
+ * pre-zstd readers must still decode (unpin/aliases). --store NAME (same shape)
+ * writes it uncompressed: for a field small enough that a zstd frame costs more
+ * than it saves and that every reader, including the in-binary one, must be able
+ * to decode without a codec (cache-tag).
  *
  * The archive stays a structurally standard .zip: any tool lists it; only
  * zstd-aware tools decode the entries.
@@ -61,6 +64,16 @@ static int g_ndeflate;
 static int wants_deflate(const char *rel) {
     for (int i = 0; i < g_ndeflate; i++)
         if (!strcmp(rel, g_deflate[i])) return 1;
+    return 0;
+}
+
+#define MAX_STORE 16
+static const char *g_store[MAX_STORE];
+static int g_nstore;
+
+static int wants_store(const char *rel) {
+    for (int i = 0; i < g_nstore; i++)
+        if (!strcmp(rel, g_store[i])) return 1;
     return 0;
 }
 
@@ -147,7 +160,10 @@ static int emit_entry(const struct entry *e) {
     void *data = slurp(e->fpath, &len);
     if (!data) { fprintf(stderr, "read failed: %s\n", e->fpath); return -1; }
     int rc;
-    if (wants_deflate(rel)) {
+    if (wants_store(rel)) {
+        rc = mz_zip_writer_add_mem(&g_zip, rel, data, len, MZ_NO_COMPRESSION) ? 0 : -1;
+        if (!rc) { g_files++; g_bytes_in += (long)len; g_bytes_out += (long)len; }
+    } else if (wants_deflate(rel)) {
         rc = mz_zip_writer_add_mem(&g_zip, rel, data, len, MZ_BEST_COMPRESSION) ? 0 : -1;
         if (!rc) { g_files++; g_bytes_in += (long)len; }
     } else {
@@ -279,13 +295,18 @@ int main(int argc, char **argv) {
             if (g_ndeflate == MAX_DEFLATE) { fprintf(stderr, "too many --deflate\n"); return 2; }
             g_deflate[g_ndeflate++] = argv[++i];
         }
+        else if (!strcmp(argv[i], "--store") && i + 1 < argc) {
+            if (g_nstore == MAX_STORE) { fprintf(stderr, "too many --store\n"); return 2; }
+            g_store[g_nstore++] = argv[++i];
+        }
         else if (!out) out = argv[i];
         else if (!root) root = argv[i];
         else { fprintf(stderr, "unexpected arg: %s\n", argv[i]); return 2; }
     }
     if (!out || !root) {
         fprintf(stderr, "usage: %s OUT.zip ROOTDIR [--dict DICT] [--level N] "
-                        "[--base N] [--carry FILE] [--deflate NAME]...\n", argv[0]);
+                        "[--base N] [--carry FILE] [--deflate NAME]... "
+                        "[--store NAME]...\n", argv[0]);
         return 2;
     }
 
