@@ -2811,7 +2811,7 @@ CBODY
           , makeSubdir ? "."        # dir whose Makefile defines $(LINK) + the lib vars
           , linkExtra ? ""          # shared static libs / automake lib vars for the final link
           , extraInstall ? ""       # raw shell appended to installPhase (man pages)
-          , isTargetDarwin ? false  # Mach-O: strip leading `_`, include `S`-type symbols
+          , isTargetDarwin ? false  # Mach-O: strip the leading `_` off every nm name
           , isCosmo ? false         # Windows APE: no applet symlinks; explicit alias list
           , isWindows ? false       # mingw PE: bin/<pkg>.exe, embedded aliases (no symlinks)
           }:
@@ -2893,6 +2893,14 @@ CBODY
               		${groupOpen} ${linkExtra} $(LIBS) ${libgcc} ${groupClose}
             '';
 
+            # Every dispatch name the binary answers to EXCEPT its own: on native
+            # these become the in-store symlinks withAliases harvests, on windows
+            # the alias list it embeds directly. The primary is dropped because it
+            # IS the binary — announcing it makes `unpin install` resolve the alias
+            # to the slot the primary just took and report "`<name>` is provided by
+            # more than one binary in this package", which is false. mtools is the
+            # one package where that can bite (its canonical name is also an
+            # applet); the harvest path and mkMegaMulticall both filter it too.
             binSymlinks =
               (map (p: p.name) (nixpkgs.lib.filter (p: p.name != primary) programs))
               ++ (map (a: a.name) aliases);
@@ -2938,7 +2946,7 @@ CBODY
           withAliases pkgs
             ({ primary = outName; }
              // (if isWin
-                 then { aliases = map (p: p.name) programs ++ map (a: a.name) aliases; }
+                 then { aliases = binSymlinks; }
                  else { aliasesFromSymlinksIn = "bin"; }))
             multicall;
 
@@ -3022,8 +3030,8 @@ CBODY
             moduleArchives = map (m: m.moduleArchive) modules;
             # Native (asm/SIMD) sidecars rescued by the bitcode hook — one per
             # bitcode module, linked in the back-ref group alongside depArchives so
-            # the asm code the bitcode module references resolves. null on the
-            # null on the cosmo path (it carries native objects directly).
+            # the asm code the bitcode module references resolves. Absent on the
+            # cosmo path (it carries native objects directly).
             nativeArchives = nixpkgs.lib.filter (x: x != null)
               (map (m: m.nativeArchive or null) modules);
             depArchives = nixpkgs.lib.unique
