@@ -1439,6 +1439,18 @@
                 rm -f "$__ues_l"; cp "$__ues_t" "$__ues_l"
               fi
             done
+            # A link that did not resolve would vanish without a trace: the pack
+            # tool walks FTW_PHYS and returns 0 on anything that is not a file or
+            # a dir, and the completeness check below lists `-type f`, so neither
+            # end sees it. That is the exact silent-loss shape the check exists to
+            # stop, so refuse instead — a `.so` redirect to a page outside the
+            # harvested tree means the man set is incomplete, not that the link is
+            # optional.
+            __ues_dangling="$(find "$__ues_acc" -type l | sed "s|^$__ues_acc/||" | tr '\n' ' ')"
+            if [ -n "$__ues_dangling" ]; then
+              echo "unpin embed: unresolved links in $__ues_bin's stage: $__ues_dangling" >&2
+              exit 1
+            fi
 
             # Where to put the ONE ZIP. A Cosmopolitan APE already carries a
             # tail-ZIP (its `/zip/` store: `.cosmo`, zoneinfo, a stdlib, …)
