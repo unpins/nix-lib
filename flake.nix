@@ -876,31 +876,27 @@
             '';
           });
 
-        # Which targets use lld, the unpins-standard linker. lldStdOpts is the
-        # flag set (`-fuse-ld=lld --gc-sections --icf=safe`); `--icf=all` is NOT
-        # used (breaks function/data-pointer identity, risks codec-table
-        # miscompiles). Only valid on a FULL link, never `ld -r` (--gc-sections/
-        # --icf error there) — hence it lives on the multicall post-link.
-        # Excludes:
-        #   * darwin → clang + Apple ld64; allowlist/codesign is link-sensitive.
-        #   * cosmo (isWindows && !isMinGW) → cosmocc, its own toolchain.
-        #   * riscv64 → lld emits "relocation refers to a symbol in a discarded
-        #     section" (RISC-V relaxation × section-discard) even without
-        #     --gc-sections/--icf; GNU ld doesn't.
-        #   * ppc64le → lld doesn't synthesize the PowerPC out-of-line FP
-        #     save/restore routines (libgcc crtsavres) GNU ld generates on
-        #     demand, so any FP-heavy static link fails with undefined _restfpr_N.
-        # Both crosses are size-neutral (the gc win is Linux-native only).
+        # Which targets use lld, the unpins-standard linker, and so get
+        # `lldStdOpts`. Every exclusion carries its reason at its own clause;
+        # excluded targets get NO substitute --gc-sections — the size win is a
+        # Linux-native-lld property, and these are all size-neutral crosses.
         isLLDTarget = pkgs:
           let h = pkgs.stdenv.hostPlatform;
+          # clang + Apple ld64; allowlist/codesign is link-sensitive.
           in !(h.isDarwin)
+          # cosmo (isWindows && !isMinGW) brings cosmocc, its own toolchain.
           && !(h.isWindows && !(h.isMinGW or false))
+          # riscv64: lld emits "relocation refers to a symbol in a discarded
+          # section" (RISC-V relaxation × section-discard) even without
+          # --gc-sections/--icf; GNU ld doesn't.
           && !(h.isRiscV or false)
+          # ppc64le: lld doesn't synthesize the PowerPC out-of-line FP
+          # save/restore routines (libgcc crtsavres) GNU ld generates on demand,
+          # so any FP-heavy static link fails with undefined _restfpr_N.
           && !(h.isPower or false)
           # m68k: ld.lld has no m68k backend ("unknown emulation: m68kelf").
           && !(h.isM68k or false)
-          # mips/s390x (tier-3 `.#cross`): lld support absent or incomplete,
-          # route through ld.bfd (always shipped, still does --gc-sections).
+          # mips/s390x (tier-3 `.#cross`): lld support absent or incomplete.
           && !(h.isMips or false)
           && !(h.isS390 or false);
 
@@ -950,7 +946,12 @@
             chmod +x $out/bin/ld.lld
           '';
 
-        # The unpins-standard lld options for a non-darwin final link.
+        # The unpins-standard lld options, and the ONE place they are spelled:
+        # every channel that adds them (gcSectionsFlag's post-link, gc.nix's two
+        # in-build channels, withLLDLink) reads this string. `--icf=all` is NOT
+        # used — it breaks function/data-pointer identity and risks codec-table
+        # miscompiles. Valid only on a FULL link, never `ld -r`, where both
+        # --gc-sections and --icf error out; lldRSafe covers the `$CC -r` case.
         lldStdOpts = "-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe";
         # `-B<lld>/bin` makes the driver find `ld.lld` for `-fuse-ld=lld` without
         # lld on PATH, so appending `${lib.gcSectionsFlag pkgs}` to a post-link is
@@ -5023,7 +5024,10 @@ CBODY
         # mkPkgsGC: pkgsStatic with a chain-wide function/data-sections overlay
         # (cheap dead-code stripping; see gc.nix). Enabled via
         # `optimize.gc = true`. Linux-native only.
-        mkPkgsGC = import ./gc.nix { inherit nixpkgs appendCFlags appendLinkFlags lldRSafe; };
+        mkPkgsGC = import ./gc.nix {
+          inherit nixpkgs appendCFlags appendLinkFlags lldRSafe lldStdOpts
+            gcSectionsFlag;
+        };
 
         # Native cosmoStdenv. Result is `stdenv // { cosmocc,
         # cosmoCCUnwrapped, cosmoBintoolsUnwrapped, platformBits, mkCrossWiring,

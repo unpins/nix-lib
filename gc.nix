@@ -9,17 +9,16 @@
 # (−13.8%); the win scales with how much of the binary is our code vs C runtime.
 #
 # Linux-native only (musl); darwin/mingw/cosmo fall through to stock pkgs (the
-# overlay isn't applied — see nixpkgsFor in flake.nix). The scope is marked
-# `__unpinsGC = true` so `lib.gcSectionsFlag` can decide whether a downstream
-# final link (e.g. a multicall.nix post-link, outside pkgName's own build)
-# should add `--gc-sections`. Hash-neutral when off: no marker → empty flag →
-# byte-identical link commands.
+# overlay isn't applied — see nixpkgsFor in flake.nix). A downstream final link
+# outside pkgName's own build (a multicall post-link) decides on its own via
+# `lib.gcSectionsFlag`, which reads the target platform — it does not consult
+# this overlay, so the two are independent.
 #
 # Overlay (mirror of lto.nix), not a blanket stdenv tweak: a `withCFlags` on
 # stdenv re-runs the bootstrap fixed-point and blows up in
 # bootstrap-stage2-gcc-wrapper.
 
-{ nixpkgs, appendCFlags, appendLinkFlags, lldRSafe }:
+{ nixpkgs, appendCFlags, appendLinkFlags, lldRSafe, lldStdOpts, gcSectionsFlag }:
 
 { system ? "x86_64-linux"
 , ssp ? true
@@ -51,18 +50,18 @@ let
       isStatic = super.stdenv.hostPlatform.isStatic or false;
     in
     if !isStatic || !(super ? ${pkgName})
-    then { __unpinsGC = true; }
+    then { }
     else {
-      __unpinsGC = true;
       # Two final-link channels, both safe (neither reaches a direct `ld -r`):
       #   * makeFlagsArray LDFLAGS — reaches autotools/make final links, but
       #     CMake/meson IGNORE `make LDFLAGS=` (baked at configure).
       #   * NIX_CFLAGS_LINK (appendLinkFlags, env-aware) — honored by EVERY
       #     $CC-driven link, so CMake/meson single-binaries also get lld + gc.
-      # make/autotools get both (doubled flags are idempotent). --icf=safe is a
-      # no-op for uniformity; the size win is --gc-sections on the chain-wide
-      # function-sections. `-B<lld>/bin` makes ld.lld findable on the
-      # NIX_CFLAGS_LINK path (belt-and-suspenders with PATH).
+      # make/autotools get both (doubled flags are idempotent). Both channels
+      # take the options from `lldStdOpts` rather than spelling them out, which
+      # is how this file would keep a stale `--icf=safe` after the canonical set
+      # changed. --icf=safe is a no-op for uniformity; the size win is
+      # --gc-sections on the chain-wide function-sections.
       ${pkgName} = appendLinkFlags
         ((withGC super.${pkgName}).overrideAttrs (old: {
           buildInputs = map withGC (old.buildInputs or [ ]);
@@ -72,10 +71,12 @@ let
           nativeBuildInputs = (old.nativeBuildInputs or [ ])
             ++ [ (lldRSafe super.buildPackages) ];
           preBuild = (old.preBuild or "") + ''
-            makeFlagsArray+=("LDFLAGS=$LDFLAGS -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe")
+            makeFlagsArray+=("LDFLAGS=$LDFLAGS ${lldStdOpts}")
           '';
         }))
-        "-B${lldRSafe super.buildPackages}/bin -fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe";
+        # Same `-B<lld>/bin ${lldStdOpts}` a multicall post-link gets, so the
+        # in-build and post-link channels cannot drift apart.
+        (gcSectionsFlag super);
     };
 in
 # Full pkgs scope (not the raw extended pkgsStatic) so `pkgs.pkgsStatic.<name>`
