@@ -66,9 +66,186 @@
           # never linked in. Driven DIRECTLY (no dict) because our in-binary
           # reader is one-shot ZSTD_decompress.
           packTool = unpinPackTool origPkgs;
+
+          commonMeta = {
+            description = "LLVM C/C++ suite (clang, lld, llvm-tools) as a single self-contained binary";
+            # Taken from the package whose `monorepoSrc` this builds, so the two
+            # can't disagree about what we are shipping.
+            inherit (origPkgs.llvmPackages_21.libllvm.meta) license;
+            platforms = origPkgs.lib.platforms.linux ++ origPkgs.lib.platforms.darwin;
+          };
+
+          # Stage the embedded tree and append it as the binary's single EOF ZIP.
+          # Deliberately a SEPARATE derivation from the LLVM compile: the packer,
+          # the mingw CRT tarball and this staging recipe would otherwise re-hash
+          # hours of clang for a payload edit. `core` is a build input, never a
+          # runtime reference (the bytes are copied), so a change here substitutes
+          # the compile instead of repeating it — provided `core` is in the binary
+          # cache, which is what the split costs.
+          #
+          # NOT fully decoupled: zigLibc/muslTar/__config_site still reach the
+          # compile through `cacheTag`, which is #define'd into unpin_musl.cpp.
+          # Serving the tag from the VFS instead would close that (and would cover
+          # mingwCrtTar, which the tag omits today).
+          #
+          # `buildCommand` skips the phase machinery entirely, fixupPhase
+          # included — stdenv's strip would rewrite the ELF and take the appended
+          # ZIP with it (docs/embedded-metadata.md).
+          embedVfs = core: pkgs.stdenv.mkDerivation {
+            pname = "unpin-llvm";
+            inherit version;
+            meta = commonMeta;
+            # The split only pays off if the compile is IN the binary cache —
+            # otherwise a payload edit substitutes nothing and rebuilds it. Named
+            # handle so warming/pushing it doesn't mean grepping inputDrvs.
+            passthru.core = core;
+            buildCommand = ''
+              # `core` is already nuked and stripped; only the payload is added,
+              # and `lib/clang` is left behind so the VFS is the only source of
+              # the resource dir.
+              mkdir -p "$out/bin"
+              cp "${core}/bin/llvm" "$out/bin/llvm"
+              chmod +w "$out/bin/llvm"
+
+              __stage=$(mktemp -d)
+
+              # M1 — clang builtin + compiler-rt headers (this build's resource dir).
+              mkdir -p "$__stage/clang-resource"
+              cp -r "${core}/lib/clang/${major}/include" "$__stage/clang-resource/include"
+
+              # M2 — the musl libc tree: the whole zig lib/libc/musl subtree
+              # (arch/, src/, include/, crt/) + the per-target & generic-musl
+              # header sets. unpin_musl.cpp's libcRoot() = VROOT/libc and
+              # addCcArgs() -I's into exactly these dirs.
+              mkdir -p "$__stage/libc/include"
+              cp -r "${zigLibc}/musl" "$__stage/libc/musl"
+              chmod -R u+w "$__stage/libc/musl"
+              # Full-libc: overlay the COMPLETE upstream musl 1.2.5 committed tree,
+              # UPSTREAM WINS. zig's embedded subset omits malloc/ entirely and
+              # *patches* internal headers for its malloc-less world (e.g.
+              # src/include/stdlib.h drops the hidden __libc_free/__libc_malloc_impl
+              # decls), so the curated tree only linked printf-class programs.
+              # Overwriting src/arch/crt/include/compat with pure upstream restores
+              # a consistent libc that buildLibc selects from by replicating musl's
+              # Makefile (walks the VFS, picks mallocng, arch-shadows generics). The
+              # GENERATED headers (libc/include/<triple>, generic-musl —
+              # alltypes.h/syscall.h/version.h) live outside musl/ and stay zig's.
+              __up=$(mktemp -d)
+              tar xf "${muslTar}" -C "$__up" --strip-components=1
+              for __sub in src arch crt include compat; do
+                [ -d "$__up/$__sub" ] || continue
+                ( cd "$__up/$__sub" && find . -type f \
+                    \( -name '*.c' -o -name '*.s' -o -name '*.S' \
+                       -o -name '*.h' -o -name '*.in' \) ) | \
+                while read -r __rel; do
+                  __rel=''${__rel#./}
+                  __dst="$__stage/libc/musl/$__sub/$__rel"
+                  mkdir -p "$(dirname "$__dst")"; cp "$__up/$__sub/$__rel" "$__dst"
+                done
+              done
+              rm -rf "$__up"
+              cp -r "${zigLibc}/include/generic-musl" "$__stage/libc/include/generic-musl"
+              # Header arch tokens are zig's std.zig.target names (headerArchName in
+              # unpin_musl.cpp): 32-bit x86 is "x86" (not musl's "i386"); arm and
+              # powerpc64 match the musl folder name.
+              for __t in x86_64 x86 aarch64 arm riscv64 powerpc64; do
+                cp -r "${zigLibc}/include/$__t-linux-musl" "$__stage/libc/include/$__t-linux-musl"
+              done
+              # Linux kernel UAPI headers (<linux/futex.h>, <asm/…>) — needed by
+              # libc++'s atomic.cpp (futex) and user code talking to the kernel.
+              # zig's arch token differs from muslArch (x86_64→x86, riscv64→riscv);
+              # any-linux-any is the arch-independent set. addKernelIncludes() maps.
+              for __k in x86-linux-any aarch64-linux-any arm-linux-any riscv-linux-any powerpc-linux-any any-linux-any; do
+                cp -r "${zigLibc}/include/$__k" "$__stage/libc/include/$__k"
+              done
+
+              # M3 — the compiler-rt builtins source tree (compiled on demand per
+              # target into libclang_rt.builtins.a: soft-float TF/XF, int128,
+              # aarch64 outline atomics, …). Sourced from the same monorepo.
+              mkdir -p "$__stage/compiler-rt"
+              cp -r "${monorepoSrc}/compiler-rt/lib/builtins" "$__stage/compiler-rt/builtins"
+
+              # M4 — the C++ runtime source trees (libc++/libc++abi/libunwind),
+              # compiled on demand per target into libc++.a/libc++abi.a/
+              # libunwind.a. Sourced from OUR monorepo (version-matched), recipe
+              # from zig. cxx/libc is the llvm-libc shim libc++ src pulls in
+              # (shared/fp_bits.h, …). __config_site + __assertion_handler are the
+              # two CMake-generated headers — we ship a resolved __config_site and
+              # a verbatim default __assertion_handler so upstream __config /
+              # __assert stay unpatched.
+              mkdir -p "$__stage/cxx"
+              cp -r "${monorepoSrc}/libcxx"    "$__stage/cxx/libcxx"
+              cp -r "${monorepoSrc}/libcxxabi" "$__stage/cxx/libcxxabi"
+              cp -r "${monorepoSrc}/libunwind" "$__stage/cxx/libunwind"
+              mkdir -p "$__stage/cxx/libc/src"
+              cp -r "${monorepoSrc}/libc/shared"        "$__stage/cxx/libc/shared"
+              cp -r "${monorepoSrc}/libc/hdr"           "$__stage/cxx/libc/hdr"
+              cp -r "${monorepoSrc}/libc/include"       "$__stage/cxx/libc/include"
+              cp -r "${monorepoSrc}/libc/src/__support" "$__stage/cxx/libc/src/__support"
+              chmod -R u+w "$__stage/cxx"
+              cp ${./cxx_config_site.h} "$__stage/cxx/libcxx/include/__config_site"
+              cp "${monorepoSrc}/libcxx/vendor/llvm/default_assertion_handler.in" \
+                 "$__stage/cxx/libcxx/include/__assertion_handler"
+              # Windows libc++ __config_site (musl=0, win32 threads, no tzdb) on its
+              # own dir, put ahead of the musl copy for Windows C++ compiles.
+              mkdir -p "$__stage/cxx/win"
+              cp ${./cxx_config_site_win.h} "$__stage/cxx/win/__config_site"
+              # macOS libc++ __config_site (musl=0, no tzdb; pthread threads) on its
+              # own dir, ahead of the musl copy for darwin C++ compiles.
+              mkdir -p "$__stage/cxx/darwin"
+              cp ${./cxx_config_site_darwin.h} "$__stage/cxx/darwin/__config_site"
+
+              # Windows/mingw-w64: runtime tree (→ libmingw32.a + crt2.o on demand;
+              # import libs from the embedded .def via dlltool) + any-windows-any
+              # user headers. lib32/libarm32 (i386/arm .def) skipped — x86_64 only.
+              mkdir -p "$__stage/libc/mingw"
+              for __d in crt complex gdtoa intrincs cfguard libsrc math misc stdio \
+                         string winpthreads include def-include lib64 lib-common; do
+                [ -d "${zigLibc}/mingw/$__d" ] && \
+                  cp -r "${zigLibc}/mingw/$__d" "$__stage/libc/mingw/$__d"
+              done
+              chmod -R u+w "$__stage/libc/mingw"
+              # Fill zig's pruned math/ from the matching upstream release. -n so
+              # zig's copy wins wherever both exist: this only ADDS the long-double
+              # routines (and the .def.h / fp_consts.h they include).
+              mkdir -p _mw && tar xf ${mingwCrtTar} -C _mw --strip-components=1
+              cp -rn _mw/mingw-w64-crt/math/. "$__stage/libc/mingw/math/"
+              rm -rf _mw
+              cp -r "${zigLibc}/include/any-windows-any" \
+                 "$__stage/libc/include/any-windows-any"
+
+              # macOS/darwin: the any-darwin-any user headers (libc/POSIX/Darwin C
+              # surface, vendored from Apple's open-source SDK) + the libSystem.tbd
+              # umbrella stub (the whole libc — linked via -lSystem; it inlines
+              # every reexported sub-lib's symbols). No libc.a is built; only
+              # compiler-rt builtins per arch on demand. zig's SDKSettings.json is
+              # skipped — its minimal content only fails clang's SDK-settings parse.
+              cp -r "${zigLibc}/include/any-darwin-any" \
+                 "$__stage/libc/include/any-darwin-any"
+              mkdir -p "$__stage/libc/darwin"
+              cp "${zigLibc}/darwin/libSystem.tbd" "$__stage/libc/darwin/libSystem.tbd"
+
+              # Aliases — argv[0] faces unpin materializes at install. Newline-
+              # separated, no trailing newline (matches withUnpinEmbed's writer).
+              mkdir -p "$__stage/unpin"
+              printf 'clang\nclang++\ncc\nc++\nld.lld\nllvm-ar\nllvm-ranlib\nllvm-nm\nllvm-objcopy\nllvm-strip\nopt\nllvm-link' \
+                > "$__stage/unpin/aliases"
+
+              chmod -R u+w "$__stage"
+              __vfs_base=$(wc -c < "$out/bin/llvm")
+              __vfs_zip=$(mktemp -d)
+              ${packTool}/bin/unpin-vfs-pack "$__vfs_zip/payload.zip" "$__stage" \
+                --base "$__vfs_base" --deflate unpin/aliases >/dev/null
+              cat "$__vfs_zip/payload.zip" >> "$out/bin/llvm"
+              rm -rf "$__stage" "$__vfs_zip"
+            '';
+          };
         in
-        (pkgs.stdenv.mkDerivation {
-          pname = "unpin-llvm";
+        embedVfs
+        ((pkgs.stdenv.mkDerivation {
+          # The expensive half — hours of static clang. Nothing about the VFS
+          # payload may enter this derivation; see `embedVfs` above.
+          pname = "unpin-llvm-core";
           inherit version;
           src = monorepoSrc;
           sourceRoot = "${monorepoSrc.name}/llvm";
@@ -402,8 +579,8 @@ static cl::SubCommand LinkSub(LinkSubName, "Link LLVM bitcode/IR modules");' \
           # The driver binary is `bin/llvm` (dispatches on argv[0]). The
           # clang/clang++/ld.lld/llvm-* faces are embedded as `unpin/aliases` ZIP
           # entries, not materialized in $out/bin — unpin recreates them as
-          # argv[0] symlinks at install. The resource dir stays on disk here;
-          # postFixup embeds it into the VFS and deletes it.
+          # argv[0] symlinks at install. The resource dir stays on disk here —
+          # `embedVfs` reads it out of this output and does not carry it over.
           installPhase = ''
             runHook preInstall
             mkdir -p "$out/bin" "$out/lib"
@@ -412,152 +589,12 @@ static cl::SubCommand LinkSub(LinkSubName, "Link LLVM bitcode/IR modules");' \
             runHook postInstall
           '';
 
-          # postFixup runs AFTER stdenv strip, so the ZIP we append survives.
-          # (1) nuke-refs the ELF (in place, same length); (2) stage the embedded
-          # tree (M1 resource headers + M2 musl + `unpin/aliases`); (3) pack it
-          # into the binary's single EOF ZIP (NO --dict; --deflate for
-          # `unpin/aliases` so pre-zstd readers decode it); (4) drop the on-disk
-          # resource dir so the VFS is the only source. VROOT = /__unpin_ziglib__;
-          # the M2 front adds -resource-dir VROOT/clang-resource and -I VROOT/libc.
+          # postFixup runs AFTER stdenv strip: nuke the store paths out of the
+          # ELF in place (same length). The VFS payload is appended downstream by
+          # `embedVfs`, which reads `lib/clang` out of this output.
           postFixup = ''
             chmod +w "$out/bin/llvm"
             ${origPkgs.buildPackages.nukeReferences}/bin/nuke-refs "$out/bin/llvm"
-
-            __stage=$(mktemp -d)
-
-            # M1 — clang builtin + compiler-rt headers (this build's resource dir).
-            mkdir -p "$__stage/clang-resource"
-            cp -r "$out/lib/clang/${major}/include" "$__stage/clang-resource/include"
-
-            # M2 — the musl libc tree: the whole zig lib/libc/musl subtree
-            # (arch/, src/, include/, crt/) + the per-target & generic-musl
-            # header sets. unpin_musl.cpp's libcRoot() = VROOT/libc and
-            # addCcArgs() -I's into exactly these dirs.
-            mkdir -p "$__stage/libc/include"
-            cp -r "${zigLibc}/musl" "$__stage/libc/musl"
-            chmod -R u+w "$__stage/libc/musl"
-            # Full-libc: overlay the COMPLETE upstream musl 1.2.5 committed tree,
-            # UPSTREAM WINS. zig's embedded subset omits malloc/ entirely and
-            # *patches* internal headers for its malloc-less world (e.g.
-            # src/include/stdlib.h drops the hidden __libc_free/__libc_malloc_impl
-            # decls), so the curated tree only linked printf-class programs.
-            # Overwriting src/arch/crt/include/compat with pure upstream restores
-            # a consistent libc that buildLibc selects from by replicating musl's
-            # Makefile (walks the VFS, picks mallocng, arch-shadows generics). The
-            # GENERATED headers (libc/include/<triple>, generic-musl —
-            # alltypes.h/syscall.h/version.h) live outside musl/ and stay zig's.
-            __up=$(mktemp -d)
-            tar xf "${muslTar}" -C "$__up" --strip-components=1
-            for __sub in src arch crt include compat; do
-              [ -d "$__up/$__sub" ] || continue
-              ( cd "$__up/$__sub" && find . -type f \
-                  \( -name '*.c' -o -name '*.s' -o -name '*.S' \
-                     -o -name '*.h' -o -name '*.in' \) ) | \
-              while read -r __rel; do
-                __rel=''${__rel#./}
-                __dst="$__stage/libc/musl/$__sub/$__rel"
-                mkdir -p "$(dirname "$__dst")"; cp "$__up/$__sub/$__rel" "$__dst"
-              done
-            done
-            rm -rf "$__up"
-            cp -r "${zigLibc}/include/generic-musl" "$__stage/libc/include/generic-musl"
-            # Header arch tokens are zig's std.zig.target names (headerArchName in
-            # unpin_musl.cpp): 32-bit x86 is "x86" (not musl's "i386"); arm and
-            # powerpc64 match the musl folder name.
-            for __t in x86_64 x86 aarch64 arm riscv64 powerpc64; do
-              cp -r "${zigLibc}/include/$__t-linux-musl" "$__stage/libc/include/$__t-linux-musl"
-            done
-            # Linux kernel UAPI headers (<linux/futex.h>, <asm/…>) — needed by
-            # libc++'s atomic.cpp (futex) and user code talking to the kernel.
-            # zig's arch token differs from muslArch (x86_64→x86, riscv64→riscv);
-            # any-linux-any is the arch-independent set. addKernelIncludes() maps.
-            for __k in x86-linux-any aarch64-linux-any arm-linux-any riscv-linux-any powerpc-linux-any any-linux-any; do
-              cp -r "${zigLibc}/include/$__k" "$__stage/libc/include/$__k"
-            done
-
-            # M3 — the compiler-rt builtins source tree (compiled on demand per
-            # target into libclang_rt.builtins.a: soft-float TF/XF, int128,
-            # aarch64 outline atomics, …). Sourced from the same monorepo.
-            mkdir -p "$__stage/compiler-rt"
-            cp -r "${monorepoSrc}/compiler-rt/lib/builtins" "$__stage/compiler-rt/builtins"
-
-            # M4 — the C++ runtime source trees (libc++/libc++abi/libunwind),
-            # compiled on demand per target into libc++.a/libc++abi.a/
-            # libunwind.a. Sourced from OUR monorepo (version-matched), recipe
-            # from zig. cxx/libc is the llvm-libc shim libc++ src pulls in
-            # (shared/fp_bits.h, …). __config_site + __assertion_handler are the
-            # two CMake-generated headers — we ship a resolved __config_site and
-            # a verbatim default __assertion_handler so upstream __config /
-            # __assert stay unpatched.
-            mkdir -p "$__stage/cxx"
-            cp -r "${monorepoSrc}/libcxx"    "$__stage/cxx/libcxx"
-            cp -r "${monorepoSrc}/libcxxabi" "$__stage/cxx/libcxxabi"
-            cp -r "${monorepoSrc}/libunwind" "$__stage/cxx/libunwind"
-            mkdir -p "$__stage/cxx/libc/src"
-            cp -r "${monorepoSrc}/libc/shared"        "$__stage/cxx/libc/shared"
-            cp -r "${monorepoSrc}/libc/hdr"           "$__stage/cxx/libc/hdr"
-            cp -r "${monorepoSrc}/libc/include"       "$__stage/cxx/libc/include"
-            cp -r "${monorepoSrc}/libc/src/__support" "$__stage/cxx/libc/src/__support"
-            chmod -R u+w "$__stage/cxx"
-            cp ${./cxx_config_site.h} "$__stage/cxx/libcxx/include/__config_site"
-            cp "${monorepoSrc}/libcxx/vendor/llvm/default_assertion_handler.in" \
-               "$__stage/cxx/libcxx/include/__assertion_handler"
-            # Windows libc++ __config_site (musl=0, win32 threads, no tzdb) on its
-            # own dir, put ahead of the musl copy for Windows C++ compiles.
-            mkdir -p "$__stage/cxx/win"
-            cp ${./cxx_config_site_win.h} "$__stage/cxx/win/__config_site"
-            # macOS libc++ __config_site (musl=0, no tzdb; pthread threads) on its
-            # own dir, ahead of the musl copy for darwin C++ compiles.
-            mkdir -p "$__stage/cxx/darwin"
-            cp ${./cxx_config_site_darwin.h} "$__stage/cxx/darwin/__config_site"
-
-            # Windows/mingw-w64: runtime tree (→ libmingw32.a + crt2.o on demand;
-            # import libs from the embedded .def via dlltool) + any-windows-any
-            # user headers. lib32/libarm32 (i386/arm .def) skipped — x86_64 only.
-            mkdir -p "$__stage/libc/mingw"
-            for __d in crt complex gdtoa intrincs cfguard libsrc math misc stdio \
-                       string winpthreads include def-include lib64 lib-common; do
-              [ -d "${zigLibc}/mingw/$__d" ] && \
-                cp -r "${zigLibc}/mingw/$__d" "$__stage/libc/mingw/$__d"
-            done
-            chmod -R u+w "$__stage/libc/mingw"
-            # Fill zig's pruned math/ from the matching upstream release. -n so
-            # zig's copy wins wherever both exist: this only ADDS the long-double
-            # routines (and the .def.h / fp_consts.h they include).
-            mkdir -p _mw && tar xf ${mingwCrtTar} -C _mw --strip-components=1
-            cp -rn _mw/mingw-w64-crt/math/. "$__stage/libc/mingw/math/"
-            rm -rf _mw
-            cp -r "${zigLibc}/include/any-windows-any" \
-               "$__stage/libc/include/any-windows-any"
-
-            # macOS/darwin: the any-darwin-any user headers (libc/POSIX/Darwin C
-            # surface, vendored from Apple's open-source SDK) + the libSystem.tbd
-            # umbrella stub (the whole libc — linked via -lSystem; it inlines
-            # every reexported sub-lib's symbols). No libc.a is built; only
-            # compiler-rt builtins per arch on demand. zig's SDKSettings.json is
-            # skipped — its minimal content only fails clang's SDK-settings parse.
-            cp -r "${zigLibc}/include/any-darwin-any" \
-               "$__stage/libc/include/any-darwin-any"
-            mkdir -p "$__stage/libc/darwin"
-            cp "${zigLibc}/darwin/libSystem.tbd" "$__stage/libc/darwin/libSystem.tbd"
-
-            # Aliases — argv[0] faces unpin materializes at install. Newline-
-            # separated, no trailing newline (matches withUnpinEmbed's writer).
-            mkdir -p "$__stage/unpin"
-            printf 'clang\nclang++\ncc\nc++\nld.lld\nllvm-ar\nllvm-ranlib\nllvm-nm\nllvm-objcopy\nllvm-strip\nopt\nllvm-link' \
-              > "$__stage/unpin/aliases"
-
-            chmod -R u+w "$__stage"
-            __vfs_base=$(wc -c < "$out/bin/llvm")
-            __vfs_zip=$(mktemp -d)
-            ${packTool}/bin/unpin-vfs-pack "$__vfs_zip/payload.zip" "$__stage" \
-              --base "$__vfs_base" --deflate unpin/aliases >/dev/null
-            cat "$__vfs_zip/payload.zip" >> "$out/bin/llvm"
-            rm -rf "$__stage" "$__vfs_zip"
-
-            # Prove the VFS is the only source.
-            rm -rf "$out/lib/clang"
-            rmdir "$out/lib" 2>/dev/null || true
 
             # Collapse the runtime closure to just this binary. The stripped ELF
             # has ZERO store references (nuke-refs above; the static zlib/zstd are
@@ -570,11 +607,5 @@ static cl::SubCommand LinkSub(LinkSubName, "Link LLVM bitcode/IR modules");' \
             rmdir "$out/nix-support" 2>/dev/null || true
           '';
 
-          meta = {
-            description = "LLVM C/C++ suite (clang, lld, llvm-tools) as a single self-contained binary";
-            # Taken from the package whose `monorepoSrc` this builds, so the two
-            # can't disagree about what we are shipping.
-            inherit (origPkgs.llvmPackages_21.libllvm.meta) license;
-            platforms = origPkgs.lib.platforms.linux ++ origPkgs.lib.platforms.darwin;
-          };
-        }).overrideAttrs (_: { stripAllList = [ "bin" "out" ]; })
+          meta = commonMeta;
+        }).overrideAttrs (_: { stripAllList = [ "bin" "out" ]; }))
