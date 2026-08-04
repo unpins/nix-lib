@@ -301,17 +301,24 @@
         #     cc — otherwise the clang wrapper injects `--gcc-toolchain=` + gcc
         #     -B/-L, poisoning clang's self-contained VFS sysroot. unpin-llvm
         #     brings its own compiler-rt/libc++/musl. Same trick cosmocc uses.
-        #  2. The shims append ${optClass} after "$@" (route-A parity) so every
-        #     invocation hits the SAME on-demand sysroot variant the seed warms.
+        #  2. The shims append ${optClass} after "$@" (route-A parity) so the opt
+        #     class is one value across a build, not whatever each recipe passes.
         #  3. `sysrootSeedHook` — a generic recipe uses flag combos the bake
-        #     didn't cover, so the cache has to be writable.
+        #     didn't cover, so the cache has to be writable. That is the common
+        #     case, not the exception: `-flto` is a variant HASH axis in
+        #     unpin_musl.cpp, and `unpinSysroot` bakes only the two non-LTO
+        #     variants — so under lto the conftest probes (which drop -flto) hit
+        #     the warm variant and the real compiles build their own. Measured
+        #     cold, that is ~11 s of musl per C derivation and ~38 s with libc++.
         #
         # lto: the cc/c++ shims append `-flto` so every object is LLVM BITCODE,
         # the prerequisite for the module emitter (multicallModuleHookLTO). Off by
         # default — a package opts in. The cpp (-E) shim omits it (clang warns
         # "argument unused" under -E, which a -Werror probe reads as unsupported).
-        # Bitcode app objs + ELF musl libc.a is the standard
-        # LTO-app/non-LTO-libc case.
+        # The libc is bitcode too: the on-demand build follows the link's own
+        # -flto, so musl folds INTO the whole-program LTO. That is what makes the
+        # darwin static-name-capture class a darwin one — there libSystem stays
+        # outside the module. Verify with `llvm-ar x` on a cached libc.a.
         unpinAdapterStdenv =
           { pkgs, toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system
           , target, optClass ? "-O2", cxx ? true, native ? false, lto ? false
@@ -351,12 +358,30 @@
               mkdir -p $out/lib
               printf '!<arch>\n' > $out/lib/libm.a
             '';
+            # wchar_t IS ISO 10646 — why the engine says so at all is the mk()
+            # comment below, whose "every unpin target is Linux/musl" was written
+            # before windows and darwin came through this same wrapper (it is
+            # frozen: that text is INSIDE the builder, so rewording it re-hashes
+            # the engine cc on every target and with it the whole catalog).
+            #
+            # Everywhere EXCEPT windows: mingw's wchar_t is 16-bit UTF-16, so the
+            # macro's contract — a wchar_t value IS a code point — cannot hold,
+            # and neither gcc nor clang defines it on any Windows target. Saying
+            # it anyway is a lie the next mingw package inherits; gnulib happens
+            # to be immune (it gates on BITSIZEOF_WCHAR_T as well), which is why
+            # nothing broke while this was unconditional. Kept on darwin: wchar_t
+            # is 32-bit there so the macro is not false, and libedit — the reason
+            # the flag exists — exempts __APPLE__ from its own check anyway.
+            isoWcharFlag =
+              nixpkgs.lib.optionalString (!isWinTarget) " -D__STDC_ISO_10646__=201706L";
             # Windows: force fortify off. The engine's mingw CRT has none of the
             # `__*_chk` shims, so any known-size memcpy/strcpy fails to link. `-U`
             # doesn't work (gnulib's config.h `#if !defined _FORTIFY_SOURCE`
-            # re-enables it); `-D_FORTIFY_SOURCE=0` (appended after "$@", wins over
-            # the wrapper's `=2`) leaves it DEFINED so gnulib's guard stays false.
-            # Empty on Linux.
+            # re-enables it); `-D_FORTIFY_SOURCE=0`, appended after "$@" so it wins
+            # over anything the source set, leaves it DEFINED so gnulib's guard
+            # stays false. The cc-wrapper is not the source here — `hardeningDisable
+            # = [ "all" ]` below already strips its `=2` on every target. Empty on
+            # Linux.
             winFortifyOff = nixpkgs.lib.optionalString isWinTarget " -D_FORTIFY_SOURCE=0";
             # darwin: give every internal-linkage symbol a module-unique name.
             #
@@ -481,8 +506,12 @@
             '';
             captureCall = nixpkgs.lib.optionalString captureLinks
               "[ -n \"\\$UNPIN_CAPTURE_LINKS\" ] && \"$out/libexec/unpin-capture\" \"\\$@\"";
+            # `version` is what nixpkgs' version-gated cc branches read
+            # (`versionAtLeast stdenv.cc.version …`), so it must be the LLVM the
+            # wrapper actually execs — take it from the toolchain instead of
+            # repeating the literal, which drifts silently at the next bump.
             ccUnwrapped = pkgs.runCommand "unpin-cc-unwrapped-${target}"
-              { passthru = { isGNU = true; version = "21.1.8"; };
+              { passthru = { isGNU = true; inherit (toolchain) version; };
                 inherit captureScript; } ''
               mkdir -p $out/bin $out/libexec
               printf '%s' "$captureScript" > $out/libexec/unpin-capture
@@ -533,7 +562,7 @@
                   set -- "\$@" "\$__a"
                 done
               fi
-              ${uniqNamesProbe}${darwinEnvSetup}exec ${toolchain}/bin/llvm $2 -target ${target} -D__STDC_ISO_10646__=201706L${darwinStubFlag} "\$@" ${optClass}${winFortifyOff}\$__lto${uniqNamesArg}
+              ${uniqNamesProbe}${darwinEnvSetup}exec ${toolchain}/bin/llvm $2 -target ${target}${isoWcharFlag}${darwinStubFlag} "\$@" ${optClass}${winFortifyOff}\$__lto${uniqNamesArg}
               EOF
                 chmod +x "$out/bin/$1"
               }
@@ -541,7 +570,7 @@
               mk clang++ clang++ ; mk c++ clang++ ; mk g++ clang++
               cat > $out/bin/cpp <<EOF
               #!/bin/sh
-              ${darwinEnvSetup}exec ${toolchain}/bin/llvm clang -E -target ${target} -D__STDC_ISO_10646__=201706L${darwinStubFlag} "\$@"
+              ${darwinEnvSetup}exec ${toolchain}/bin/llvm clang -E -target ${target}${isoWcharFlag}${darwinStubFlag} "\$@"
               EOF
               chmod +x $out/bin/cpp
             '';
@@ -684,9 +713,11 @@
                 # through a bespoke, non-autotools Makefile that hardcodes the
                 # gnu compiler by name — e.g. zlib's `win32/Makefile.gcc` invokes
                 # `''${PREFIX}gcc` (= `x86_64-w64-mingw32-gcc`) literally, never
-                # `$CC`. The cc-wrapper only exposes `cc`/`clang` (it adds no
-                # `gcc` alias because the unwrapped clang isn't isGNU), and the
-                # genuine-cross wrapper names it unprefixed. The prefixed BINTOOLS
+                # `$CC`. The cc-wrapper only exposes `cc`/`clang`: its builder
+                # tests `$ccPath/clang` BEFORE `$ccPath/gcc`, and ccUnwrapped
+                # ships both, so the clang branch wins and no `gcc` is wrapped
+                # (isGNU has no say here); `unprefixAliases` then adds the bare
+                # names next to the wrapper's prefixed ones. The prefixed BINTOOLS
                 # (`${target}-ar`/`-ranlib`) already exist (bintoolsUnwrapped);
                 # add the matching `gcc`/`g++` CC aliases (point at the `clang`/
                 # `clang++` wrapper scripts, which resolve) so such Makefiles find
@@ -753,9 +784,18 @@
           in
           # dontPatchELF: static-musl has no interp/RPATH to touch.
           # hardeningDisable=all: match route-A's minimal flag set (fortify needs
-          # libc support musl only partly provides). No dontStrip — unlike
-          # cosmocc's APE, static-musl ELF strips fine, so strippedOrJoined's
-          # final strip applies.
+          # libc support musl only partly provides). `all` is wider than that
+          # reason and the difference is not free: it also drops
+          # `-fstack-protector-strong`, so an engine binary carries no canary
+          # where the pre-engine static-musl gcc build did (measured on the same
+          # nixpkgs zlib: 32 `%fs:0x28` loads before, no `sspstrong` attribute in
+          # the engine bitcode after). `optimize.ssp` defaults to true and does
+          # NOT restore it — it only ever subtracts. musl exports
+          # `__stack_chk_fail`/`__stack_chk_guard` and the engine links it fine,
+          # so narrowing this to [ "fortify" "fortify3" ] is available; it re-hashes
+          # the whole catalog, so it is a posture decision, not a cleanup.
+          # No dontStrip — unlike cosmocc's APE, static-musl ELF strips fine, so
+          # strippedOrJoined's final strip applies.
           pkgs.stdenvAdapters.addAttrsToDerivation
             ({ dontPatchELF = true; hardeningDisable = [ "all" ]; }
               # See muslLibmStub: keep CMake's find_library(m) off the host glibc
