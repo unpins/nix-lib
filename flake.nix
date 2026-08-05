@@ -379,9 +379,8 @@
             # doesn't work (gnulib's config.h `#if !defined _FORTIFY_SOURCE`
             # re-enables it); `-D_FORTIFY_SOURCE=0`, appended after "$@" so it wins
             # over anything the source set, leaves it DEFINED so gnulib's guard
-            # stays false. The cc-wrapper is not the source here — `hardeningDisable
-            # = [ "all" ]` below already strips its `=2` on every target. Empty on
-            # Linux.
+            # stays false. The cc-wrapper is not the source here — `fortify` is in
+            # the hardeningDisable list below on every target. Empty on Linux.
             winFortifyOff = nixpkgs.lib.optionalString isWinTarget " -D_FORTIFY_SOURCE=0";
             # darwin: give every internal-linkage symbol a module-unique name.
             #
@@ -783,21 +782,33 @@
               '');
           in
           # dontPatchELF: static-musl has no interp/RPATH to touch.
-          # hardeningDisable=all: match route-A's minimal flag set (fortify needs
-          # libc support musl only partly provides). `all` is wider than that
-          # reason and the difference is not free: it also drops
-          # `-fstack-protector-strong`, so an engine binary carries no canary
+          # Hardening: every default flag off EXCEPT stackprotector. `fortify` is
+          # what put this at `all` (musl implements only part of the `__*_chk`
+          # surface and the engine's mingw CRT none of it), but `all` also drops
+          # `-fstack-protector-strong`, so an engine binary carried no canary
           # where the pre-engine static-musl gcc build did (measured on the same
           # nixpkgs zlib: 32 `%fs:0x28` loads before, no `sspstrong` attribute in
-          # the engine bitcode after). `optimize.ssp` defaults to true and does
-          # NOT restore it — it only ever subtracts. musl exports
-          # `__stack_chk_fail`/`__stack_chk_guard` and the engine links it fine,
-          # so narrowing this to [ "fortify" "fortify3" ] is available; it re-hashes
-          # the whole catalog, so it is a posture decision, not a cleanup.
+          # the engine bitcode after), and `optimize.ssp` could not give it back
+          # — it only ever subtracts. musl and libSystem both export
+          # `__stack_chk_fail`/`__stack_chk_guard`, so the flag costs one link
+          # symbol and ~1.4% of text (sed: 0 -> 90 canary loads, +4960 B).
+          # Two targets are a deliberate no-op, and nixpkgs decides it, not us:
+          # its cc-wrapper strips `stackprotector` as unsupported on mingw and on
+          # musl-x86_32, so `windows-x86_64` and `linux-i686` rebuild BYTE-
+          # IDENTICAL. darwin already had clang's on-by-default `-fstack-
+          # protector` and moves to `strong`.
+          # Subtracted from the wrapper's OWN default list, so a nixpkgs bump that
+          # adds a hardening default inherits today's posture (off) instead of
+          # silently enabling it. Re-enabling any of the other ten is a separate
+          # per-flag decision, not a cleanup: `format` is -Werror, `pic` flips the
+          # on-demand libc's variant hash, `libcxxhardeningfast` would define a
+          # hardening mode the driver's own libc++ was not built with.
           # No dontStrip — unlike cosmocc's APE, static-musl ELF strips fine, so
           # strippedOrJoined's final strip applies.
           pkgs.stdenvAdapters.addAttrsToDerivation
-            ({ dontPatchELF = true; hardeningDisable = [ "all" ]; }
+            ({ dontPatchELF = true;
+               hardeningDisable =
+                 nixpkgs.lib.remove "stackprotector" cc.defaultHardeningFlags; }
               # See muslLibmStub: keep CMake's find_library(m) off the host glibc
               # libm.so. Linux-musl only (darwin/windows have a real libm).
               // nixpkgs.lib.optionalAttrs (!isDarwinTarget && !isWinTarget) {
