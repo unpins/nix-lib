@@ -34,26 +34,47 @@
         # keeps nix-lib's closure {nixpkgs} only.
         #
         # unpinSysroot bakes a read-only per-target sysroot; linking (not -c)
-        # triggers the on-demand build of libc/CRTs (and libc++ when `cxx`). Bake
-        # BOTH non-PIC and PIC variants: the cache is variant-aware and many build
-        # systems force -fPIC even for a static target (zlib's configure does).
-        # Without the PIC variant pre-baked the link fails writing the RO store
-        # cache and configure silently mis-detects. `native` gates the sanity run
-        # (cross can't exec on the builder); `cxx` the C++ half.
-        unpinSysroot = { pkgs, toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system, triple, optClass ? "-O2", native ? false, cxx ? false }:
+        # triggers the on-demand build of libc/CRTs (and libc++ when `cxx`). The
+        # bake must cover every variant the consumer's links will ask for, because
+        # a miss is silent: the driver rebuilds musl inside the sandbox and throws
+        # it away with the derivation.
+        #
+        # Two axes, both HASH axes of `Variant` in unpin_musl.cpp:
+        #  * pic — many build systems force -fPIC even for a static target (zlib's
+        #    configure does), and without the PIC variant baked the link fails
+        #    writing the RO store cache and configure silently mis-detects.
+        #  * lto — `lto` bakes the second PAIR, for consumers whose shims append
+        #    -flto (both routes do by default). The non-LTO pair stays either way:
+        #    autoconf conftests drop -flto on purpose, so a build hits BOTH. Under
+        #    -flto the libc objects are bitcode, so this doubles the sysroot
+        #    (11M -> 26M/target) and pays for itself at the first link: a C++
+        #    -flto link is 38s against an empty cache and 11s against the bake
+        #    (same binary), pkgsStatic.hello through engineStdenv 52s -> 41s.
+        #    `-flto=thin` needs no third bake — parseVariant folds every -flto=
+        #    spelling into the one lto=1 variant.
+        # Still uncoverable: a package that passes its own -march=/-mcpu= or a
+        # different opt class moves cpuFlags/fast and misses the bake again.
+        # `native` gates the sanity run (cross can't exec on the builder); `cxx`
+        # the C++ half.
+        unpinSysroot = { pkgs, toolchain ? unpinToolchain pkgs.stdenv.buildPlatform.system, triple, optClass ? "-O2", native ? false, cxx ? false, lto ? false }:
+          let ltoAxis = if lto then ''"" "-flto"'' else ''""''; in
           pkgs.runCommand "unpin-sysroot-${triple}" { } ''
             export HOME=$TMPDIR
             export XDG_CACHE_HOME=$out/cache
             printf 'int main(void){return 0;}\n' > hello.c
-            for pic in "" "-fPIC"; do
-              ${toolchain}/bin/llvm clang -target ${triple} ${optClass} $pic hello.c -o hc
-              ${nixpkgs.lib.optionalString native "./hc"}
+            for l in ${ltoAxis}; do
+              for pic in "" "-fPIC"; do
+                ${toolchain}/bin/llvm clang -target ${triple} ${optClass} $pic $l hello.c -o hc
+                ${nixpkgs.lib.optionalString native "./hc"}
+              done
             done
             ${nixpkgs.lib.optionalString cxx ''
               printf '#include <iostream>\nint main(){std::cout<<"";return 0;}\n' > hello.cpp
-              for pic in "" "-fPIC"; do
-                ${toolchain}/bin/llvm clang++ -target ${triple} ${optClass} $pic hello.cpp -o hcpp
-                ${nixpkgs.lib.optionalString native "./hcpp"}
+              for l in ${ltoAxis}; do
+                for pic in "" "-fPIC"; do
+                  ${toolchain}/bin/llvm clang++ -target ${triple} ${optClass} $pic $l hello.cpp -o hcpp
+                  ${nixpkgs.lib.optionalString native "./hcpp"}
+                done
               done
             ''}
             echo "baked variants for ${triple}:"; find $out/cache/unpin-llvm -name .complete \
@@ -234,7 +255,10 @@
           , target, lto ? "full", optClass ? "-O2"
           , native ? false, cxx ? false, stackSize ? "8388608" }:
           let
-            sysroot = unpinSysroot { inherit pkgs toolchain; triple = target; inherit optClass native cxx; };
+            sysroot = unpinSysroot {
+              inherit pkgs toolchain; triple = target; inherit optClass native cxx;
+              lto = ltoFlag != "";
+            };
             ltoFlag =
               if lto == "thin" then "-flto=thin"
               else if lto == "full" || lto == true then "-flto"
@@ -303,13 +327,13 @@
         #     brings its own compiler-rt/libc++/musl. Same trick cosmocc uses.
         #  2. The shims append ${optClass} after "$@" (route-A parity) so the opt
         #     class is one value across a build, not whatever each recipe passes.
-        #  3. `sysrootSeedHook` — a generic recipe uses flag combos the bake
-        #     didn't cover, so the cache has to be writable. That is the common
-        #     case, not the exception: `-flto` is a variant HASH axis in
-        #     unpin_musl.cpp, and `unpinSysroot` bakes only the two non-LTO
-        #     variants — so under lto the conftest probes (which drop -flto) hit
-        #     the warm variant and the real compiles build their own. Measured
-        #     cold, that is ~11 s of musl per C derivation and ~38 s with libc++.
+        #  3. `sysrootSeedHook` — a generic recipe can still use flag combos the
+        #     bake didn't cover (its own -march=, a different opt class), so the
+        #     cache has to be writable. `lto` is forwarded to `unpinSysroot` so
+        #     the combo this stdenv itself forces is NOT one of them: the shims
+        #     append -flto, `-flto` is a variant HASH axis in unpin_musl.cpp, and
+        #     an unbaked LTO libc costs ~11 s per C derivation (~38 s with
+        #     libc++) rebuilt inside the sandbox and discarded.
         #
         # lto: the cc/c++ shims append `-flto` so every object is LLVM BITCODE,
         # the prerequisite for the module emitter (multicallModuleHookLTO). Off by
@@ -335,7 +359,7 @@
           # makeStaticLibraries, not from pkgsStatic).
           , hostPkgs ? pkgs.pkgsStatic }:
           let
-            sysroot = unpinSysroot { inherit pkgs toolchain; triple = target; inherit optClass native cxx; };
+            sysroot = unpinSysroot { inherit pkgs toolchain; triple = target; inherit optClass native cxx lto; };
             ltoArg = if lto then " -flto" else "";
             # musl folds libm (and pthread/rt/dl/…) into libc — there is no separate
             # libm.a. CMake's `find_library(m)` (e.g. libtiff's FindCMath) doesn't
