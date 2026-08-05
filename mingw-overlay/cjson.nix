@@ -3,6 +3,4 @@
 # `-Werror` turns fatal. Mingw runtime-header artifact; just disable the gate.
 { lib }:
 self: super:
-super.cjson.overrideAttrs (oa: {
-  NIX_CFLAGS_COMPILE = (oa.NIX_CFLAGS_COMPILE or "") + " -Wno-error=float-conversion";
-})
+lib.appendCFlags super.cjson "-Wno-error=float-conversion"

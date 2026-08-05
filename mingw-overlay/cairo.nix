@@ -16,17 +16,14 @@
 #    See [[mingw-dllimport-static-pattern]].
 { lib }:
 self: super:
-(super.cairo.override {
-  x11Support = false;
-  xcbSupport = false;
-}).overrideAttrs (oa: {
-  NIX_CFLAGS_COMPILE = (oa.NIX_CFLAGS_COMPILE or "")
-    + " -Wno-error=incompatible-pointer-types";
-  postInstall = (oa.postInstall or "") + ''
-    sed -i 's|^Requires: cairo, freetype2|Requires: cairo, fontconfig, freetype2|' \
-      $out/lib/pkgconfig/cairo-ft.pc
-    for pc in $out/lib/pkgconfig/cairo*.pc; do
-      sed -i 's|^Cflags:|Cflags: -DCAIRO_WIN32_STATIC_BUILD|' "$pc"
-    done
-  '';
-})
+lib.appendCFlags
+  ((super.cairo.override {
+    x11Support = false;
+    xcbSupport = false;
+  }).overrideAttrs (oa: {
+    postInstall = (oa.postInstall or "") + ''
+      sed -i 's|^Requires: cairo, freetype2|Requires: cairo, fontconfig, freetype2|' \
+        $out/lib/pkgconfig/cairo-ft.pc
+    '' + lib.withPcCflags "-DCAIRO_WIN32_STATIC_BUILD" "$out/lib/pkgconfig/cairo*.pc";
+  }))
+  "-Wno-error=incompatible-pointer-types"

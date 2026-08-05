@@ -8,10 +8,10 @@
 { lib }:
 self: super:
 super.libssh.overrideAttrs (oa: {
-  postFixup = (oa.postFixup or "") + ''
-    sed -i \
-      -e 's|^Cflags: |Cflags: -DLIBSSH_STATIC |' \
-      -e 's|^Libs: \(.*\)$|Libs: \1 -lws2_32 -liphlpapi|' \
-      $dev/lib/pkgconfig/libssh.pc
-  '';
+  postFixup = (oa.postFixup or "")
+    + lib.withPcCflags "-DLIBSSH_STATIC" "$dev/lib/pkgconfig/libssh.pc"
+    + ''
+      sed -i 's|^Libs: \(.*\)$|Libs: \1 -lws2_32 -liphlpapi|' \
+        $dev/lib/pkgconfig/libssh.pc
+    '';
 })

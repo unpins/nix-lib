@@ -13,18 +13,19 @@
 #    with 1); `Libs += -lstdc++` (C++ lib, no DT_NEEDED on static).
 { lib }:
 self: super:
-super.graphite2.overrideAttrs (oa: {
-  NIX_CFLAGS_COMPILE = (oa.NIX_CFLAGS_COMPILE or "") + " -DGRAPHITE2_STATIC";
+lib.appendCFlags (super.graphite2.overrideAttrs (oa: {
   postPatch = (oa.postPatch or "") + ''
     substituteInPlace CMakeLists.txt \
       --replace-fail "add_subdirectory(tests)" "# add_subdirectory(tests) — dropped for mingw static build"
   '';
   doCheck = false;
   doInstallCheck = false;
-  postInstall = (oa.postInstall or "") + ''
-    pc=$dev/lib/pkgconfig/graphite2.pc
-    [ -f "$pc" ] || pc=$out/lib/pkgconfig/graphite2.pc
-    sed -i 's|^Cflags: |Cflags: -DGRAPHITE2_STATIC |' "$pc"
-    sed -i 's|-lgraphite2$|-lgraphite2 -lstdc++|' "$pc"
-  '';
-})
+  postInstall = (oa.postInstall or "")
+    + lib.withPcCflags "-DGRAPHITE2_STATIC"
+        "$dev/lib/pkgconfig/graphite2.pc $out/lib/pkgconfig/graphite2.pc"
+    + ''
+      pc=$dev/lib/pkgconfig/graphite2.pc
+      [ -f "$pc" ] || pc=$out/lib/pkgconfig/graphite2.pc
+      sed -i 's|-lgraphite2$|-lgraphite2 -lstdc++|' "$pc"
+    '';
+})) "-DGRAPHITE2_STATIC"

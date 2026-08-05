@@ -42,8 +42,6 @@ in
       else "-lstdc++ -lm"
     }' \
       >> $out/lib/pkgconfig/libchromaprint.pc
-  '' + lib.optionalString isMinGW ''
-    sed -i 's|^Cflags: |Cflags: -DCHROMAPRINT_NODLL |' \
-      $out/lib/pkgconfig/libchromaprint.pc
-  '';
+  '' + lib.optionalString isMinGW
+    (lib.withPcCflags "-DCHROMAPRINT_NODLL" "$out/lib/pkgconfig/libchromaprint.pc");
 })

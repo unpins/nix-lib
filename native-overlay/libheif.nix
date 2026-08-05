@@ -21,17 +21,12 @@ let
   dropLibs = builtins.filter
     (x: !(builtins.elem (x.pname or x.name or "") [ "rav1e" "x265" "libaom" "gdk-pixbuf" ]));
 in
-pkgs.libheif.overrideAttrs (oa: {
+lib.appendCFlags
+  (pkgs.libheif.overrideAttrs (oa: {
   buildInputs = dropLibs (oa.buildInputs or [ ]);
   propagatedBuildInputs = dropLibs (oa.propagatedBuildInputs or [ ]);
   postInstall = "mkdir -p $out $bin $man";
   doCheck = false;
-  # mingw: de265.h decorates its API __declspec(dllimport) under _WIN32 unless
-  # LIBDE265_STATIC_BUILD is defined, which libde265.pc omits from Cflags — so
-  # libheif.a references __imp_de265_* thunks static libde265.a can't satisfy.
-  # Define it for libheif's compile so it binds the plain de265_* symbols.
-  NIX_CFLAGS_COMPILE = (oa.NIX_CFLAGS_COMPILE or "")
-    + lib.optionalString isMinGW " -DLIBDE265_STATIC_BUILD";
   cmakeFlags = (oa.cmakeFlags or [ ]) ++ [
     "-DENABLE_PLUGIN_LOADING=OFF"
     "-DWITH_LIBDE265=ON"
@@ -45,4 +40,9 @@ pkgs.libheif.overrideAttrs (oa: {
     "-DWITH_EXAMPLES=OFF"
     "-DBUILD_TESTING=OFF"
   ];
-})
+  }))
+  # mingw: de265.h decorates its API __declspec(dllimport) under _WIN32 unless
+  # LIBDE265_STATIC_BUILD is defined, which libde265.pc omits from Cflags — so
+  # libheif.a references __imp_de265_* thunks static libde265.a can't satisfy.
+  # Define it for libheif's compile so it binds the plain de265_* symbols.
+  (lib.optional isMinGW "-DLIBDE265_STATIC_BUILD")

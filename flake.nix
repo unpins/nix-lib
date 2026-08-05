@@ -556,9 +556,11 @@
               # (wchar_t holds Unicode), clang predefines it on NONE. Code that hard-
               # checks it (\`#error wchar_t must store ISO 10646 characters\` in
               # libedit's chartype.h) built fine when deps were gcc, but the engine is
-              # clang — so the all-deps path now miscompiles it. Every unpin target is
-              # Linux/musl with 32-bit UCS-4 wchar_t, so the macro is true; define it
-              # to gcc's value to keep the engine a drop-in for gcc-built sources.
+              # clang — so the all-deps path now miscompiles it. Defined to gcc's
+              # value on the targets where the macro's contract HOLDS (linux-musl and
+              # darwin, 32-bit UCS-4 wchar_t), keeping the engine a drop-in for
+              # gcc-built sources. \`isoWcharFlag\` withholds it on mingw, whose
+              # wchar_t is 16-bit UTF-16.
               mk() {
                 cat > "$out/bin/$1" <<EOF
               #!/bin/sh
@@ -882,6 +884,10 @@
             flagStr = builtins.concatStringsSep " "
               (if builtins.isList flags then flags else [ flags ]);
           in
+          # Appending nothing is identity — a caller whose flag list is empty
+          # under some option (lto.nix's SSP keep-syms with `ssp = false`) must
+          # not end up declaring the variable, let alone with a stray space.
+          if flagStr == "" then drv else
           drv.overrideAttrs (oa:
             if oa ? env && oa.env ? ${var} then {
               env = oa.env // { ${var} = oa.env.${var} + " " + flagStr; };
@@ -1091,6 +1097,29 @@
               mesonFlagsArray+=("--cross-file=$NIX_BUILD_TOP/objc-cross.conf")
             '';
           });
+
+        # Shell that prepends `flags` to the `Cflags:` of every `.pc` in `pcGlob`
+        # (an unquoted shell word list — globs and `$dev`/`$out` both fine; a path
+        # that doesn't exist is skipped, which is how a `$dev`-or-`$out` pair is
+        # expressed).
+        #
+        # The recurring need is `-D<X>_STATIC`: a library whose headers default to
+        # `__declspec(dllimport)` is built static with the macro defined, but the
+        # `.pc` upstream ships never propagates it, so a static CONSUMER compiles
+        # dllimport declarations and emits `__imp_*` that the plain `.a` cannot
+        # satisfy. See [[mingw-dllimport-static-pattern]].
+        #
+        # `^Cflags:` without the trailing space is deliberate: it also fixes a
+        # `.pc` whose Cflags line is empty, and for a non-empty line it yields the
+        # exact same text as matching `^Cflags: `. The grep makes it idempotent —
+        # a package rewritten in both postInstall and postFixup, or a `.pc` that
+        # already carries the macro upstream, must not get it twice.
+        withPcCflags = flags: pcGlob: ''
+          for pc in ${pcGlob}; do
+            [ -f "$pc" ] || continue
+            grep -qF -- '${flags}' "$pc" || sed -i 's|^Cflags:|Cflags: ${flags}|' "$pc"
+          done
+        '';
 
         # armv7l (aarch32) engine cross: nothing sets CC_FOR_BUILD, so meson
         # auto-detects the engine's unprefixed `cc` (an arm-TARGETING clang) as
@@ -1444,18 +1473,15 @@
             buildSalt = pkgs.buildPackages.stdenv.cc.suffixSalt;
           in
           if !(host.isDarwin or false) then drv
-          else drv.overrideAttrs (oa: {
-            buildInputs = [ pkgs.pkgsStatic.libiconv ] ++ (oa.buildInputs or [ ]);
-            preBuild = (oa.preBuild or "")
-              + nixpkgs.lib.optionalString cross ''
-                export NIX_LDFLAGS_${buildSalt}="''${NIX_LDFLAGS_${buildSalt}:-} -L${nixpkgs.lib.getLib pkgs.buildPackages.libiconv}/lib"
-              '';
-          # Hand-rolled instead of appendLdFlags: the helper writes a bare
-          # `-liconv` when the drv has no NIX_LDFLAGS, this writes " -liconv".
-          # Same link line, different hash — unifying is a deliberate rebuild.
-          } // (if oa ? env && oa.env ? NIX_LDFLAGS
-                then { env = oa.env // { NIX_LDFLAGS = oa.env.NIX_LDFLAGS + " -liconv"; }; }
-                else { NIX_LDFLAGS = (oa.NIX_LDFLAGS or "") + " -liconv"; }));
+          else appendLdFlags
+            (drv.overrideAttrs (oa: {
+              buildInputs = [ pkgs.pkgsStatic.libiconv ] ++ (oa.buildInputs or [ ]);
+              preBuild = (oa.preBuild or "")
+                + nixpkgs.lib.optionalString cross ''
+                  export NIX_LDFLAGS_${buildSalt}="''${NIX_LDFLAGS_${buildSalt}:-} -L${nixpkgs.lib.getLib pkgs.buildPackages.libiconv}/lib"
+                '';
+            }))
+            "-liconv";
 
         # Build-host-native tool that packs a staging `unpin/` tree into a
         # zstd-in-zip (ZIP method 93) overlay — the format withMan/withAliases use.
@@ -2434,6 +2460,31 @@ CBODY
           }: drv:
           let
             entryOf = p: "unpin__${sanCSym package}__${sanCSym p.name}_main";
+            # The two nm scrapes that build the asm-referenced keep-list, in ONE
+            # place: the per-program path and the shared-archive path below both
+            # need them, and Mach-O spells both sides differently in ways that
+            # fail SILENTLY (see the `machoAsm` note in the argument list — no `U`
+            # column on an undefined symbol, and a leading underscore the IR side
+            # doesn't carry). A scrape fixed in one path and left narrow in the
+            # other reintroduces exactly the bug the note describes. Byte-for-byte
+            # the previous ELF text, so no non-darwin target moves.
+            undefScrape =
+              if machoAsm
+              then "awk 'NF && $NF !~ /:$/ {print $NF}' | sed 's/^_//'"
+              else "awk '$1==\"U\"{print $2}'";
+            defScrape = "awk '$NF ~ /:$/ {next} {print $NF}'"
+              + nixpkgs.lib.optionalString machoAsm " | sed 's/^_//'";
+            # Read one program's capture sidecar into $__objs/$__arch. Both fold
+            # paths need it identically; the LOCALA dedup matters because a gnulib
+            # archive double-listed for circular refs folds to one — lld -r
+            # resolves back-references without the repeat.
+            readSidecar = p: ''
+              __side="$UNPIN_LINK_DIR/${p.name}.link"
+              [ -f "$__side" ] || { echo "multicallModuleHookLTO: no link sidecar for ${p.name} ($__side)" >&2; exit 1; }
+              __objs=$(awk '$1=="OBJ"{print $2}' "$__side")
+              __arch=$(awk '$1=="LOCALA"{print $2}' "$__side" | awk '!seen[$0]++')
+              [ -n "$__objs" ] || { echo "multicallModuleHookLTO: sidecar for ${p.name} has no objects" >&2; exit 1; }
+            '';
             # Fold the program's bitcode objs + trampoline + PRIVATE archives
             # into one module with a REAL linker (ld.lld -r), not llvm-link.
             # llvm-link has no archive semantics: it whole-loads (duplicate strong
@@ -2449,15 +2500,7 @@ CBODY
               let
                 linkBc = "multicall/link_${sanCSym p.name}.bc";
                 infer = inferLinkInputs && (p.objs or null) == null;
-                # dedup LOCALA: a gnulib archive double-listed for circular refs
-                # folds to one — lld -r resolves back-references without it.
-                inferSetup = ''
-                  __side="$UNPIN_LINK_DIR/${p.name}.link"
-                  [ -f "$__side" ] || { echo "multicallModuleHookLTO: no link sidecar for ${p.name} ($__side)" >&2; exit 1; }
-                  __objs=$(awk '$1=="OBJ"{print $2}' "$__side")
-                  __arch=$(awk '$1=="LOCALA"{print $2}' "$__side" | awk '!seen[$0]++')
-                  [ -n "$__objs" ] || { echo "multicallModuleHookLTO: sidecar for ${p.name} has no objects" >&2; exit 1; }
-                '';
+                inferSetup = readSidecar p;
                 linkLine =
                   if infer
                   then ''${llvm} ld.lld -r $__objs multicall/tramp_${sanCSym p.name}.bc $__arch \
@@ -2543,11 +2586,11 @@ CBODY
                 if ${llvm} llvm-ar t "$module/lib/module_native.a" >/dev/null 2>&1 \
                    && [ -n "$(${llvm} llvm-ar t "$module/lib/module_native.a" 2>/dev/null)" ]; then
                   ${llvm} llvm-nm --undefined-only "$module/lib/module_native.a" 2>/dev/null \
-                    | awk '$1=="U"{print $2}' | sort -u > multicall/nat_${sanCSym p.name}.u
+                    | ${undefScrape} | sort -u > multicall/nat_${sanCSym p.name}.u
                   # defined externals of the OWN OBJECTS only (skip the "file:"
                   # headers llvm-nm prints when handed several files).
                   ${llvm} llvm-nm --defined-only --extern-only ${progObjs} 2>/dev/null \
-                    | awk '$NF ~ /:$/ {next} {print $NF}' | sort -u > multicall/obj_${sanCSym p.name}.d
+                    | ${defScrape} | sort -u > multicall/obj_${sanCSym p.name}.d
                   __extra=$(comm -12 multicall/nat_${sanCSym p.name}.u multicall/obj_${sanCSym p.name}.d)
                   for __s in $__extra; do keeplist="$keeplist,$__s"; done
                   [ -n "$__extra" ] && echo "multicall(${p.name}): keeping asm-referenced bitcode syms external:" $__extra >&2 || true
@@ -2589,13 +2632,7 @@ CBODY
                 infer = inferLinkInputs && (p.objs or null) == null;
                 partial = "multicall/partial_${sanCSym p.name}.bc";
                 readInputs =
-                  if infer then ''
-                    __side="$UNPIN_LINK_DIR/${p.name}.link"
-                    [ -f "$__side" ] || { echo "multicallModuleHookLTO: no link sidecar for ${p.name} ($__side)" >&2; exit 1; }
-                    __objs=$(awk '$1=="OBJ"{print $2}' "$__side")
-                    __arch=$(awk '$1=="LOCALA"{print $2}' "$__side" | awk '!seen[$0]++')
-                    [ -n "$__objs" ] || { echo "multicallModuleHookLTO: sidecar for ${p.name} has no objects" >&2; exit 1; }
-                  '' else ''
+                  if infer then readSidecar p else ''
                     __objs="${spaceSep (p.objs or [ ])}"
                     __arch="${spaceSep internalArchives}"
                   '';
@@ -2636,6 +2673,42 @@ CBODY
                   *) echo native ;;
                 esac
               }
+              # Append every member of archive $2 whose kind is $3 to archive $1,
+              # extracting INSTANCE BY INSTANCE (`llvm-ar xN <k>`) into uniquely
+              # numbered files named `$4_<k>_<member>`. Needed because `llvm-ar x`
+              # flattens members to their BASENAME and OVERWRITES same-basename
+              # collisions: ffmpeg's libavcodec.a holds per-codec x86 objects
+              # sharing `mc.o`/`deblock.o`/`idct.o`, so a flat extract silently
+              # loses hevc's `mc.o` and `ff_hevc_put_bi_epel_*` goes undefined at
+              # the mega-link. Both the native rescue and the darwin bitcode-only
+              # copy split archives this way; one function so a fix to the member
+              # bookkeeping can't land in only one of them.
+              _unpin_split_members() { # $1=out.a $2=in.a $3=bc|native $4=prefix
+                local __out="$1" __in="$2" __want="$3" __pfx="$4"
+                local __td __k=0 __mem __safe __c __f __u
+                __td=$(mktemp -d)
+                cp "$__in" "$__td/in.a" || { rm -rf "$__td"; return 0; }
+                ${llvm} llvm-ar t "$__td/in.a" > "$__td/members" 2>/dev/null \
+                  || { rm -rf "$__td"; return 0; }
+                mkdir -p "$__td/e" "$__td/seen"
+                while IFS= read -r __mem; do
+                  [ -n "$__mem" ] || continue
+                  __safe=$(printf '%s' "$__mem" | tr -c 'A-Za-z0-9._-' '_')
+                  __c=$(cat "$__td/seen/$__safe" 2>/dev/null || echo 0); __c=$((__c + 1))
+                  printf '%s' "$__c" > "$__td/seen/$__safe"
+                  rm -f "$__td"/e/*
+                  ( cd "$__td/e" && ${llvm} llvm-ar xN "$__c" "$__td/in.a" "$__mem" ) 2>/dev/null || true
+                  __f=$(ls "$__td/e" 2>/dev/null | head -1)
+                  [ -n "$__f" ] || { __k=$((__k + 1)); continue; }
+                  if [ "$(_unpin_natkind "$__td/e/$__f")" = "$__want" ]; then
+                    __u="$__td/''${__pfx}_$(printf '%06d' $__k)_$__safe"
+                    mv "$__td/e/$__f" "$__u"
+                    ${llvm} llvm-ar qc "$__out" "$__u"
+                  fi
+                  __k=$((__k + 1))
+                done < "$__td/members"
+                rm -rf "$__td"
+              }
               _unpin_collect() {
                 __nat="$1"; shift
                 for __i in "$@"; do
@@ -2644,16 +2717,11 @@ CBODY
                     *.a)
                       # Split a (possibly mixed) archive: archive only its NATIVE
                       # members; the bitcode members already rode into module.bc via
-                      # the ld.lld -r link. `llvm-ar x` flattens every member to its
-                      # BASENAME and OVERWRITES same-basename collisions on disk. Most
-                      # archives have none, so keep the fast flat extract there (and
-                      # byte-identical to the original path); only when a member name
-                      # repeats — ffmpeg's libavcodec.a holds per-codec x86 objects
-                      # sharing basenames (`mc.o`/`deblock.o`/`idct.o`/…) so a flat
-                      # extract loses e.g. hevc's `mc.o` → `ff_hevc_put_bi_epel_*`
-                      # goes undefined at the mega-link — fall back to instance-by-
-                      # instance extraction (`llvm-ar xN <k>` pulls the k-th instance)
-                      # into uniquely-numbered files so nothing is dropped.
+                      # the ld.lld -r link. Most archives have no repeated member
+                      # name, so keep the fast flat extract for them (and
+                      # byte-identical to the original path); when a name repeats,
+                      # fall back to _unpin_split_members, which is why that
+                      # function exists.
                       __td=$(mktemp -d)
                       cp "$__i" "$__td/in.a" || { rm -rf "$__td"; continue; }
                       ${llvm} llvm-ar t "$__td/in.a" > "$__td/members" 2>/dev/null || { rm -rf "$__td"; continue; }
@@ -2668,26 +2736,11 @@ CBODY
                             ${llvm} llvm-ar qc "$__nat" "$__m"
                           fi
                         done
+                        rm -rf "$__td"
                       else
-                        mkdir -p "$__td/e" "$__td/seen"
-                        __k=0
-                        while IFS= read -r __mem; do
-                          [ -n "$__mem" ] || continue
-                          __safe=$(printf '%s' "$__mem" | tr -c 'A-Za-z0-9._-' '_')
-                          __c=$(cat "$__td/seen/$__safe" 2>/dev/null || echo 0); __c=$((__c + 1)); printf '%s' "$__c" > "$__td/seen/$__safe"
-                          rm -f "$__td"/e/*
-                          ( cd "$__td/e" && ${llvm} llvm-ar xN "$__c" "$__td/in.a" "$__mem" ) 2>/dev/null || true
-                          __f=$(ls "$__td/e" 2>/dev/null | head -1)
-                          [ -n "$__f" ] || { __k=$((__k + 1)); continue; }
-                          if [ "$(_unpin_natkind "$__td/e/$__f")" = native ]; then
-                            __u="$__td/n_$(printf '%06d' $__k)_$__safe"
-                            mv "$__td/e/$__f" "$__u"
-                            ${llvm} llvm-ar qc "$__nat" "$__u"
-                          fi
-                          __k=$((__k + 1))
-                        done < "$__td/members"
+                        rm -rf "$__td"
+                        _unpin_split_members "$__nat" "$__i" native n
                       fi
-                      rm -rf "$__td"
                       ;;
                     *)
                       if [ "$(_unpin_natkind "$__i")" = native ]; then
@@ -2709,29 +2762,7 @@ CBODY
               __bcu=multicall/union_bc.a
               rm -f "$__bcu"
               for __a in $__union; do
-                __td=$(mktemp -d)
-                cp "$__a" "$__td/in.a" || { rm -rf "$__td"; continue; }
-                ${llvm} llvm-ar t "$__td/in.a" > "$__td/members" 2>/dev/null \
-                  || { rm -rf "$__td"; continue; }
-                mkdir -p "$__td/e" "$__td/seen"
-                __k=0
-                while IFS= read -r __mem; do
-                  [ -n "$__mem" ] || continue
-                  __safe=$(printf '%s' "$__mem" | tr -c 'A-Za-z0-9._-' '_')
-                  __c=$(cat "$__td/seen/$__safe" 2>/dev/null || echo 0); __c=$((__c + 1))
-                  printf '%s' "$__c" > "$__td/seen/$__safe"
-                  rm -f "$__td"/e/*
-                  ( cd "$__td/e" && ${llvm} llvm-ar xN "$__c" "$__td/in.a" "$__mem" ) 2>/dev/null || true
-                  __f=$(ls "$__td/e" 2>/dev/null | head -1)
-                  [ -n "$__f" ] || { __k=$((__k + 1)); continue; }
-                  if [ "$(_unpin_natkind "$__td/e/$__f")" = bc ]; then
-                    __u="$__td/b_$(printf '%06d' $__k)_$__safe"
-                    mv "$__td/e/$__f" "$__u"
-                    ${llvm} llvm-ar qc "$__bcu" "$__u"
-                  fi
-                  __k=$((__k + 1))
-                done < "$__td/members"
-                rm -rf "$__td"
+                _unpin_split_members "$__bcu" "$__a" bc b
               done
               if [ -f "$__bcu" ]; then ${llvm} llvm-ar s "$__bcu"; else ${llvm} llvm-ar rc "$__bcu"; fi''}
               ${llvm} ld.lld -r ${modsList} ${nixpkgs.lib.optionalString machoAsm "--whole-archive $__bcu --no-whole-archive "}$__union \
@@ -2751,11 +2782,9 @@ CBODY
               if ${llvm} llvm-ar t "$module/lib/module_native.a" >/dev/null 2>&1 \
                  && [ -n "$(${llvm} llvm-ar t "$module/lib/module_native.a" 2>/dev/null)" ]; then
                 ${llvm} llvm-nm --undefined-only "$module/lib/module_native.a" 2>/dev/null \
-                  | ${if machoAsm
-                      then "awk 'NF && $NF !~ /:$/ {print $NF}' | sed 's/^_//'"
-                      else "awk '$1==\"U\"{print $2}'"} | sort -u > multicall/nat_all.u
+                  | ${undefScrape} | sort -u > multicall/nat_all.u
                 ${llvm} llvm-nm --defined-only --extern-only multicall/link_all.bc 2>/dev/null \
-                  | awk '$NF ~ /:$/ {next} {print $NF}'${nixpkgs.lib.optionalString machoAsm " | sed 's/^_//'"} | sort -u > multicall/def_all.d
+                  | ${defScrape} | sort -u > multicall/def_all.d
                 __extra=$(comm -12 multicall/nat_all.u multicall/def_all.d)
                 for __s in $__extra; do keeplist="$keeplist,$__s"; done
                 [ -n "$__extra" ] && echo "multicall(shared): keeping asm-referenced bitcode syms external:" $__extra >&2 || true
@@ -2922,7 +2951,11 @@ CBODY
                 echo "#define main ${sanCSym p.name}_main"
                 $NM --defined-only -g ${nixpkgs.lib.concatStringsSep " " p.objs} 2>/dev/null \
                   | awk -v t="${sanCSym p.name}" -v strip=${if isTargetDarwin then "1" else "0"} '
-                      $2 ~ /^[TBDRWVCS]$/ {
+                      # Same symbol classes as the bitcode fold and the cosmo hook:
+                      # `i` (indirect/ifunc) and `u` (unique global) are defined
+                      # globals too, and a class left out here leaks that symbol
+                      # across the folded programs under its original name.
+                      $2 ~ /^[TBDRWVCSiu]$/ {
                         sym = $3
                         if (strip && sym ~ /^_/) sym = substr(sym, 2)
                         if (sym ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && sym != "main" && !seen[sym]++)
@@ -5114,7 +5147,7 @@ CBODY
         # the closure rebuilds with -flto + gcc-ar + --gc-sections. Stack
         # protector kept via -Wl,-u,__stack_chk_fail. See ./lto.nix.
         # Consumed by mkStandaloneFlake when `lto = true`.
-        mkPkgsLTO = import ./lto.nix { inherit nixpkgs appendCFlags; };
+        mkPkgsLTO = import ./lto.nix { inherit nixpkgs appendCFlags appendLdFlags; };
 
         # mkPkgsGC: pkgsStatic with a chain-wide function/data-sections overlay
         # (cheap dead-code stripping; see gc.nix). Enabled via

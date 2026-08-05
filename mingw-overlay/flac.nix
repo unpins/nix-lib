@@ -5,12 +5,6 @@
 { lib }:
 self: super:
 super.flac.overrideAttrs (oa: {
-  postFixup = (oa.postFixup or "") + ''
-    for pc in $dev/lib/pkgconfig/*.pc; do
-      [ -f "$pc" ] || continue
-      if ! grep -q 'FLAC__NO_DLL' "$pc"; then
-        sed -i 's|^Cflags:|Cflags: -DFLAC__NO_DLL|' "$pc"
-      fi
-    done
-  '';
+  postFixup = (oa.postFixup or "")
+    + lib.withPcCflags "-DFLAC__NO_DLL" "$dev/lib/pkgconfig/*.pc";
 })

@@ -15,7 +15,7 @@
 # `useLLVM`). So nix-lib keeps the dep map here; consumers only set `lto =
 # true`.
 
-{ nixpkgs, appendCFlags }:
+{ nixpkgs, appendCFlags, appendLdFlags }:
 
 { system ? "x86_64-linux"
 , opt ? "-O2"
@@ -40,23 +40,17 @@ let
   # link instead (see ltoOverlay): NIX_LDFLAGS would also hit `ld -r`
   # relocatable partial-links (kbuild built-in.o), where --gc-sections errors
   # "requires a defined symbol root specified by -e or -u".
-  ltoLDFlags = if ssp then "-u __stack_chk_fail -u __stack_chk_guard" else "";
+  ltoLDFlags = nixpkgs.lib.optionals ssp [ "-u" "__stack_chk_fail" "-u" "__stack_chk_guard" ];
 
   # `${triple}-gcc-ar` (plugin-aware) is PATH-resolved ahead of binutils.
   # Bail out on buildInputs lacking `.override` (setup hooks, raw paths):
   # the only loss is LTO on a helper that never reaches the final binary.
   withLTO = drv:
     if !(drv ? override) then drv
-    else (appendCFlags drv ltoCFlags).overrideAttrs (old: {
+    else
+    (appendLdFlags (appendCFlags drv ltoCFlags) ltoLDFlags).overrideAttrs (old: {
     hardeningDisable = (old.hardeningDisable or [ ])
       ++ (if ssp then [ ] else [ "stackprotector" ]);
-    # Hand-rolled rather than `appendLdFlags`, for the same reason
-    # `withDarwinIconv` is: the helper writes a bare `-u …` where this writes
-    # " -u …", so the link line is identical and the hash is not. Unifying is a
-    # deliberate rebuild, and nothing would catch an accidental one — no
-    # drv-diff target sets `optimize`.
-    NIX_LDFLAGS = (old.NIX_LDFLAGS or "")
-      + " ${ltoLDFlags}";
     AR = "${triple}-gcc-ar";
     RANLIB = "${triple}-gcc-ranlib";
     NM = "${triple}-gcc-nm";

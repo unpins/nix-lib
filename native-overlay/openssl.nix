@@ -31,12 +31,6 @@
         mkdir -p "$out/lib"
         printf '!<arch>\n' > "$out/lib/libatomic.a"
       '';
-      addStubL = o:
-        if o ? env && o.env ? NIX_LDFLAGS then {
-          env = o.env // { NIX_LDFLAGS = o.env.NIX_LDFLAGS + " -L${libatomicStub}/lib"; };
-        } else {
-          NIX_LDFLAGS = (o.NIX_LDFLAGS or "") + " -L${libatomicStub}/lib";
-        };
       # …and the same `-latomic` rides along in the installed `libcrypto.pc` /
       # `libssl.pc` `Libs.private` (OpenSSL's Configure `ex_libs`). CONSUMERS that
       # link static openssl via `pkg-config --static` (kmod's PKG_CHECK_MODULES,
@@ -55,6 +49,6 @@
       };
     in
     if pkgs.stdenv.hostPlatform.isAarch32
-    then base.overrideAttrs (o: (addStubL o) // (stripPcAtomic o))
+    then lib.appendLdFlags (base.overrideAttrs stripPcAtomic) "-L${libatomicStub}/lib"
     else base;
 }
