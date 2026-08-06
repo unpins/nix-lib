@@ -4583,13 +4583,25 @@ CBODY
                 # SELF-FOLD: a multi-program package (find+xargs, flac+metaflac)
                 # must still ship ONE binary, so apply the mega fold to its single
                 # module (N=1). Drops extra upstream binaries not in `programs`.
-                # `defaultProgram` runs on a bare invocation (default = binName if
-                # an applet, else null → dispatcher lists programs).
+                # `defaultProgram` runs on a bare invocation. Left unset it is
+                # binName, which resolves to null — the dispatcher lists — unless
+                # the binary is itself one of the programs. That fallback IS the
+                # naming rule; declaring the option is the exception.
                 selfFold = wantModule && builtins.length mcPrograms > 1;
                 selfFoldDefault =
-                  let dp = multicall.defaultProgram or binName;
-                  in if builtins.elem dp (map (a: a.name) multicallManifest.applets)
-                     then dp else null;
+                  let
+                    declared = multicall.defaultProgram or null;
+                    appletNames = map (a: a.name) multicallManifest.applets;
+                    dp = if declared != null then declared else binName;
+                  in
+                  # A declared name that is no program is a typo; silently listing
+                  # would ship the wrong bare behaviour. mkMegaMulticall already
+                  # throws on the same mistake — this closes the standalone half.
+                  if declared != null && !builtins.elem declared appletNames then
+                    throw ''
+                      ${name}: multicall.defaultProgram "${declared}" is not one of its programs (${builtins.concatStringsSep ", " appletNames}).
+                    ''
+                  else if builtins.elem dp appletNames then dp else null;
                 selfFolded = mkMegaMulticall {
                   inherit pkgs name;
                   modules = [ multicallManifest ];
