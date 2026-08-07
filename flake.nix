@@ -2529,6 +2529,27 @@ CBODY
                 # symbol). Restricting to objects fixes gzip and is a no-op for xz.
                 progObjs =
                   if infer then "$__objs" else "${spaceSep (p.objs or [ ])}";
+                # The trampoline calls `main`. If this program's objects don't
+                # DEFINE one, `main` stays undefined in the module and binds at
+                # the final fold link to the only `main` in sight — the
+                # dispatcher's. The applet then re-enters the dispatcher, which
+                # dispatches it again, until the stack dies. It is silent: the
+                # binary links, installs, and only that one applet is broken.
+                # (mtools on darwin stacked cppRenameMulticall under the module
+                # fold, so `main` had already become `mkmanifest_main`; SIGSEGV
+                # on both darwin arches, shipped until the applet sweep ran it.)
+                # Undefined `main` is the exact static signal — 0 across every
+                # healthy module measured, 1 on the broken one.
+                mainGuard = ''
+                  if ${llvm} nm --undefined-only ${linkBc} 2>/dev/null \
+                       | awk '{print $NF}' | grep -qxE '_?main'; then
+                    echo "multicallModuleHookLTO: '${p.name}' defines no main of its own." >&2
+                    echo "  The entry trampoline would bind to the dispatcher's main and" >&2
+                    echo "  recurse until the stack is exhausted. A build whose main was" >&2
+                    echo "  already renamed by an earlier fold must not be folded again." >&2
+                    exit 1
+                  fi
+                '';
                 # mingw compiles a package's public API (and the gnulib getline/
                 # getdelim it ships) with __declspec(dllexport). opt -internalize
                 # PRESERVES dllexport symbols by design (they are a DLL's export
@@ -2565,6 +2586,7 @@ CBODY
                 $CC -flto -O2 -c multicall/tramp_${sanCSym p.name}.c -o multicall/tramp_${sanCSym p.name}.bc
                 ${nixpkgs.lib.optionalString infer inferSetup}
                 ${linkLine}
+                ${mainGuard}
                 ${natCollect}
                 # asm→bitcode rescue (the reverse of the SIMD case above): a native
                 # object (e.g. gzip's i386 match.o) may REFERENCE a global DEFINED in
