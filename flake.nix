@@ -4975,6 +4975,17 @@ CBODY
               smoke_pattern = smokePattern;
               # Per-package darwin portability exception (PrivateFramework names).
               darwin_allow_private_frameworks = darwinAllowPrivateFrameworks;
+              # Applets that legitimately never answer `--help`: servers that start
+              # listening the moment they run (rtmpdump's rtmpsrv/rtmpsuck print a
+              # banner and then serve — 338 MB of output in 20 s). The CI sweep
+              # still demands they be IN the dispatch table and reachable by
+              # argv[0]; it just doesn't execute them. Declared per program with
+              # `noHelp = true;` so the exception names itself in the flake instead
+              # of hiding in CI.
+              applets_no_help =
+                if multicall == null then [ ]
+                else map (p: p.name)
+                  (nixpkgs.lib.filter (p: p.noHelp or false) multicall.programs);
             };
             inherit unpinRecipe;
           };

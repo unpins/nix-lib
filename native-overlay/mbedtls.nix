@@ -20,7 +20,12 @@
 #  3. postConfigure (darwin): nixpkgs runs `perl scripts/config.pl set …` to turn
 #     threading on. Under the darwin engine cmake builds OUT of source (CWD =
 #     build/, `scripts/` one level up) whereas linux builds in-source, so the
-#     relative path misses. Run it from wherever `config.pl` actually is.
+#     relative path misses. Run it from wherever `config.pl` actually is. The cd
+#     lives in a SUBSHELL: a save-and-restore into a plain `__d` looks equivalent
+#     but is not composable — a consumer that wraps this same postConfigure
+#     reassigns `__d` from the inner copy, so the outer restore lands in
+#     `source/` and the build phase runs `ninja` where there is no build.ninja
+#     (librist/srt, 2026-08-07). A subshell needs no restore at all.
 #
 # Wired on `isStatic`, not `isMusl`: the fix was written for tar (linux-only, since
 # darwin/windows libarchive build --without-mbedtls), but ffmpeg links mbedtls on
@@ -32,9 +37,10 @@
 # tests build with -Werror and used to die on the inert `-static-libgcc` darwin
 # pkgsStatic injected — that flag is now dropped at the stdenv (flake.nix,
 # dropStaticLibgccHook), so the programs build and the suite runs on darwin too.
-# librist/srt still carry their own copy of the old workaround: they build mbedtls
-# from the PRISTINE pkgsStatic with only the stdenv swapped, so they never pass
-# through this scope OR that hook.
+# librist/srt used to carry their own copy of the old workaround on the belief
+# that they build mbedtls from a PRISTINE pkgsStatic; they do not — `autoWire`
+# puts this overlay in the very set they extend, so their copy landed ON TOP of
+# this one and nested the postConfigure. Both dropped it 2026-08-07.
 { lib }:
 {
   autoWire = "static";
@@ -58,10 +64,10 @@
       '';
     } // lib.optionalAttrs isDarwin {
       postConfigure = ''
-        __d=$PWD
-        [ -f scripts/config.pl ] || cd ..
-        ${oa.postConfigure or ""}
-        cd "$__d"
+        (
+          [ -f scripts/config.pl ] || cd ..
+          ${oa.postConfigure or ""}
+        )
       '';
     });
 }
