@@ -1966,6 +1966,14 @@
           , runtimeStage ? null
           , stripCmd ? null
           , cosmoSymtabTrim ? false
+          , compatLinks ? [ ]       # extra bin/ names symlinked to the primary in
+                                    # the SHIPPED tree. The wrap copies only the
+                                    # primary variants, so a compat symlink the
+                                    # base installed reaches the ZIP as an alias
+                                    # but leaves no file — and action-build looks
+                                    # up `result/bin/<package>` by path. Needed
+                                    # only when binName ≠ name; [] leaves the drv
+                                    # byte-identical.
           , removeReferences ? [ ]  # name-substring patterns whose store refs are
                                     # DEAD baked datadir/helper paths (never reached
                                     # at runtime in the standalone binary); scrub them
@@ -2065,7 +2073,22 @@
               if [ "''${#__unpin_bins[@]}" = 0 ]; then
                 echo "unpinEmbedWrap: no binary <${primary}>[.exe|.ape] in ${binOut}/bin" >&2
                 exit 1
-              fi
+              fi${nixpkgs.lib.optionalString (compatLinks != [ ]) ''
+
+              # Compat names, one symlink per variant that exists. The `-e` guard
+              # is for darwin: on a case-insensitive store `Xvnc` and `xvnc` are
+              # the same file, so the link is both impossible and unnecessary.
+              # Glued to the `fi` above for the reason spelled out at the
+              # removeReferences block: an interpolation on its own line leaves a
+              # blank one behind when it expands to "", which is build-script text
+              # and moves EVERY drv that goes through this wrap.
+              for __unpin_c in ${nixpkgs.lib.concatMapStringsSep " " nixpkgs.lib.escapeShellArg compatLinks}; do
+                for __unpin_s in "" ".exe" ".ape"; do
+                  [ -f "$out/bin/${primary}$__unpin_s" ] || continue
+                  [ -e "$out/bin/$__unpin_c$__unpin_s" ] \
+                    || ln -s "${primary}$__unpin_s" "$out/bin/$__unpin_c$__unpin_s"
+                done
+              done''}
               # Mirror share/man into the result tree (the ZIP is the canonical copy;
               # this is redundant but preserved for tooling).
               if [ -d "${manOut}/share/man" ]; then
@@ -4578,6 +4601,7 @@ CBODY
                 declaredAliases = nixpkgs.lib.filter (a: a != binName)
                   (nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) mcPrograms);
                 nativeEmbedOpts = { primary = binName; man = embedMan; removeReferences = removeReferences ++ (if multicall == null then [ ] else multicall.removeReferences or [ ]); }
+                  // nixpkgs.lib.optionalAttrs (binName != name) { compatLinks = [ name ]; }
                   // nixpkgs.lib.optionalAttrs (declaredAliases != [ ]) { aliases = declaredAliases; }
                   // (if runtimeEmbedNative != null then runtimeEmbedNative pkgs base else { });
                 # Legacy in-build man embed, retained ONLY for un-migrated
@@ -4784,7 +4808,8 @@ CBODY
               manFallback = if winManGraft == null then null else "${winManGraft}";
               stripCmd = ":";
               cosmoSymtabTrim = true;
-            } // nixpkgs.lib.optionalAttrs (windowsDeclaredAliases != [ ]) { aliases = windowsDeclaredAliases; }
+            } // nixpkgs.lib.optionalAttrs (binName != name) { compatLinks = [ name ]; }
+              // nixpkgs.lib.optionalAttrs (windowsDeclaredAliases != [ ]) { aliases = windowsDeclaredAliases; }
               // (if runtimeEmbedWindows != null then runtimeEmbedWindows windowsPkgs windowsForEmbed else { });
             windowsPkg0 = withMetaPins (
               # Un-migrated flake that still embeds in its own windowsBuild keeps the
