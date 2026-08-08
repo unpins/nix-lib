@@ -4111,8 +4111,8 @@ CBODY
           # man (codec libs, coreutils/busybox) skip gracefully. Set false to
           # opt a package out.
           , embedMan ? true
-          # Dead-store-ref scrub patterns for the NATIVE unpinEmbedWrap, for
-          # packages that DON'T carry an engine `multicall` attr (single-binary or
+          # Dead-store-ref scrub patterns for unpinEmbedWrap, native AND windows,
+          # for packages that DON'T carry an engine `multicall` attr (single-binary or
           # cppRenameMulticall folds like acl/brotli/cpio). Same semantics as
           # `multicall.removeReferences` (name-substring patterns; opt-in; []
           # leaves the drv byte-identical) — this is just the reachable spelling
@@ -4808,6 +4808,14 @@ CBODY
               manFallback = if winManGraft == null then null else "${winManGraft}";
               stripCmd = ":";
               cosmoSymtabTrim = true;
+              # The windows wrap used to take no scrub list at all, so a dead
+              # baked path was cleaned on linux/darwin and kept on windows —
+              # measured on xvnc, whose .exe held a live ref to its own pristine
+              # base via the xserver's $out/lib/xorg/protocol.txt while every
+              # other target was ref-clean. Same list, same opt-in: [] leaves the
+              # drv byte-identical.
+              removeReferences = removeReferences
+                ++ (if multicall == null then [ ] else multicall.removeReferences or [ ]);
             } // nixpkgs.lib.optionalAttrs (binName != name) { compatLinks = [ name ]; }
               // nixpkgs.lib.optionalAttrs (windowsDeclaredAliases != [ ]) { aliases = windowsDeclaredAliases; }
               // (if runtimeEmbedWindows != null then runtimeEmbedWindows windowsPkgs windowsForEmbed else { });
