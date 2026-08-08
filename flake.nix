@@ -725,7 +725,17 @@
             # ONE list: the search dir here and the force-link `-l` line in
             # ccExtraBuildCommands must name the same set, or a stub sits on the
             # path and is never pulled — or an `-l` finds nothing.
-            winExtraLibs = [ "bcrypt" "ws2_32" "userenv" "secur32" "crypt32" "shlwapi" ];
+            winExtraLibs = [
+              "bcrypt" "ws2_32" "userenv" "secur32" "crypt32" "shlwapi"
+              # advapi32/user32: static OpenSSL's Windows entropy + UI paths
+              # (rtmpdump links it). winmm/ksuser: libao's WMM driver — waveOut*
+              # and the KSDATAFORMAT_SUBTYPE_* GUIDs ksmedia.h declares extern
+              # (vorbis-tools' ogg123). Both packages name these on their OWN
+              # links, but the capture shim only resolves `-l<name>` it can find
+              # as a `lib<name>.a` under an explicit `-L`, and these are sysroot
+              # import stubs — so the fold link never inherits them.
+              "advapi32" "user32" "winmm" "ksuser"
+            ];
             winImportLibs = pkgs.runCommand "unpin-win-implibs-${target}" { } ''
               mkdir -p $out/lib
               for L in ${nixpkgs.lib.concatStringsSep " " winExtraLibs}; do
@@ -4754,7 +4764,11 @@ CBODY
             # module paths mutually exclusive. OPT-IN (`multicall.windows = true`),
             # NOT implied by windowsBuild: deps must cross-build cleanly through the
             # engine for mingw first (file's zlib uses a gcc-only win32/Makefile.gcc).
-            # grep/sed/file validated; htop/bc stay on their current path.
+            # Every catalog package that used to carry a bespoke mingw fold is on
+            # this path now; what remains off it are the four cosmo folds (which
+            # multicallCosmo already excludes) and usbutils, whose fold rewrites
+            # meson.build to emit ONE executable — declaring two programs there
+            # would announce an applet that does not exist.
             wantWindowsModule =
               engine == "unpin-llvm" && multicall != null && (multicall.windows or false)
               && multicallCosmo == null && windowsEnabled;
