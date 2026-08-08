@@ -4373,8 +4373,10 @@ CBODY
             # qemu) and a NATIVE darwin host; both ride the stdenv swap on
             # `pkgsStatic`. Asked by the build itself and again by the module
             # fold, in sibling scopes — one definition so the two can't drift.
-            isEngineHost = pkgs: engine == "unpin-llvm"
-              && (pkgs.stdenv.hostPlatform.isLinux || pkgs.stdenv.hostPlatform.isDarwin);
+            # Takes the PLATFORM, not a `pkgs`: the CI manifest below answers the
+            # same question for targets it never instantiates a nixpkgs for.
+            isEngineHost = platform: engine == "unpin-llvm"
+              && (platform.isLinux || platform.isDarwin);
             # A `multicall` option may be written as a plain value or as a
             # `pkgs:` function, so a target resolves store paths in its own scope.
             inScope = pkgs: v: if builtins.isFunction v then v pkgs else v;
@@ -4436,7 +4438,7 @@ CBODY
             };
             rawBuild = pkgs:
               let
-                useEngine = isEngineHost pkgs;
+                useEngine = isEngineHost pkgs.stdenv.hostPlatform;
                 # SET-LEVEL stdenv swap so the top package AND its whole link
                 # closure compile on the engine (all-deps-bitcode; a shallow `//`
                 # would leave deps gcc ELF). Which scopes the swap may touch is
@@ -4498,7 +4500,7 @@ CBODY
                 # darwin opt-out: a darwin build that genuinely ships fewer
                 # applets narrows the list with `darwinPrograms` above, which
                 # keeps the fold and fixes the cause.
-                wantModule = multicall != null && isEngineHost pkgs;
+                wantModule = multicall != null && isEngineHost pkgs.stdenv.hostPlatform;
                 rawHooked =
                   if wantModule
                   then multicallModuleHookLTO
@@ -5158,6 +5160,78 @@ CBODY
                 if multicall == null then [ ]
                 else map (p: p.name)
                   (nixpkgs.lib.filter (p: p.noHelp or false) multicall.programs);
+              # What each smoke target DECLARES, so the CI applet sweep can check
+              # the shipped binary against the declaration instead of against
+              # itself. `manifest` is a flake output, not part of any derivation —
+              # nothing added here moves a drvPath. Pure eval too (elaborated
+              # platforms, no nixpkgs instantiated), so preflight stays a
+              # one-second eval.
+              #
+              #   dispatcher — nix-lib folds a table dispatcher into this target.
+              #     The sweep turns it into a NEGATIVE control: an impossible
+              #     `--unpin-program=` name must come back as the dispatcher's own
+              #     "no program" error. Nothing at eval or build time can see a
+              #     dispatcher that isn't there — the announced list comes from the
+              #     DECLARATION, so the announced==embedded guards stay green on a
+              #     binary that dispatches nothing. Measured on bzip2's .exe: four
+              #     announced applets, all of them running bzip2's main.
+              #   programs — the real programs. Two of them need a dispatcher; one
+              #     with aliases does not, because those are the program's own
+              #     argv[0] self-dispatch (bunzip2/bzcat are bzip2).
+              #   announced — exactly what nix-lib packs as `unpin/aliases`, or
+              #     null where the wrap harvests the build's own symlinks instead
+              #     and nix-lib does not know the set.
+              #
+              # Keyed `<os>-<arch>` to match build.yml's matrix. A target absent
+              # here (every cross but windows) is simply not swept.
+              applets_by_target =
+                let
+                  progsFor = platform:
+                    if multicall == null then [ ]
+                    else supportedOn platform
+                      # Windows keeps `multicall.programs` — see windowsPrograms.
+                      (if platform.isDarwin && multicall ? darwinPrograms
+                       then multicall.darwinPrograms
+                       else multicall.programs);
+                  entry = triple:
+                    let
+                      platform = nixpkgs.lib.systems.elaborate triple;
+                      programs = progsFor platform;
+                      folds =
+                        if platform.isWindows
+                        then wantWindowsModule && builtins.length programs > 1
+                        else multicall != null && isEngineHost platform
+                          && builtins.length programs > 1;
+                      # Mirrors declaredAliases / windowsDeclaredAliases. The
+                      # windows branch that reads the flake's own build
+                      # (`unpinEmbedsAliases`) is deliberately left null: forcing a
+                      # derivation attr here would make preflight instantiate the
+                      # cross set.
+                      announced =
+                        if platform.isWindows then
+                          (if multicallCosmo != null
+                           then [ multicallCosmo.program ] ++ (multicallCosmo.aliases or [ ])
+                           else if wantWindowsModule
+                           then nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) programs
+                           else null)
+                        else if multicall == null then null
+                        else nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) programs;
+                    in
+                    {
+                      dispatcher = folds;
+                      programs = map (p: p.name) programs;
+                      announced =
+                        if announced == null then null
+                        else nixpkgs.lib.filter (a: a != binName) announced;
+                    };
+                in
+                {
+                  "linux-x86_64" = entry "x86_64-linux";
+                  "linux-aarch64" = entry "aarch64-linux";
+                  "darwin-aarch64" = entry "aarch64-darwin";
+                  "darwin-x86_64" = entry "x86_64-darwin";
+                  "windows-x86_64" = entry "x86_64-w64-mingw32";
+                };
             };
             inherit unpinRecipe;
           };
