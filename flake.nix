@@ -4272,6 +4272,52 @@ CBODY
             unpinRecipe = builtins.removeAttrs args
               [ "sharedPkgs" "sharedToolchain" "sharedEnginePkgsStatic" "sharedCrossPkgs" ];
             tc = system: if sharedToolchain != null then sharedToolchain else unpinToolchain system;
+            # The signature above throws on an unknown option — it has no `...`.
+            # One level down there was no such promise: every nested set is read
+            # with `x.y or default`, so `keepAutoArchive` is silently `[ ]` and the
+            # build comes out green and wrong. Not hypothetical — nixpkgs retired
+            # `allowBroken` for `problems.handlers` and the dead knob sat in a
+            # recipe until it took the whole darwin matrix with it. Pure eval,
+            # forced on the returned outputs, so it holds for every target.
+            knownOpts = {
+              optimize       = [ "lto" "opt" "ssp" "gc" ];
+              multicall      = [ "programs" "darwinPrograms" "defaultProgram"
+                                 "depArchives" "internalArchives" "keepAutoArchives"
+                                 "inferLinkInputs" "foldSharedArchives"
+                                 "removeReferences" "requires" "runtimeDataRoot"
+                                 "windows" ];
+              multicallCosmo = [ "program" "programObjs" "aliases" "appletArchives"
+                                 "gnulibArchives" "depArchives" "requires" ];
+              requires       = [ "cxx" "group" "frameworks" ];
+              program        = [ "name" "objs" "aliases" "buildDir" "noHelp"
+                                 "supportedTarget" ];
+              runtimeEmbed   = [ "native" "windows" ];
+            };
+            unknownOpts =
+              let
+                chk = what: kn: set:
+                  map (k: "  ${what}.${k} — known: ${nixpkgs.lib.concatStringsSep ", " kn}")
+                    (nixpkgs.lib.subtractLists kn (builtins.attrNames set));
+                progs = what: ps: nixpkgs.lib.concatMap
+                  (p: chk "${what}.programs[\"${p.name or "?"}\"]" knownOpts.program p) ps;
+              in
+              chk "optimize" knownOpts.optimize optimize
+              ++ chk "runtimeEmbed" knownOpts.runtimeEmbed
+                   (if runtimeEmbed == null then { } else runtimeEmbed)
+              ++ nixpkgs.lib.optionals (multicall != null) (
+                   chk "multicall" knownOpts.multicall multicall
+                ++ chk "multicall.requires" knownOpts.requires (multicall.requires or { })
+                ++ progs "multicall" (multicall.programs or [ ]))
+              ++ nixpkgs.lib.optionals (multicallCosmo != null) (
+                   chk "multicallCosmo" knownOpts.multicallCosmo multicallCosmo
+                ++ chk "multicallCosmo.requires" knownOpts.requires
+                     (multicallCosmo.requires or { }));
+            checkOpts = v:
+              if unknownOpts == [ ] then v
+              else throw ''
+                ${name}: unknown option(s) in a nested option set —
+                ${nixpkgs.lib.concatStringsSep "\n" unknownOpts}
+              '';
             runtimeEmbedNative = if runtimeEmbed == null then null else runtimeEmbed.native or null;
             runtimeEmbedWindows = if runtimeEmbed == null then null else runtimeEmbed.windows or null;
             optimize_ = { lto = false; opt = null; ssp = true; gc = true; } // optimize;
@@ -4872,7 +4918,7 @@ CBODY
             crossPkg = attr: fallback:
               stripped (withLLDLink pkgsAttr (sharedCrossPkgs.${attr} or fallback));
           in
-          {
+          checkOpts {
             packages = forAllNative (system:
               let pkgs = nixpkgsFor.${system}; in
               nixpkgs.lib.optionalAttrs (wantsNative system) { default = stripped pkgs; }
