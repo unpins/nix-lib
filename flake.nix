@@ -4865,12 +4865,30 @@ CBODY
             } // nixpkgs.lib.optionalAttrs (binName != name) { compatLinks = [ name ]; }
               // nixpkgs.lib.optionalAttrs (windowsDeclaredAliases != [ ]) { aliases = windowsDeclaredAliases; }
               // (if runtimeEmbedWindows != null then runtimeEmbedWindows windowsPkgs windowsForEmbed else { });
+            # `windowsDeclaredAliases` announces every windowsPrograms name when
+            # `wantWindowsModule`, which is only honest if nix-lib actually folds
+            # them. This cannot fire as written — it restates windowsSelfFold —
+            # and is kept only as a tripwire on that COUPLING: narrow the fold
+            # condition later and the build stops here instead of silently
+            # shipping links that fall through to the default applet. It is NOT
+            # the check that catches a missing dispatcher; nothing in eval can
+            # see that. That one is a smoke that invokes each announced applet.
+            windowsAnnounceOk =
+              !wantWindowsModule || builtins.length windowsPrograms < 2 || windowsSelfFold;
             windowsPkg0 = withMetaPins (
+              if !windowsAnnounceOk then
+                throw ''
+                  ${name}: the windows artifact announces ${toString (builtins.length windowsPrograms)} programs but nothing folds them.
+                ''
               # Un-migrated flake that still embeds in its own windowsBuild keeps the
               # legacy in-build embed + strippedOrJoined (deleted post-migration).
-              if windowsBase.unpinEmbedsMan or false
+              else if windowsBase.unpinEmbedsMan or false
               then strippedOrJoined windowsPkgs name
                 (withCosmoStrip windowsPkgs { primary = binName; } windowsForEmbed)
+              # A multi-program package must ship ONE .exe: fold its single module
+              # through the mega path, which embeds man/aliases itself.
+              else if windowsSelfFold
+              then strippedOrJoined windowsPkgs name windowsSelfFolded
               else unpinEmbedWrap windowsPkgs windowsEmbedOpts windowsForEmbed);
             # The manifest the mega-builder's cosmoMode consumes. The module
             # buckets reference the same built drv's `module` output; external
@@ -4896,6 +4914,59 @@ CBODY
               drv = windowsForEmbed;
               programs = windowsPrograms;
               pkgs = windowsEnginePkgs;
+            };
+            # SELF-FOLD, windows half — symmetric to `selfFold` on the native
+            # side. Without it `multicall.windows = true` only EMITTED a module
+            # for the catalog mega and shipped the raw cross build, so a
+            # multi-program package announced applets nothing dispatched:
+            # measured on bzip2, whose .exe ran bzip2's main under argv[0]
+            # `bzip2recover` and leaked `--unpin-program=` to the applet. It went
+            # unseen because every package migrated so far (file, grep, sed) has
+            # exactly ONE program, where "no dispatcher" and "correct" look alike.
+            windowsSelfFold = wantWindowsModule && builtins.length windowsPrograms > 1;
+            windowsSelfFoldDefault =
+              let
+                declared = multicall.defaultProgram or null;
+                appletNames = map (a: a.name) windowsMulticallManifest.applets;
+                dp = if declared != null then declared else binName;
+              in
+              # Same rule as the native half, deliberately: a windows-only
+              # spelling of "what runs on a bare invocation" would be a second
+              # button for one decision, which is what the naming rule closed.
+              if declared != null && !builtins.elem declared appletNames then
+                throw ''
+                  ${name}: multicall.defaultProgram "${declared}" is not one of its windows programs (${builtins.concatStringsSep ", " appletNames}).
+                ''
+              else if builtins.elem dp appletNames then dp else null;
+            # The mega merge takes ONE manRoot per module, but the windows man
+            # precedence (explicit `winManRoot` wins; else the cross build's own
+            # pages; else the version-locked nixpkgs graft, and only when the
+            # chosen root is empty) is resolved by unpinEmbedWrap in SHELL —
+            # `[ -d share/man ]` is not knowable in eval without IFD. So stage
+            # the identical precedence here instead of guessing a root.
+            windowsSelfFoldMan =
+              let manSrc = "${windowsForEmbed.man or windowsForEmbed}";
+              in
+              if !embedMan then null
+              else windowsPkgs.buildPackages.runCommand "${name}-windows-man" { } ''
+                mkdir -p "$out/share/man"
+                __pick=""
+                ${if winManRoot != null
+                  then ''[ -d "${winManRoot}/share/man" ] && __pick="${winManRoot}"''
+                  else ''[ -d "${manSrc}/share/man" ] && __pick="${manSrc}"''}
+                ${nixpkgs.lib.optionalString (winManGraft != null) ''
+                if [ -d "${winManGraft}/share/man" ] \
+                   && { [ -z "$__pick" ] \
+                        || [ -z "$(find "$__pick/share/man" \( -type f -o -type l \) -print -quit 2>/dev/null)" ]; }; then
+                  __pick="${winManGraft}"
+                fi''}
+                [ -n "$__pick" ] && cp -rL --no-preserve=mode "$__pick/share/man/." "$out/share/man/" || true
+              '';
+            windowsSelfFolded = mkMegaMulticall {
+              pkgs = windowsPkgs.pkgsCross.mingwW64;
+              inherit name;
+              modules = [ (windowsMulticallManifest // { manRoot = windowsSelfFoldMan; }) ];
+              defaultApplet = windowsSelfFoldDefault;
             };
             windowsPkg =
               if wantCosmoModule
