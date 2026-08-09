@@ -16,11 +16,21 @@
 #      - threading.c → `pthread_mutex_*` (winpthreads)
 #      - entropy_poll.c → `BCryptGenRandom` (-lbcrypt)
 #      - x509_crt.c → `inet_pton` for IP SANs (-lws2_32)
+#
+# 4. Drop `-fzero-init-padding-bits=unions`. nixpkgs adds it under
+#    `stdenv.cc.isGNU`, and the engine's cc answers yes to that — but
+#    it is clang, which rejects the flag outright ("unknown argument").
+#    Nothing is lost: the flag mitigates a GCC 15 change to how `{ 0 }`
+#    initializes unions, which is not how clang behaves.
 { lib }:
 self: super:
 super.mbedtls.overrideAttrs (oa: {
   propagatedBuildInputs = (oa.propagatedBuildInputs or [ ]) ++ [ self.windows.pthreads ];
-  cmakeFlags = (oa.cmakeFlags or [ ]) ++ [ "-DMBEDTLS_FATAL_WARNINGS=OFF" ];
+  cmakeFlags =
+    builtins.filter
+      (f: !(lib.hasInfix "-fzero-init-padding-bits" (toString f)))
+      (oa.cmakeFlags or [ ])
+    ++ [ "-DMBEDTLS_FATAL_WARNINGS=OFF" ];
   postInstall = (oa.postInstall or "") + ''
     for pc in $out/lib/pkgconfig/mbedcrypto.pc $out/lib/pkgconfig/mbedtls.pc $out/lib/pkgconfig/mbedx509.pc; do
       [ -f "$pc" ] || continue
