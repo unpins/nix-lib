@@ -452,10 +452,64 @@
             # split local vs /nix/store) — the source the multicall hook reads
             # back for a program's objs/internalArchives. Inputs resolved to
             # absolute paths so the sidecar stays valid in the later postBuild.
+            # Object suffixes the capture shim recognises. CMake targeting Windows
+            # names its objects `.obj`; autotools/meson emit `.o` everywhere. The
+            # shim bails when it counts zero objects, so on a cmake mingw package
+            # it wrote no sidecar at all and the fold died with "no link sidecar"
+            # (srt — and aom/jxl/avif/heif/openjpeg would have followed). Appended
+            # only for windows, so the shell text of every other target's wrapper
+            # — and its drv — stays put.
+            objSuffixes = "*.o|*.lo" + nixpkgs.lib.optionalString isWinTarget "|*.obj";
+            # CMake's Windows-GNU platform passes objects AND libraries through
+            # @response files, so the argv the shim sees carries no object at all:
+            # it wrote no sidecar and the fold died with "no link sidecar" after a
+            # full srt build. Splice the files back into the argument list. Only
+            # for windows — every other target's wrapper text, and drv, stays put.
+            # CMake on Windows-GNU `ar`s a target's own objects into `objects.a` and
+            # links it under --whole-archive. Record those separately: the fold has
+            # to take them WHOLE (as the program's objects), while an ordinary `.a`
+            # keeps archive semantics and yields only referenced members. Recorded
+            # in ADDITION to the normal classification — a second mention of an
+            # archive whose members are already defined pulls nothing — so the
+            # existing lines stay byte-identical and no other target's drv moves.
+            waInit = nixpkgs.lib.optionalString isWinTarget ''; __wa=0; whole=""'';
+            waFlags = nixpkgs.lib.optionalString isWinTarget ''
+                  -Wl,--whole-archive|--whole-archive) __wa=1 ;;
+                  -Wl,--no-whole-archive|--no-whole-archive) __wa=0 ;;
+                  # Any other -Wl option is a LINKER FLAG, never an input, and one
+                  # of them ends in `.a`: CMake's `-Wl,--out-implib,libfoo.dll.a`
+                  # matched the archive arm below and the fold then tried to open
+                  # the flag as a file. Harmless while no sidecar was written.
+                  -Wl,*) ;;'';
+            waRecord = nixpkgs.lib.optionalString isWinTarget ''[ "$__wa" = 1 ] && whole="$whole$p
+              "
+                    '';
+            waEmit = nixpkgs.lib.optionalString isWinTarget ''
+
+                printf '%s' "$whole"  | while IFS= read -r x; do [ -n "$x" ] && echo "WHOLEA $x"; done'';
+            # CMake on Windows-GNU `ar`s the objects into `objects.a` and links THAT
+            # with --whole-archive, so a genuine program link can carry zero objects
+            # on the command line — srt built completely and then died at the fold
+            # with "no link sidecar". A build-tree archive is an equally good signal
+            # there; a store-path one is not, that is an ordinary dependency link.
+            localArchiveCounts =
+              nixpkgs.lib.optionalString isWinTarget ''[ -n "''${locala}" ] || '';
+            rspExpand = nixpkgs.lib.optionalString isWinTarget ''
+
+              set -f
+              set -- $(for a in "$@"; do
+                case "$a" in
+                  @?*)     f=''${a#@};     [ -f "$f" ] && tr -d '"' < "$f" || printf '%s\n' "$a" ;;
+                  -Wl,@?*) f=''${a#-Wl,@}; [ -f "$f" ] && tr -d '"' < "$f" || printf '%s\n' "$a" ;;
+                  *) printf '%s\n' "$a" ;;
+                esac
+              done)
+              set +f
+            '';
             captureScript = ''
               #!/bin/sh
               [ -n "''${UNPIN_LINK_DIR:-}" ] || exit 0
-              mkdir -p "$UNPIN_LINK_DIR" 2>/dev/null || exit 0
+              mkdir -p "$UNPIN_LINK_DIR" 2>/dev/null || exit 0${rspExpand}
               out=""; link=1; prev=""
               for a in "$@"; do
                 case "$prev" in -o) out="$a" ;; esac
@@ -466,8 +520,8 @@
               done
               [ "$link" = 1 ] || exit 0
               [ -n "$out" ] || exit 0
-              case "$out" in *.o|*.lo|*.so|*.so.*|*.os) exit 0 ;; esac
-              nobj=0; objs=""; locala=""; storea=""; ldirs=""; lnames=""; prev=""
+              case "$out" in ${objSuffixes}|*.so|*.so.*|*.os) exit 0 ;; esac
+              nobj=0; objs=""; locala=""; storea=""; ldirs=""; lnames=""; prev=""${waInit}
               for a in "$@"; do
                 # separated forms: -L <dir>, -l <name>
                 case "$prev" in
@@ -476,14 +530,14 @@
                 esac
                 case "$a" in
                   -L?*) ldirs="$ldirs ''${a#-L}" ;;
-                  -l?*) lnames="$lnames ''${a#-l}" ;;
-                  *.o|*.lo)
+                  -l?*) lnames="$lnames ''${a#-l}" ;;${waFlags}
+                  ${objSuffixes})
                     case "$a" in /*) p="$a" ;; *) p="$(pwd)/$a" ;; esac
                     nobj=$((nobj+1)); objs="$objs$p
               " ;;
                   *.a)
                     case "$a" in /*) p="$a" ;; *) p="$(pwd)/$a" ;; esac
-                    case "$p" in
+                    ${waRecord}case "$p" in
                       /nix/store/*) storea="$storea$p
               " ;;
                       *) locala="$locala$p
@@ -514,7 +568,7 @@
                 done
               done
               set +f
-              [ "$nobj" -ge 1 ] || exit 0
+              ${localArchiveCounts}[ "$nobj" -ge 1 ] || exit 0
               # Sidecar is keyed by program name (grep, sed, …); a windows link
               # outputs `<prog>.exe`, so strip `.exe` to keep the name the hook's
               # inferLinkInputs lookup expects (`<prog>.link`, not `<prog>.exe.link`).
@@ -523,7 +577,7 @@
                 echo "CWD $(pwd)"
                 printf '%s' "$objs"   | while IFS= read -r x; do [ -n "$x" ] && echo "OBJ $x"; done
                 printf '%s' "$locala" | while IFS= read -r x; do [ -n "$x" ] && echo "LOCALA $x"; done
-                printf '%s' "$storea" | while IFS= read -r x; do [ -n "$x" ] && echo "STOREA $x"; done
+                printf '%s' "$storea" | while IFS= read -r x; do [ -n "$x" ] && echo "STOREA $x"; done${waEmit}
               } > "$UNPIN_LINK_DIR/$b.link"
               exit 0
             '';
@@ -720,12 +774,28 @@
             # but EXTRA `-l<dll>` libs (bcrypt, ws2_32) are synthesized in-memory
             # from VFS .def files and that synthesis FAILS in the build sandbox
             # ("unable to find library"). nixpkgs' mingw-w64 ships them as real
-            # ABI-neutral import stubs; curate ONLY the extras into a link-path dir
-            # — NOT kernel32/CRT, so the engine's startup objects aren't shadowed.
-            # ONE list: the search dir here and the force-link `-l` line in
-            # ccExtraBuildCommands must name the same set, or a stub sits on the
-            # path and is never pulled — or an `-l` finds nothing.
-            winExtraLibs = [
+            # ABI-neutral import stubs, so they come off disk instead.
+            #
+            # TWO roles, deliberately different sets. The search PATH carries every
+            # stub: a dep names whatever Win32 API it uses on its own link line,
+            # and an omission there is a build failure the package cannot fix
+            # (openssl's apps/openssl.exe wants -lgdi32). The FORCE-LINK line stays
+            # curated — it exists for symbols the fold link cannot otherwise reach.
+            #
+            # Off the path: the CRT/startup archives the engine supplies itself
+            # (msvcr*/ucrt*/mingw32/mingwthrd/moldname/kernel32), which would
+            # shadow its startup objects, and libm.a, which must keep resolving
+            # from the engine's sysroot — a stray mingw libm on a search path is
+            # how CMake's find_library(m) once escaped to the wrong libm. None of
+            # these were reachable before this dir went broad either.
+            #
+            # libmingwex.a STAYS on the path: the engine's mingw libc declares
+            # `strtok_r` but defines nothing (cmocka, via librist, links to
+            # nothing), and mingwex is where mingw-w64 keeps those POSIX fills. A
+            # linker searches an archive only for symbols that are still
+            # undefined, so it can only fill gaps — never displace what the engine
+            # already defines.
+            winForceLibs = [
               "bcrypt" "ws2_32" "userenv" "secur32" "crypt32" "shlwapi"
               # advapi32/user32: static OpenSSL's Windows entropy + UI paths
               # (rtmpdump links it). winmm/ksuser: libao's WMM driver — waveOut*
@@ -735,11 +805,30 @@
               # as a `lib<name>.a` under an explicit `-L`, and these are sysroot
               # import stubs — so the fold link never inherits them.
               "advapi32" "user32" "winmm" "ksuser"
+              # iphlpapi: librist's netcalls (GetAdaptersInfo) — named on its own
+              # meson link line, invisible to the fold, same as the two above.
+              "iphlpapi"
+              # mingwex: mingw-w64's POSIX fills. The engine's libc DECLARES
+              # `strtok_r` and defines nothing (cmocka, under librist, links to
+              # nothing), and being on the search path is not enough — nothing
+              # names it. Force-linking an archive can only supply symbols that
+              # are still undefined, so this fills gaps without displacing
+              # anything the engine defines.
+              "mingwex"
             ];
             winImportLibs = pkgs.runCommand "unpin-win-implibs-${target}" { } ''
               mkdir -p $out/lib
-              for L in ${nixpkgs.lib.concatStringsSep " " winExtraLibs}; do
-                ln -s ${pkgs.windows.mingw_w64}/lib/lib$L.a $out/lib/
+              for f in ${pkgs.windows.mingw_w64}/lib/lib*.a; do
+                case "$(basename "$f")" in
+                  libkernel32.a|libmingw32.a|libmingwthrd.a|libmoldname.a|libmsvcr*|libucrt*|libm.a) continue ;;
+                esac
+                ln -s "$f" $out/lib/
+              done
+              # Every force-linked name must be ON that path: one that isn't turns
+              # into `unable to find library` on EVERY windows link, so fail here
+              # rather than in each package's build.
+              for L in ${nixpkgs.lib.concatStringsSep " " winForceLibs}; do
+                [ -e "$out/lib/lib$L.a" ] || { echo "force-linked lib$L.a is not on the link path"; exit 1; }
               done
             '';
             ccExtraBuildCommands = unprefixAliases
@@ -773,7 +862,7 @@
                 # magic dir from the exe path; the per-package link gets it from
                 # file's own LIBS, but the mega-link only knows depArchives, so add
                 # it here too (no-op for packages that don't reference it).
-                echo "${nixpkgs.lib.concatMapStringsSep " " (l: "-l${l}") winExtraLibs}" >> $out/nix-support/cc-ldflags
+                echo "${nixpkgs.lib.concatMapStringsSep " " (l: "-l${l}") winForceLibs}" >> $out/nix-support/cc-ldflags
               '';
             bintools = staticBuild.wrapBintoolsWith ({
               bintools = bintoolsUnwrapped; libc = null; extraBuildCommands = unprefixAliases;
@@ -2431,6 +2520,11 @@ CBODY
                                     # hand-listed objs/internalArchives
           , stripDllexport ? false  # mingw: strip __declspec(dllexport) before
                                     # internalize (see stripStep) — off elsewhere
+          , wholeArchiveObjs ? false # windows: accept a program whose objects
+                                    # arrive as a build-tree archive linked under
+                                    # --whole-archive (how CMake links on
+                                    # Windows-GNU), taking it whole. Off elsewhere
+                                    # keeps every other target's script identical.
           , foldSharedArchives ? false # multi-program packages whose programs
                                     # share the same private static archives
                                     # (ffmpeg/ffprobe → libav*): fold the shared
@@ -2515,8 +2609,11 @@ CBODY
               __side="$UNPIN_LINK_DIR/${p.name}.link"
               [ -f "$__side" ] || { echo "multicallModuleHookLTO: no link sidecar for ${p.name} ($__side)" >&2; exit 1; }
               __objs=$(awk '$1=="OBJ"{print $2}' "$__side")
-              __arch=$(awk '$1=="LOCALA"{print $2}' "$__side" | awk '!seen[$0]++')
-              [ -n "$__objs" ] || { echo "multicallModuleHookLTO: sidecar for ${p.name} has no objects" >&2; exit 1; }
+              __arch=$(awk '$1=="LOCALA"{print $2}' "$__side" | awk '!seen[$0]++')${
+                nixpkgs.lib.optionalString wholeArchiveObjs ''
+
+              __whole=$(awk '$1=="WHOLEA"{print $2}' "$__side" | awk '!seen[$0]++')''}
+              [ -n "$__objs" ] ${nixpkgs.lib.optionalString wholeArchiveObjs ''|| [ -n "$__whole" ] ''}|| { echo "multicallModuleHookLTO: sidecar for ${p.name} has no objects" >&2; exit 1; }
             '';
             # Fold the program's bitcode objs + trampoline + PRIVATE archives
             # into one module with a REAL linker (ld.lld -r), not llvm-link.
@@ -2536,7 +2633,7 @@ CBODY
                 inferSetup = readSidecar p;
                 linkLine =
                   if infer
-                  then ''${llvm} ld.lld -r $__objs multicall/tramp_${sanCSym p.name}.bc $__arch \
+                  then ''${llvm} ld.lld -r $__objs${nixpkgs.lib.optionalString wholeArchiveObjs " --whole-archive $__whole --no-whole-archive"} multicall/tramp_${sanCSym p.name}.bc $__arch \
                   --lto-emit-llvm -o ${linkBc}''
                   else ''${llvm} ld.lld -r ${spaceSep (p.objs or [ ])} multicall/tramp_${sanCSym p.name}.bc ${spaceSep internalArchives} \
                   --lto-emit-llvm -o ${linkBc}'';
@@ -2548,7 +2645,7 @@ CBODY
                 # classifies inputs by magic and archives the native ones.
                 natCollect =
                   if infer
-                  then ''_unpin_collect "$module/lib/module_native.a" $__objs $__arch''
+                  then ''_unpin_collect "$module/lib/module_native.a" $__objs $__arch${nixpkgs.lib.optionalString wholeArchiveObjs " $__whole"}''
                   else ''_unpin_collect "$module/lib/module_native.a" ${spaceSep (p.objs or [ ])} ${spaceSep internalArchives}'';
                 # Just the program OBJECTS (no archives) — used to decide which
                 # asm-referenced symbols must be kept external (see body). A symbol
@@ -3234,7 +3331,17 @@ CBODY
               "libutil.a" "libcrypt.a" "libxnet.a" "libnsl.a"
             ];
             effectiveSkipArchives =
-              nixpkgs.lib.subtractLists keptAutoArchives libcSplitArchives;
+              nixpkgs.lib.subtractLists keptAutoArchives libcSplitArchives
+              # A PE import lib matches the `*.a` glob too, and linking one puts a
+              # DLL dependency in a binary whose whole point is to be one file:
+              # winpthreads ships libwinpthread.dll.a beside libwinpthread.a, and
+              # the .exe that picked it up did not start on Windows at all — no
+              # output, no message, exit 53. The static twin sits in the same dir
+              # and this same glob finds it. nix-lib already deletes *.dll.a from
+              # the outputs it builds itself; this one rides in on a nixpkgs input
+              # (windows.pthreads), which it does not touch. Windows-only so the
+              # shell text — and every other target's drv — stays put.
+              ++ nixpkgs.lib.optional (pkgs.stdenv.hostPlatform.isWindows or false) "*.dll.a";
             # Shell prelude (shared by both builders) that fills a `autodeps`
             # array from depInputDirs, filtering the libc split archives.
             autoDepsPrelude = ''
@@ -4018,7 +4125,23 @@ CBODY
           pkgsCross = prev.pkgsCross // {
             mingwW64 = prev.pkgsCross.mingwW64.extend (_f: p:
               if p.stdenv.hostPlatform.isMinGW or false
-              then { stdenv = windowsEngineStdenvShared; } else { });
+              then {
+                stdenv = windowsEngineStdenvShared;
+                # winpthreads is built by the windows set's own `crossThreadsStdenv`,
+                # which the swap above does not reach — so it stays a gcc/msvcrt
+                # build. Its libwinpthread.a then calls the msvcrt-era `_setjmp`,
+                # while the engine's CRT resolves setjmp to `__intrinsic_setjmpex`:
+                # the fold link fails outright, and taking the .dll.a instead only
+                # trades that for a DLL the .exe cannot carry. Rebuild it in-scope
+                # so both sides agree on one CRT.
+                #
+                # It has to be overrideScope, not `.override { stdenv = … }` on the
+                # attribute: `windows.*` is SPLICED in a cross set, so an override
+                # there is consumed and then discarded — same drvPath out, silently.
+                windows = p.windows.overrideScope (_wf: _wp: {
+                  crossThreadsStdenv = windowsEngineStdenvShared;
+                });
+              } else { });
           };
         });
 
@@ -4804,6 +4927,10 @@ CBODY
                   # mingw API is __declspec(dllexport); strip so internalize folds
                   # the module to one external (see hook's stripStep).
                   stripDllexport = true;
+                  # CMake links a Windows-GNU target from an `objects.a` of its own
+                  # objects under --whole-archive, so the sidecar carries no OBJ at
+                  # all (srt). Autotools/meson are unaffected — they still list .o.
+                  wholeArchiveObjs = true;
                 }
                 (windowsRawBuild pkgs)
               else windowsRawBuild pkgs;
