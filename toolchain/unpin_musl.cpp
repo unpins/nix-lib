@@ -369,6 +369,23 @@ int runSelf(const std::string &self, const std::vector<std::string> &args) {
   return rc;
 }
 
+// Same, with stdin redirected from a file. Only llvm-ar's MRI mode needs it:
+// `llvm-ar -M` reads its script from stdin and nowhere else.
+int runSelfStdin(const std::string &self, const std::vector<std::string> &args,
+                 const std::string &stdinPath) {
+  std::vector<StringRef> argv;
+  argv.reserve(args.size());
+  for (auto &s : args) argv.push_back(s);
+  std::optional<StringRef> redirects[3] = {StringRef(stdinPath), std::nullopt,
+                                           std::nullopt};
+  std::string err;
+  int rc = sys::ExecuteAndWait(self, argv, /*Env=*/std::nullopt, redirects,
+                               /*SecondsToWait=*/0, /*MemoryLimit=*/0, &err);
+  if (rc != 0 && !err.empty())
+    errs() << "unpin-musl: exec failed: " << err << "\n";
+  return rc;
+}
+
 // Worker count for the internal compile pools (each thread re-execs one clang).
 // Honor NIX_BUILD_CORES (nix's --cores) when set non-zero so the toolchain's
 // parallelism is throttleable from the derivation: without this every sysroot
@@ -1252,17 +1269,34 @@ bool buildMingwArchive(const std::string &self, const std::string &triple,
   return runSelf(self, ar) == 0;
 }
 
-// crt2.o (the exe entry, zig crt2_o) from crt/crtexe.c. x86_64 SEH needs async
-// unwind tables (zig sets unwind_tables=.async for non-x86(32)).
+// The mingw-w64 startup objects, all out of crt/. x86_64 SEH needs async unwind
+// tables (zig sets unwind_tables=.async for non-x86(32)).
+//
+//   crt2.o    crtexe.c              exe entry, calls main      (zig crt2_o)
+//   crt2u.o   crtexe.c -DUNICODE    same, calls wmain          (-municode)
+//   dllcrt2.o crtdll.c              DLL entry, DllMainCRTStartup
+//
+// Only crt2.o used to be built, because only crt2.o is what OUR link path names.
+// That made the other two invisible until something looked them up by name:
+// clang's MinGW driver picks crt2u.o for -municode and dllcrt2.o for -shared,
+// and rustc's bootstrap copies BOTH crt2.o and dllcrt2.o out of
+// `$CC -print-file-name=` (compile.rs, copy_self_contained_objects) and stats the
+// result. These are upstream's names, not ours, so a consumer that bypasses the
+// front still finds what it expects.
 bool buildMingwCrt(const std::string &self, const std::string &triple,
+                   const std::string &src, bool unicode,
                    const std::string &outObj, const Variant &V) {
   std::vector<std::string> args = {"clang"};
   addMingwExtra(args, /*crt=*/true, V);
   args.push_back("-fasynchronous-unwind-tables");
+  if (unicode) {
+    args.push_back("-DUNICODE");
+    args.push_back("-D_UNICODE");
+  }
   args.push_back("-target");
   args.push_back(triple);
   args.push_back("-c");
-  args.push_back(mingwRoot() + "/crt/crtexe.c");
+  args.push_back(mingwRoot() + "/crt/" + src);
   args.push_back("-o");
   args.push_back(outObj);
   return runSelf(self, args) == 0;
@@ -1316,9 +1350,56 @@ bool buildImportLibs(const std::string &self, const std::string &triple,
   return true;
 }
 
+// mingw-w64 ships libmingwex.a and libmsvcrt.a as names of their own; the recipe
+// we follow (zig's) folds mingwex INTO libmingw32.a and spells the C library as
+// the UCRT api-ms-win-crt-* apiset split. Nothing on OUR link path wants either
+// name — but they are upstream's names, and a consumer that writes its own link
+// line uses them. rust's `*-pc-windows-gnullvm` target is exactly that: its
+// late_link_args are `-lmingw32 -lmingwex -lmsvcrt -lkernel32 -luser32`, and
+// those two are the ONLY things in it we could not resolve.
+//
+// Aliases over the content we already built, not stubs: `-nodefaultlibs -lmsvcrt`
+// has to link the C library, not silently nothing.
+//
+//   libmingwex.a  copy of libmingw32.a — a superset. Naming one archive twice on
+//                 a link line costs nothing: the second -l finds every member it
+//                 would have pulled already resolved.
+//   libmsvcrt.a   the api-ms-win-crt-* import libs merged. This is what the name
+//                 means upstream too — mingw-w64's libmsvcrt.a is an alias whose
+//                 target `--with-default-msvcrt=ucrt` points at the UCRT, which
+//                 is the CRT we link. Merge via llvm-ar's MRI `addlib`, not by
+//                 extracting: every member of an import lib carries the SAME name
+//                 (the DLL's), so extraction keeps one of 228 and drops the rest.
+bool buildMingwCompatLibs(const std::string &self, const std::string &libDir,
+                          const std::string &implibDir,
+                          const std::string &scriptPath) {
+  if (sys::fs::copy_file(libDir + "/libmingw32.a", libDir + "/libmingwex.a")) {
+    errs() << "unpin-mingw: libmingwex.a alias failed\n";
+    return false;
+  }
+  std::error_code ec;
+  raw_fd_ostream mri(scriptPath, ec);
+  if (ec) return false;
+  mri << "create " << libDir << "/libmsvcrt.a\n";
+  for (const char *nm : kMingwAlwaysLink) {
+    StringRef name(nm);
+    if (!name.starts_with("api-ms-win-crt-")) continue;
+    std::string lib = implibDir + "/lib" + name.str() + ".a";
+    if (sys::fs::exists(lib)) mri << "addlib " << lib << "\n";
+  }
+  mri << "save\nend\n";
+  mri.close();
+  if (runSelfStdin(self, {"llvm-ar", "-M"}, scriptPath) != 0) {
+    errs() << "unpin-mingw: libmsvcrt.a merge failed\n";
+    return false;
+  }
+  return true;
+}
+
 // Build (or reuse) the per-target Windows sysroot. Same variant-keyed cache as
 // the linux path (<cache>/<triple>/<hash>). Layout: <dir>/lib/{libmingw32.a,
-// crt2.o,libclang_rt.builtins.a}, <dir>/implib/lib*.a, <dir>/bin/{ld.lld,lld}.
+// libmingwex.a,libmsvcrt.a,crt2.o,crt2u.o,dllcrt2.o,libclang_rt.builtins.a},
+// <dir>/implib/lib*.a, <dir>/bin/{ld.lld,lld}.
 std::string ensureWinSysroot(const std::string &triple,
                              const std::string &archTok, const Variant &V) {
   std::string self = selfExe();
@@ -1346,10 +1427,17 @@ std::string ensureWinSysroot(const std::string &triple,
   std::string muslArch = muslArchName(archTok); // x86_64 → x86_64
   bool ok = buildMingwArchive(self, triple, tmp + "/obj",
                               tmp + "/lib/libmingw32.a", V);
-  ok = ok && buildMingwCrt(self, triple, tmp + "/lib/crt2.o", V);
+  ok = ok && buildMingwCrt(self, triple, "crtexe.c", /*unicode=*/false,
+                           tmp + "/lib/crt2.o", V);
+  ok = ok && buildMingwCrt(self, triple, "crtexe.c", /*unicode=*/true,
+                           tmp + "/lib/crt2u.o", V);
+  ok = ok && buildMingwCrt(self, triple, "crtdll.c", /*unicode=*/false,
+                           tmp + "/lib/dllcrt2.o", V);
   ok = ok && buildBuiltins(self, triple, muslArch, tmp + "/obj-rt",
                            tmp + "/lib/libclang_rt.builtins.a", V, /*isWin=*/true);
   ok = ok && buildImportLibs(self, triple, archTok, tmp + "/implib", tmp + "/def");
+  ok = ok && buildMingwCompatLibs(self, tmp + "/lib", tmp + "/implib",
+                                  tmp + "/def/msvcrt.mri");
   if (!ok) {
     errs() << "unpin-mingw: Windows sysroot build FAILED for " << triple << "\n";
     if (lockFd >= 0) ::close(lockFd);
@@ -1543,6 +1631,64 @@ bool isRelocatableLink(ArrayRef<const char *> Args) {
     StringRef a = Args[i];
     if (a == "-r" || a == "--relocatable" || a == "-Wl,-r" ||
         a == "-Wl,--relocatable")
+      return true;
+  }
+  return false;
+}
+
+// A freestanding link. The three spellings are NOT synonyms: -nostartfiles drops
+// the CRT, -nodefaultlibs drops the libraries, -nostdlib drops both. The Windows
+// front injects both halves unconditionally, so it has to read the same flags or
+// the user's request is silently overridden — which is how a `-shared -nostdlib`
+// DLL still got crt2.o, dragging mainCRTStartup in and failing on an undefined
+// WinMain (mcfgthread builds exactly that way).
+bool userNoStartFiles(ArrayRef<const char *> Args) {
+  for (size_t i = 1; i < Args.size(); ++i) {
+    StringRef a = Args[i];
+    if (a == "-nostdlib" || a == "-nostartfiles") return true;
+  }
+  return false;
+}
+bool userNoDefaultLibs(ArrayRef<const char *> Args) {
+  for (size_t i = 1; i < Args.size(); ++i) {
+    StringRef a = Args[i];
+    if (a == "-nostdlib" || a == "-nodefaultlibs") return true;
+  }
+  return false;
+}
+
+// Whether the link line names `-l<lib>` itself.
+bool userLinksLib(ArrayRef<const char *> Args, StringRef lib) {
+  std::string flag = ("-l" + lib).str();
+  for (size_t i = 1; i < Args.size(); ++i)
+    if (StringRef(Args[i]) == flag) return true;
+  return false;
+}
+
+// The startup object clang's own MinGW driver would select.
+StringRef mingwStartupObj(ArrayRef<const char *> Args) {
+  bool shared = false, uni = false;
+  for (size_t i = 1; i < Args.size(); ++i) {
+    StringRef a = Args[i];
+    if (a == "-shared" || a == "--shared") shared = true;
+    else if (a == "-municode") uni = true;
+  }
+  if (shared) return "dllcrt2.o";
+  return uni ? "crt2u.o" : "crt2.o";
+}
+
+// `-print-file-name=`/`-print-search-dirs`: a query rather than a compile, but
+// the answer still has to name a file that EXISTS. Our CRT is materialised on
+// demand and lives nowhere clang searches, so the query falls through to the FHS
+// defaults and clang echoes the bare name back. rustc's bootstrap copies crt2.o
+// and dllcrt2.o out of exactly this query and stats the result, so a wrong answer
+// is a build failure, not a cosmetic one.
+bool isPrintPathQuery(ArrayRef<const char *> Args) {
+  for (size_t i = 1; i < Args.size(); ++i) {
+    StringRef a = Args[i];
+    if (a.starts_with("-print-file-name") ||
+        a.starts_with("--print-file-name") || a == "-print-search-dirs" ||
+        a == "--print-search-dirs")
       return true;
   }
   return false;
@@ -1755,6 +1901,20 @@ void frontRewriteWin(SmallVectorImpl<const char *> &Args, StringSaver &Saver,
   add("-isystem");
   add(winHeaders());
 
+  // Answer a path query against the real, materialised sysroot (see
+  // isPrintPathQuery). -B is what makes clang's GetFilePath look there; the
+  // query costs a sysroot build the first time, which is work the link would
+  // have done anyway.
+  if (isPrintPathQuery(Args)) {
+    Variant PV = parseVariant(Args, ti.triple);
+    std::string pdir = ensureWinSysroot(ti.triple, ti.archTok, PV);
+    if (!pdir.empty()) {
+      add(Twine("-B") + pdir + "/lib");
+      add(Twine("-B") + pdir + "/implib");
+    }
+    return;
+  }
+
   if (!isLinkStep(Args)) return;
 
   Variant V = parseVariant(Args, ti.triple);
@@ -1769,30 +1929,46 @@ void frontRewriteWin(SmallVectorImpl<const char *> &Args, StringSaver &Saver,
   }
 
   std::string muslArch = muslArchName(ti.archTok);
+  // libunwind ships with the C++ runtime, which a C link has no reason to build
+  // — except that rust's unwind crate links `-lunwind` and rustc drives `clang`,
+  // not clang++. Build it when the line asks for it by name; the -L below is
+  // then a search path, NOT a force-link (that stays C++-only).
   std::string cxxLib;
-  if (cxx) cxxLib = ensureCxxRuntime(ti.triple, muslArch, /*headerTriple=*/"", V,
-                                     /*isWin=*/true);
+  if (cxx || userLinksLib(Args, "unwind"))
+    cxxLib = ensureCxxRuntime(ti.triple, muslArch, /*headerTriple=*/"", V,
+                              /*isWin=*/true);
 
-  // Self-contained link: our crt2.o + libmingw32.a + builtins, then the UCRT /
-  // Win32 import libs. -nostdlib suppresses clang's MinGW auto-CRT/default libs;
-  // we supply the full set. The C++ runtime + mingw + builtins are mutually
-  // referential, so one --start-group covers them; the import libs follow
-  // (resolve UCRT/kernel).
+  // Self-contained link: our startup object + libmingw32.a + builtins, then the
+  // UCRT / Win32 import libs. Our own -nostdlib suppresses clang's MinGW
+  // auto-CRT/default libs; we supply the full set. The C++ runtime + mingw +
+  // builtins are mutually referential, so one --start-group covers them; the
+  // import libs follow (resolve UCRT/kernel).
+  //
+  // Each half is skipped when the USER asked for it to be (see userNoStartFiles
+  // / userNoDefaultLibs). The -L paths stay either way: a search path adds
+  // nothing to the link, and it is what lets `-nodefaultlibs -lmingwex` work.
+  // Read the user's flags BEFORE adding ours — `add` appends to this same Args,
+  // and our own -nostdlib would otherwise read back as the user's.
+  bool noStart = userNoStartFiles(Args);
+  bool noLibs = userNoDefaultLibs(Args);
+  StringRef startObj = mingwStartupObj(Args);
   add("-nostdlib");
-  add(Twine(dir) + "/lib/crt2.o");
+  if (!noStart) add(Twine(dir) + "/lib/" + startObj);
   add(Twine("-L") + dir + "/lib");
   add(Twine("-L") + dir + "/implib");
   if (!cxxLib.empty()) add(Twine("-L") + cxxLib);
-  add("-Wl,--start-group");
-  if (!cxxLib.empty()) {
-    add("-lc++");
-    add("-lc++abi");
-    add("-lunwind");
+  if (!noLibs) {
+    add("-Wl,--start-group");
+    if (cxx && !cxxLib.empty()) {
+      add("-lc++");
+      add("-lc++abi");
+      add("-lunwind");
+    }
+    add("-lmingw32");
+    add("-lclang_rt.builtins");
+    add("-Wl,--end-group");
+    for (const char *l : kMingwAlwaysLink) add(Twine("-l") + l);
   }
-  add("-lmingw32");
-  add("-lclang_rt.builtins");
-  add("-Wl,--end-group");
-  for (const char *l : kMingwAlwaysLink) add(Twine("-l") + l);
   add("-fuse-ld=lld");
   add(Twine("-B") + dir + "/bin");
 }

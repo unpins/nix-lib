@@ -9,7 +9,10 @@
 // dirs (gdtoa/misc.c vs winpthreads/misc.c) never collide in the archive.
 //
 // Scope: x86_64-windows-gnu only. mingw32_x86_32_src (i386) and mingw32_arm_src
-// are omitted. dllcrt2/DLL output deferred. C runtime only (C++ = phase 2).
+// are omitted. C runtime only (C++ = phase 2). The startup objects (crt2.o,
+// crt2u.o, dllcrt2.o) are not in these lists — buildMingwCrt compiles them
+// individually out of crt/, since each is its own output rather than an archive
+// member.
 //
 //===----------------------------------------------------------------------===//
 
@@ -68,6 +71,36 @@ static const char *const kMingwGeneric[] = {
     "gdtoa/strtopx.c",
     "gdtoa/sum.c",
     "gdtoa/ulp.c",
+    // Declared unconditionally by math.h/string.h/wchar.h and defined by
+    // nothing: not in libmingw32.a, not exported by any UCRT import lib, and
+    // with no __mingw_ovr inline (unlike fabsf/hypotf/wmemcpy, which the
+    // headers do define). zvbi's io-sim.c is where it surfaced — configure
+    // finds no sincos, declares its own static one, and clang rejects the
+    // static-after-extern. Upstream ships these for x86_64/UCRT as
+    // src_ucrtbase64 + src_libmingwex; zig's list drops them.
+    "math/sincos.c",
+    "math/sincosf.c",
+    "misc/mempcpy.c",
+    "misc/wmempcpy.c",
+    "stdio/strtok_r.c",
+    // Same class, still latent: _FORTIFY_SOURCE and SSP are both off on mingw
+    // today, so nothing emits __*_chk or __stack_chk_fail — but a package that
+    // sets -D_FORTIFY_SOURCE itself would find the builtins lowering to calls
+    // that resolve nowhere. Cheap to carry, and the alternative is another
+    // core rebuild plus another catalog re-hash to add 13 tiny files.
+    "ssp/chk_fail.c",
+    "ssp/gets_chk.c",
+    "ssp/memcpy_chk.c",
+    "ssp/memmove_chk.c",
+    "ssp/mempcpy_chk.c",
+    "ssp/memset_chk.c",
+    "ssp/stack_chk_fail.c",
+    "ssp/stack_chk_guard.c",
+    "ssp/stpcpy_chk.c",
+    "ssp/strcat_chk.c",
+    "ssp/strcpy_chk.c",
+    "ssp/strncat_chk.c",
+    "ssp/strncpy_chk.c",
     "math/coshl.c",
     "math/fpclassify.c",
     "math/fpclassifyf.c",

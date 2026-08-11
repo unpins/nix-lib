@@ -200,9 +200,59 @@
               # routines (and the .def.h / fp_consts.h they include).
               mkdir -p _mw && tar xf ${mingwCrtTar} -C _mw --strip-components=1
               cp -rn _mw/mingw-w64-crt/math/. "$__stage/libc/mingw/math/"
-              rm -rf _mw
+              # zig drops ssp/ whole, plus a few singles the runtime list needs
+              # (sincos/sincosf come in with the math/ fill above).
+              cp -r _mw/mingw-w64-crt/ssp "$__stage/libc/mingw/ssp"
+              for __f in misc/mempcpy.c misc/wmempcpy.c stdio/strtok_r.c; do
+                cp -n "_mw/mingw-w64-crt/$__f" "$__stage/libc/mingw/$__f"
+              done
+              chmod -R u+w "$__stage/libc/mingw"
+              # Every path mingw_sources.inc names must exist here. The list is
+              # baked into the core and the tree ships in this payload, so the
+              # two drift independently — and a name with no file behind it is
+              # a missing symbol at link time in some package, hours away from
+              # the edit that caused it.
+              __smiss=$(sed -n 's/^ *"\([^"]*\.[cS]\)",.*/\1/p' ${./mingw_sources.inc} \
+                          | sort -u | while read -r __s; do
+                              [ -e "$__stage/libc/mingw/$__s" ] || echo "$__s"; done)
+              if [ -n "$__smiss" ]; then
+                echo "embedVfs: mingw_sources.inc names files absent from the tree:" >&2
+                printf '  %s\n' $__smiss >&2
+                exit 1
+              fi
+
               cp -r "${zigLibc}/include/any-windows-any" \
                  "$__stage/libc/include/any-windows-any"
+              # zig prunes the user headers the same way it prunes math/: of
+              # mingw-w64-headers' 1828 include/ files it ships 1418, and the 79
+              # it drops are the whole WinRT surface — windows.foundation.h,
+              # windows.storage.h and friends. glib's gwin32packageparser.c
+              # stops dead on the last one. Seven more (d3dnthal.h, ddrawi.h,
+              # dmemmgr.h, …) are missing from ddk/include's top level, while
+              # its ddk/ subdir is complete. Fill from the same 13.0 release the
+              # math fill above uses, -n so zig always wins.
+              #
+              # HEADERS ONLY. The other 324 files zig drops are the .idl these
+              # were generated FROM: 11 MB of source needing widl, which this
+              # binary does not ship and nothing on the compile path reads.
+              # Measured: the 79 pull in nothing zig doesn't already carry.
+              __hdr="$__stage/libc/include/any-windows-any"
+              chmod -R u+w "$__hdr"
+              for __r in mingw-w64-headers/include mingw-w64-headers/ddk/include; do
+                ( cd "_mw/$__r" && find . -name '*.h' -print0 \
+                    | xargs -0 cp --parents -n -t "$__hdr" )
+              done
+              # The fill is only as good as that layout. A zig or mingw-w64 bump
+              # that moves either root would silently restore the prune.
+              __hmiss=$(cd _mw/mingw-w64-headers/include && find . -name '*.h' \
+                          -printf '%P\n' | while read -r __h; do
+                            [ -e "$__hdr/$__h" ] || echo "$__h"; done)
+              if [ -n "$__hmiss" ]; then
+                echo "embedVfs: mingw user headers still pruned after the fill:" >&2
+                printf '  %s\n' $__hmiss >&2
+                exit 1
+              fi
+              rm -rf _mw
 
               # macOS/darwin: the any-darwin-any user headers (libc/POSIX/Darwin C
               # surface, vendored from Apple's open-source SDK) + the libSystem.tbd
