@@ -116,6 +116,58 @@
             unpinSeedSysrootCache
           '');
 
+        # Windows import stubs force-linked on the FOLD link — and only there.
+        #
+        # These are symbols the fold cannot reach on its own: the mega link knows
+        # the captured objects plus depArchives, never the `-l<dll>` a package
+        # named on its own link line. They used to ride on the toolchain's
+        # cc-ldflags, which put them on EVERY windows link — including autoconf's
+        # probes. That poisons any link-only `AC_CHECK_FUNC` for a socket symbol:
+        # `select` (vorbis-tools) and `inet_ntop` (opus-tools) both resolved out
+        # of ws2_32 and got HAVE_* defined, while the code guarded by that macro
+        # includes <sys/select.h>/<arpa/inet.h> — headers mingw has not got. The
+        # search PATH (`winImportLibs`) stays global; only the force-link moved.
+        winForceLibs = [
+          "bcrypt" "ws2_32" "userenv" "secur32" "crypt32" "shlwapi"
+          # advapi32/user32: static OpenSSL's Windows entropy + UI paths
+          # (rtmpdump links it). winmm/ksuser: libao's WMM driver — waveOut* and
+          # the KSDATAFORMAT_SUBTYPE_* GUIDs ksmedia.h declares extern
+          # (vorbis-tools' ogg123). iphlpapi: librist's netcalls
+          # (GetAdaptersInfo). Each is named on its package's OWN link, but the
+          # capture shim only records a `-l<name>` it can resolve to a
+          # `lib<name>.a` under an explicit `-L`, and these are sysroot import
+          # stubs — so the fold link never inherits them.
+          "advapi32" "user32" "winmm" "ksuser" "iphlpapi"
+          # cfgmgr32: pciutils' win32-cfgmgr32 backend (CM_Get_Device_ID_List_*,
+          # CM_Free_Log_Conf_Handle), named by its lib/configure. ole32: libwebp's
+          # WIC image I/O calls CoInitialize/CoCreateInstance (imageio/wicdec.c,
+          # imageio/image_enc.c). Deliberately NOT windowscodecs/uuid alongside
+          # ole32 — wicdec.c #defines INITGUID, so CLSID_WICImagingFactory and the
+          # GUID_WICPixelFormat* are DEFINED in libwebp's own objects, not
+          # imported (GUID_WICPixelFormatUndefined is in no import lib at all).
+          "cfgmgr32" "ole32"
+          # gdi32/avicap32: ffmpeg's windows-only indevs, each named by ffmpeg's
+          # own configure and so invisible to the capture shim. gdigrab needs the
+          # GDI screen grab (CreateDIBSection/BitBlt/GetDeviceCaps) and the
+          # drawtext filter the font enumeration (EnumFontFamiliesExW,
+          # CreateFontIndirectW, GetTextFaceW); vfwcap needs avicap32's
+          # capCreateCaptureWindowA/capGetDriverDescriptionA. dshow's
+          # OleCreatePropertyFrame comes from oleaut32, which ole32 above does NOT
+          # cover — it is a separate DLL and a separate import lib.
+          "gdi32" "oleaut32" "avicap32"
+        ];
+
+        # mingw-w64's POSIX fills, force-linked on EVERY windows link — the one
+        # archive that has to stay global. The engine's mingw libc DECLARES
+        # `strtok_r` and defines nothing; giflib and cmocka (under librist) call
+        # it, and nothing names mingwex, so the search path alone resolves
+        # nothing. Unlike the DLL import stubs above this is a real static
+        # archive with real mingw headers behind it, so an autoconf probe that
+        # links a symbol out of it is answering honestly — no HAVE_* is set for
+        # a header mingw hasn't got. A linker searches an archive only for
+        # symbols still undefined, so it fills gaps and displaces nothing.
+        winGapLibs = [ "mingwex" ];
+
         # The vendored `unpin-llvm` build, from nix-lib's OWN pinned nixpkgs, so
         # the toolchain's LLVM version is locked together with nix-lib. Lazy.
         # `origPkgs` replicates the gc-sections-overlay scope mkStandaloneFlake's
@@ -688,6 +740,40 @@
               # is a GNU-windres drop-in already in the multicall driver. Inert for
               # non-windows targets (never invoked), so added unconditionally.
               mkt windres llvm-windres
+              ${nixpkgs.lib.optionalString isWinTarget ''
+                # dlltool: builds a PE import library from a .def. mcfgthread's
+                # meson build generates libntdll.a that way, through nixpkgs'
+                # one-line `dlltool` shim, which execs `${target}-dlltool` off
+                # PATH — "command not found" (exit 127) without this. Windows-
+                # gated, unlike windres: llvm-dlltool only makes sense for PE, and
+                # gating keeps the linux/darwin bintools byte-identical.
+                mkt dlltool llvm-dlltool
+                # strings: x264's configure runs its endianness test by grepping
+                # `${target}-strings -a conftest.o` for a marker ("endian test
+                # failed", exit 1, without it). The multicall driver has NO strings
+                # subcommand, so this cannot be an `mkt` shim — and printing the
+                # printable runs of a file is all any configure probe wants, which
+                # is one grep. Every other option real strings takes (offsets,
+                # radix, encodings, --bytes) is refused loudly: a stand-in that
+                # quietly answers a question it did not understand is worse than a
+                # missing tool. Gated with dlltool — nothing off windows has asked
+                # for it, and adding it there re-hashes native and darwin for a
+                # problem they do not have. Before the engine took over the mingw
+                # dep set these packages got the real strings from gcc's bintools.
+                cat > "$out/bin/${target}-strings" <<EOF
+#! ${staticBuild.runtimeShell}
+__f=
+for __a in "\$@"; do
+  case "\$__a" in
+    -a|--all) ;;
+    -*) echo "${target}-strings: unsupported option \$__a" >&2; exit 2 ;;
+    *) __f="\$__f \$__a" ;;
+  esac
+done
+LC_ALL=C exec ${staticBuild.gnugrep}/bin/grep -hoaE '[[:print:]]{4,}' \$__f
+EOF
+                chmod +x "$out/bin/${target}-strings"
+              ''}
               ${nixpkgs.lib.optionalString isDarwinTarget ''
                 # darwin Mach-O bintools. The darwin stdenv's fixup phase post-
                 # processes every .dylib/Mach-O it installs — `install_name_tool`
@@ -776,58 +862,38 @@
             # ("unable to find library"). nixpkgs' mingw-w64 ships them as real
             # ABI-neutral import stubs, so they come off disk instead.
             #
-            # TWO roles, deliberately different sets. The search PATH carries every
-            # stub: a dep names whatever Win32 API it uses on its own link line,
-            # and an omission there is a build failure the package cannot fix
-            # (openssl's apps/openssl.exe wants -lgdi32). The FORCE-LINK line stays
-            # curated — it exists for symbols the fold link cannot otherwise reach.
+            # THREE roles, deliberately different sets. This search PATH carries
+            # every stub: a dep names whatever Win32 API it uses on its own link
+            # line, and an omission there is a build failure the package cannot
+            # fix (openssl's apps/openssl.exe wants -lgdi32). `winGapLibs` is
+            # force-linked here, on every link. `winForceLibs` is force-linked by
+            # the FOLD link alone — see its definition for why it must not be
+            # global.
             #
             # Off the path: the CRT/startup archives the engine supplies itself
             # (msvcr*/ucrt*/mingw32/mingwthrd/moldname/kernel32), which would
-            # shadow its startup objects, and libm.a, which must keep resolving
-            # from the engine's sysroot — a stray mingw libm on a search path is
-            # how CMake's find_library(m) once escaped to the wrong libm. None of
-            # these were reachable before this dir went broad either.
+            # shadow its startup objects. They were not reachable before this dir
+            # went broad either.
             #
-            # libmingwex.a STAYS on the path: the engine's mingw libc declares
-            # `strtok_r` but defines nothing (cmocka, via librist, links to
-            # nothing), and mingwex is where mingw-w64 keeps those POSIX fills. A
-            # linker searches an archive only for symbols that are still
-            # undefined, so it can only fill gaps — never displace what the engine
-            # already defines.
-            winForceLibs = [
-              "bcrypt" "ws2_32" "userenv" "secur32" "crypt32" "shlwapi"
-              # advapi32/user32: static OpenSSL's Windows entropy + UI paths
-              # (rtmpdump links it). winmm/ksuser: libao's WMM driver — waveOut*
-              # and the KSDATAFORMAT_SUBTYPE_* GUIDs ksmedia.h declares extern
-              # (vorbis-tools' ogg123). Both packages name these on their OWN
-              # links, but the capture shim only resolves `-l<name>` it can find
-              # as a `lib<name>.a` under an explicit `-L`, and these are sysroot
-              # import stubs — so the fold link never inherits them.
-              "advapi32" "user32" "winmm" "ksuser"
-              # iphlpapi: librist's netcalls (GetAdaptersInfo) — named on its own
-              # meson link line, invisible to the fold, same as the two above.
-              "iphlpapi"
-              # mingwex: mingw-w64's POSIX fills. The engine's libc DECLARES
-              # `strtok_r` and defines nothing (cmocka, under librist, links to
-              # nothing), and being on the search path is not enough — nothing
-              # names it. Force-linking an archive can only supply symbols that
-              # are still undefined, so this fills gaps without displacing
-              # anything the engine defines.
-              "mingwex"
-            ];
+            # libm.a STAYS: mingw's is a 602-byte archive with one dummy member and
+            # no defined symbols — the math lives in the CRT — and it exists exactly
+            # so `-lm` resolves. Withholding it only broke every package that says
+            # -lm (lua, quickjs). An EMPTY libm is also what the native engine wants
+            # on the CMake side, so nothing here can escape to a foreign libm.
+            #
+            # libmingwex.a STAYS on the path — and is force-linked (winGapLibs).
             winImportLibs = pkgs.runCommand "unpin-win-implibs-${target}" { } ''
               mkdir -p $out/lib
               for f in ${pkgs.windows.mingw_w64}/lib/lib*.a; do
                 case "$(basename "$f")" in
-                  libkernel32.a|libmingw32.a|libmingwthrd.a|libmoldname.a|libmsvcr*|libucrt*|libm.a) continue ;;
+                  libkernel32.a|libmingw32.a|libmingwthrd.a|libmoldname.a|libmsvcr*|libucrt*) continue ;;
                 esac
                 ln -s "$f" $out/lib/
               done
               # Every force-linked name must be ON that path: one that isn't turns
               # into `unable to find library` on EVERY windows link, so fail here
               # rather than in each package's build.
-              for L in ${nixpkgs.lib.concatStringsSep " " winForceLibs}; do
+              for L in ${nixpkgs.lib.concatStringsSep " " (winForceLibs ++ winGapLibs)}; do
                 [ -e "$out/lib/lib$L.a" ] || { echo "force-linked lib$L.a is not on the link path"; exit 1; }
               done
             '';
@@ -846,23 +912,28 @@
                 # add the matching `gcc`/`g++` CC aliases (point at the `clang`/
                 # `clang++` wrapper scripts, which resolve) so such Makefiles find
                 # the engine compiler. Windows-only — linux/cosmo are untouched.
-                ln -sf clang   "$out/bin/gcc"
-                ln -sf clang++ "$out/bin/g++"
-                ln -sf clang   "$out/bin/${target}-gcc"
-                ln -sf clang++ "$out/bin/${target}-g++"
+                # Scripts, not symlinks: clang implements no Ada or Fortran front
+                # end and delegates those sources to `${target}-gcc` — which, as a
+                # symlink back to clang, delegates again. binutils' configure probes
+                # Ada (ACX_PROG_GNAT) and that loop reached 4597 processes / 24 GB.
+                # Refusing is also the honest answer, and configure reads a nonzero
+                # exit as the "no" it was asking for.
+                for pair in gcc:clang g++:clang++ ${target}-gcc:clang ${target}-g++:clang++; do
+                  name=''${pair%%:*}; real=''${pair##*:}
+                  cat > "$out/bin/$name" <<EOF
+#! ${staticBuild.runtimeShell}
+for a in "\$@"; do
+  case "\$a" in
+    *.adb|*.ads|*.f|*.F|*.for|*.FOR|*.f77|*.f90|*.F90|*.f95|*.F95|*.f03|*.F03|*.f08|*.F08)
+      echo "$name: the unpin engine has no Ada or Fortran compiler" >&2; exit 1 ;;
+  esac
+done
+exec "$out/bin/$real" "\$@"
+EOF
+                  chmod +x "$out/bin/$name"
+                done
                 echo "-L${winImportLibs}/lib" >> $out/nix-support/cc-ldflags
-                # Force-link the curated import stubs on EVERY windows link. They
-                # are pulled on demand (an unreferenced import lib adds no code), so
-                # this is a no-op for a package that needs none — but it resolves
-                # symbols the mega-link can't otherwise reach: a folded module.bc
-                # references e.g. BCryptGenRandom, yet the mega buildPhase adds no
-                # `-l<dll>` of its own (per-package builds do, via NIX_LDFLAGS).
-                # cc-ldflags land after the user objects, so static resolution works.
-                # shlwapi: file's libmagic calls PathRemoveFileSpecA to derive the
-                # magic dir from the exe path; the per-package link gets it from
-                # file's own LIBS, but the mega-link only knows depArchives, so add
-                # it here too (no-op for packages that don't reference it).
-                echo "${nixpkgs.lib.concatMapStringsSep " " (l: "-l${l}") winForceLibs}" >> $out/nix-support/cc-ldflags
+                echo "${nixpkgs.lib.concatMapStringsSep " " (l: "-l${l}") winGapLibs}" >> $out/nix-support/cc-ldflags
               '';
             bintools = staticBuild.wrapBintoolsWith ({
               bintools = bintoolsUnwrapped; libc = null; extraBuildCommands = unprefixAliases;
@@ -2520,6 +2591,16 @@ CBODY
                                     # hand-listed objs/internalArchives
           , stripDllexport ? false  # mingw: strip __declspec(dllexport) before
                                     # internalize (see stripStep) — off elsewhere
+          , coffObjs ? false        # windows: the sidecar's OBJ list can name a
+                                    # real COFF object — a compiled resource
+                                    # (pciutils' lspci-rsrc.o), which the ELF
+                                    # `-r` fold rejects outright ("unknown file
+                                    # type") where a mislabelled archive member
+                                    # only warned. Feed the fold a bitcode-only
+                                    # view of OBJ; the COFF ones still reach
+                                    # module_native.a, since _unpin_collect keeps
+                                    # getting the full list. Off elsewhere leaves
+                                    # every other target's script identical.
           , wholeArchiveObjs ? false # windows: accept a program whose objects
                                     # arrive as a build-tree archive linked under
                                     # --whole-archive (how CMake links on
@@ -2612,9 +2693,44 @@ CBODY
               __arch=$(awk '$1=="LOCALA"{print $2}' "$__side" | awk '!seen[$0]++')${
                 nixpkgs.lib.optionalString wholeArchiveObjs ''
 
-              __whole=$(awk '$1=="WHOLEA"{print $2}' "$__side" | awk '!seen[$0]++')''}
+              __whole=$(awk '$1=="WHOLEA"{print $2}' "$__side" | awk '!seen[$0]++')
+              # Take a --whole-archive input apart instead of handing it to the
+              # `-r` link whole. It is the target's own objects, so every BITCODE
+              # member has to ride in — but the same archive also carries members
+              # the ELF `-r` cannot read at all: NASM's COFF objects (libjpeg) and
+              # compiled Windows resources (flac's version.rc.res), which are a
+              # hard "not an ELF file" under --whole-archive where a plain archive
+              # only warned. The bitcode ones join $__objs here; the native ones
+              # reach module_native.a through _unpin_collect, which already gets
+              # $__whole. Magic bytes, not suffixes: `.obj` says nothing about
+              # whether clang emitted bitcode or the assembler emitted COFF.
+              if [ -n "$__whole" ]; then
+                __wd="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-whole/${sanCSym p.name}"
+                rm -rf "$__wd"; __wn=0
+                for __wa in $__whole; do
+                  __wn=$((__wn+1)); mkdir -p "$__wd/$__wn"
+                  ( cd "$__wd/$__wn" && ${llvm} llvm-ar x "$__wa" ) || continue
+                done
+                for __wm in $(find "$__wd" -type f 2>/dev/null); do
+                  [ "$(head -c2 "$__wm" 2>/dev/null)" = BC ] && __objs="$__objs
+              $__wm"
+                done
+              fi''}${
+                nixpkgs.lib.optionalString coffObjs ''
+
+              # Bitcode-only view of OBJ for the `-r` fold (see coffObjs). The
+              # full list still goes to _unpin_collect, so a COFF object is
+              # rescued into module_native.a rather than lost.
+              __objsBc=
+              for __o in $__objs; do
+                if [ "$(_unpin_natkind "$__o")" = bc ]; then __objsBc="$__objsBc
+              $__o"; fi
+              done''}
               [ -n "$__objs" ] ${nixpkgs.lib.optionalString wholeArchiveObjs ''|| [ -n "$__whole" ] ''}|| { echo "multicallModuleHookLTO: sidecar for ${p.name} has no objects" >&2; exit 1; }
             '';
+            # What the `-r` fold reads. Same as $__objs everywhere but windows,
+            # where the COFF members are filtered out above.
+            foldObjs = if coffObjs then "$__objsBc" else "$__objs";
             # Fold the program's bitcode objs + trampoline + PRIVATE archives
             # into one module with a REAL linker (ld.lld -r), not llvm-link.
             # llvm-link has no archive semantics: it whole-loads (duplicate strong
@@ -2633,7 +2749,7 @@ CBODY
                 inferSetup = readSidecar p;
                 linkLine =
                   if infer
-                  then ''${llvm} ld.lld -r $__objs${nixpkgs.lib.optionalString wholeArchiveObjs " --whole-archive $__whole --no-whole-archive"} multicall/tramp_${sanCSym p.name}.bc $__arch \
+                  then ''${llvm} ld.lld -r ${foldObjs} multicall/tramp_${sanCSym p.name}.bc $__arch \
                   --lto-emit-llvm -o ${linkBc}''
                   else ''${llvm} ld.lld -r ${spaceSep (p.objs or [ ])} multicall/tramp_${sanCSym p.name}.bc ${spaceSep internalArchives} \
                   --lto-emit-llvm -o ${linkBc}'';
@@ -2784,10 +2900,16 @@ CBODY
                 infer = inferLinkInputs && (p.objs or null) == null;
                 partial = "multicall/partial_${sanCSym p.name}.bc";
                 readInputs =
-                  if infer then readSidecar p else ''
-                    __objs="${spaceSep (p.objs or [ ])}"
-                    __arch="${spaceSep internalArchives}"
-                  '';
+                  if infer then readSidecar p else
+                    ''
+                      __objs="${spaceSep (p.objs or [ ])}"
+                      __arch="${spaceSep internalArchives}"
+                    ''
+                    # hand-listed objs are never COFF, but foldObjs below reads
+                    # $__objsBc unconditionally once coffObjs is on.
+                    + nixpkgs.lib.optionalString coffObjs ''
+                      __objsBc="$__objs"
+                    '';
               in
               ''
                 printf 'extern int main(int,char**,char**);\nint %s(int c,char**v,char**e){return main(c,v,e);}\n' \
@@ -2795,7 +2917,7 @@ CBODY
                 $CC -flto -O2 -c multicall/tramp_${sanCSym p.name}.c -o multicall/tramp_${sanCSym p.name}.bc
                 ${readInputs}
                 for __a in $__arch; do echo "$__a" >> multicall/union.arch.raw; done
-                ${llvm} ld.lld -r $__objs multicall/tramp_${sanCSym p.name}.bc \
+                ${llvm} ld.lld -r ${foldObjs} multicall/tramp_${sanCSym p.name}.bc \
                   --lto-emit-llvm -o ${partial}
                 ${llvm} opt -passes=internalize -internalize-public-api-list='${entry}' \
                   ${partial} -o multicall/mod_${sanCSym p.name}.bc
@@ -2917,24 +3039,43 @@ CBODY
                 _unpin_split_members "$__bcu" "$__a" bc b
               done
               if [ -f "$__bcu" ]; then ${llvm} llvm-ar s "$__bcu"; else ${llvm} llvm-ar rc "$__bcu"; fi''}
-              ${llvm} ld.lld -r ${modsList} ${nixpkgs.lib.optionalString machoAsm "--whole-archive $__bcu --no-whole-archive "}$__union \
-                --lto-emit-llvm -o multicall/link_all.bc
-              # native SIMD from the shared archives (once)
+              # native SIMD from the shared archives (once). BEFORE the bitcode
+              # fold, because that fold needs to know what the natives reference.
               _unpin_collect "$module/lib/module_native.a" $__union
               if [ -f "$module/lib/module_native.a" ]; then
                 ${llvm} llvm-ar s "$module/lib/module_native.a"
               else
                 ${llvm} llvm-ar rc "$module/lib/module_native.a"
               fi
+              # `ld.lld -r` pulls archive members ON DEMAND, and the only demand it
+              # sees is from bitcode. A bitcode member whose sole consumers are the
+              # NATIVE asm members — libavcodec/x86/constants.c defines ff_pd_1,
+              # ff_pw_* … and every reference to them lives in the .asm objects,
+              # which are rescued to module_native.a and are NOT part of this link —
+              # is therefore never pulled. It ends up defined nowhere, so the
+              # keep-list below cannot see it either, and the mega link fails with
+              # `undefined symbol: ff_pd_1` referenced from module_native.a. Name
+              # the natives' undefined symbols with `-u` so the members that define
+              # them get pulled in. A name nothing in the union defines just stays
+              # undefined, which is what `-r` wants anyway.
+              __upull=
+              if [ -n "$(${llvm} llvm-ar t "$module/lib/module_native.a" 2>/dev/null)" ]; then
+                ${llvm} llvm-nm --undefined-only "$module/lib/module_native.a" 2>/dev/null \
+                  | ${undefScrape} | sort -u > multicall/nat_all.u
+                # if/then, never `[ ] && cmd`: a false test as the loop body's last
+                # command makes the loop exit 1 and `set -e` kills postBuild.
+                while IFS= read -r __s; do
+                  if [ -n "$__s" ]; then __upull="$__upull -u $__s"; fi
+                done < multicall/nat_all.u
+              fi
+              ${llvm} ld.lld -r ${modsList} ${nixpkgs.lib.optionalString machoAsm "--whole-archive $__bcu --no-whole-archive "}$__union \
+                $__upull --lto-emit-llvm -o multicall/link_all.bc
               # keep the per-program entries external; also keep any bitcode symbol
               # a rescued asm object references — the shared archives are folded IN
               # here (not external depArchives), so their asm-referenced defs must
               # survive internalize or they go undefined at the mega native link.
               keeplist='${entriesCsv}'
-              if ${llvm} llvm-ar t "$module/lib/module_native.a" >/dev/null 2>&1 \
-                 && [ -n "$(${llvm} llvm-ar t "$module/lib/module_native.a" 2>/dev/null)" ]; then
-                ${llvm} llvm-nm --undefined-only "$module/lib/module_native.a" 2>/dev/null \
-                  | ${undefScrape} | sort -u > multicall/nat_all.u
+              if [ -s multicall/nat_all.u ]; then
                 ${llvm} llvm-nm --defined-only --extern-only multicall/link_all.bc 2>/dev/null \
                   | ${defScrape} | sort -u > multicall/def_all.d
                 __extra=$(comm -12 multicall/nat_all.u multicall/def_all.d)
@@ -3301,6 +3442,10 @@ CBODY
             # closure surfacing musl's libc.a must not clash with it).
             depInputDirs = nixpkgs.lib.unique
               (nixpkgs.lib.concatMap (m: m.depInputDirs or [ ]) modules);
+            # Capture-sidecar dirs, one per bitcode module (see winSidecarPrelude).
+            # Cosmo manifests carry none.
+            linksDirs = nixpkgs.lib.unique
+              (nixpkgs.lib.filter (x: x != null) (map (m: m.linksDir or null) modules));
             # Union of dead-ref scrub patterns across folded modules (see
             # unpinEmbedWrap's removeReferences). Applied to the mega binary.
             removeReferences = nixpkgs.lib.unique
@@ -3363,6 +3508,54 @@ CBODY
             # target. Derived from the link `pkgs` host platform.
             isWin = pkgs.stdenv.hostPlatform.isWindows or false;
             binFile = if isWin then "${name}.exe" else name;
+            # The import stubs only the fold link can be missing (see winForceLibs).
+            # Last on the line, after every object, so static resolution works.
+            # Empty off windows — it must not add a token, or every native mega
+            # re-hashes.
+            winForceFlags = nixpkgs.lib.optionalString isWin
+              (" " + nixpkgs.lib.concatMapStringsSep " " (l: "-l${l}") winForceLibs);
+            # The rest of the import stubs, recovered from the capture sidecars
+            # instead of hand-listed.
+            #
+            # The shim already writes one STOREA row per store archive a program's
+            # link line named — INCLUDING the sysroot import stubs, because the
+            # cc-wrapper puts `-L<implibs>/lib` in cc-ldflags, so `-ldwrite`
+            # resolves to a real file and gets recorded. The fold then reads OBJ,
+            # LOCALA and WHOLEA out of that sidecar and DROPS the STOREA rows —
+            # which is why `winForceLibs` exists at all: it is a hand-maintained
+            # re-derivation of a list the build already wrote down. Every entry in
+            # it was found by linking, reading `undefined symbol: X` and looking up
+            # which DLL exports X — cairo's AlphaBlend, gio's DnsQuery_UTF8,
+            # pangowin32's DWriteCreateFactory, each one a full rebuild of the
+            # windows chain away, because touching winForceLibs re-hashes the
+            # cc-wrapper through winImportLibs' guard.
+            #
+            # So take them off the sidecar. Only rows under the implib dir: a
+            # STOREA row for a real dep (zlib, harfbuzz) already rides in through
+            # depArchives/autodeps, where the libc-split skip list applies, and
+            # nothing here should bypass that. Import stubs have no such hazard —
+            # they define nothing but thunks, a linker pulls a member only for a
+            # symbol still undefined, and an unreferenced one costs a directory
+            # read.
+            #
+            # `winForceLibs` stays: it is force-linked on the line whether or not
+            # any package named it, which is the belt to this suspenders, and
+            # pruning it would re-hash the whole windows chain to prove a negative.
+            winSidecarPrelude = nixpkgs.lib.optionalString (isWin && linksDirs != [ ]) ''
+              winimplibs=()
+              # if/then, never `[ ] && cmd`: a false test as the loop body's last
+              # command makes the loop exit 1 and `set -e` kills buildPhase.
+              while IFS= read -r a; do
+                if [ -n "$a" ]; then winimplibs+=("$a"); fi
+              done < <(cat ${nixpkgs.lib.concatMapStringsSep " " (d: "${d}/*.link") linksDirs} 2>/dev/null \
+                        | awk '$1=="STOREA" && $2 ~ /-unpin-win-implibs-/ {print $2}' \
+                        | awk '!seen[$0]++')
+              echo "multicall(mega): ''${#winimplibs[@]} import stubs off the capture sidecars"
+            '';
+            # Same gate as the prelude — the flag must never name an array the
+            # prelude did not declare.
+            winSidecarFlags = nixpkgs.lib.optionalString (isWin && linksDirs != [ ])
+              " \"\${winimplibs[@]}\"";
             # darwin (Mach-O) mega: ld64 rejects the GNU flags the ELF/PE path
             # uses — `--start-group`/`--end-group` (ld64 resolves back-refs
             # multi-pass, no group needed) and `-s` (ld64's spelling is `-x`). So
@@ -3426,7 +3619,7 @@ CBODY
                   cxx = anyCxx;
                   lto = anyBitcode;
                 };
-                prelude = "";
+                prelude = winSidecarPrelude;
                 # `bitcodeLibcForce` carries a trailing space and pastes straight
                 # onto `-o` — keep the concatenation exact.
                 linkLine = ''
@@ -3440,7 +3633,7 @@ CBODY
                     multicall/dispatcher.c \
                     ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
                     ${groupOpen} ${nixpkgs.lib.concatStringsSep " " nativeArchives} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose} \
-                    ${darwinFrameworkFlags}
+                    ${darwinFrameworkFlags}${winForceFlags}${winSidecarFlags}
                 '';
                 postLink = "";
                 install = ''
@@ -4076,7 +4269,7 @@ CBODY
         # windows counterpart of the enginePkgsStatic sharing, but free (no
         # injection knob needed; the shared thunk IS the sharing). mkStandaloneFlake
         # just references these instead of rebuilding them inline → byte-identical.
-        windowsPkgsShared =
+        windowsNixpkgs =
           let
             basePkgs = nixpkgs.legacyPackages.${"x86_64-linux"};
             nixpkgsPatched = basePkgs.applyPatches {
@@ -4086,7 +4279,7 @@ CBODY
             };
             cosmoOverlay = import ./cosmo { lib = nixpkgs.lib // lib; };
           in
-          import nixpkgsPatched {
+          extra: import nixpkgsPatched ({
             system = "x86_64-linux";
             overlays = [ cosmoOverlay ];
             config = {
@@ -4105,25 +4298,59 @@ CBODY
                   wiring.stdenv
                 else baseStdenv;
             };
+          } // extra);
+        windowsPkgsShared = windowsNixpkgs { };
+        # The mingw cross set the ENGINE links through. Identical to
+        # `windowsPkgsShared.pkgsCross.mingwW64` — same triple, same `libc`
+        # declaration — except that rust is told the truth about the C toolchain.
+        #
+        # rust is the only consumer that hardcodes a link spec per target, and
+        # `x86_64-pc-windows-gnu`'s is a gcc/msvcrt one: `-lgcc_s -lmsvcrt -lgcc`.
+        # The engine has no libgcc at all (compiler-rt + libunwind), so rustc's own
+        # `std` fails to link, which is where the ffmpeg windows chain stopped.
+        # `*-pc-windows-gnullvm` is the target rust maintains for exactly this
+        # shape (UCRT + clang/lld/compiler-rt/libunwind, tier 2 since 1.79); its
+        # late_link_args are `-lmingw32 -lmingwex -lmsvcrt -lkernel32 -luser32`,
+        # all of which the engine's sysroot resolves.
+        #
+        # `libc` stays "msvcrt" on purpose. It is a declaration nixpkgs uses to
+        # build ITS mingw-w64, not a description of what the engine links (which
+        # is UCRT, and has been all along); changing it here would rebuild the
+        # pristine windows set for no gain. Spelled out rather than taken from
+        # `lib.systems.examples` so the two attrs that matter are visible.
+        windowsGnullvmCross = windowsNixpkgs {
+          crossSystem = {
+            config = "x86_64-w64-mingw32";
+            libc = "msvcrt";
+            rust.rustcTarget = "x86_64-pc-windows-gnullvm";
           };
+        };
         # Engine adapter for the mingw cross host (bitcode). Built from the ORIGINAL
-        # un-swapped mingwW64 so it never sees the overlay below — no recursion.
-        windowsEngineStdenvShared =
-          let mc = windowsPkgsShared.pkgsCross.mingwW64;
+        # un-swapped cross set so it never sees the overlay below — no recursion.
+        windowsEngineStdenvShared = windowsEngineStdenvSharedFor true;
+        # Same stdenv with LTO off, for the deps that must opt out. Mirrors the
+        # `engineStdenv { lto = false; }` door on the pkgsStatic side — see the
+        # x264 pin below for the one case that needs it here.
+        windowsEngineStdenvSharedNoLto = windowsEngineStdenvSharedFor false;
+        windowsEngineStdenvSharedFor = lto:
+          let mc = windowsGnullvmCross;
           in unpinAdapterStdenv {
             pkgs = mc;
             hostPkgs = mc;
             target = mc.stdenv.hostPlatform.config;
             native = false;
             cxx = true;
-            lto = true;
+            inherit lto;
             captureLinks = true;
           };
-        # windowsPkgsShared with the mingw cross stdenv swapped to the engine adapter
-        # (set-level, guarded on isMinGW so the glibc build host is untouched).
+        # windowsPkgsShared with `pkgsCross.mingwW64` replaced by the gnullvm cross
+        # set above, its stdenv swapped to the engine adapter (set-level, guarded on
+        # isMinGW so the glibc build host is untouched). Only the ENGINE windows
+        # scope moves: the non-engine route goes through `mingwStaticCross pkgs`,
+        # i.e. the package's own stock `pkgsCross.mingwW64`, still windows-gnu.
         windowsEnginePkgsShared = windowsPkgsShared.extend (_final: prev: {
           pkgsCross = prev.pkgsCross // {
-            mingwW64 = prev.pkgsCross.mingwW64.extend (_f: p:
+            mingwW64 = windowsGnullvmCross.extend (_f: p:
               if p.stdenv.hostPlatform.isMinGW or false
               then {
                 stdenv = windowsEngineStdenvShared;
@@ -4140,8 +4367,54 @@ CBODY
                 # there is consumed and then discarded — same drvPath out, silently.
                 windows = p.windows.overrideScope (_wf: _wp: {
                   crossThreadsStdenv = windowsEngineStdenvShared;
+                  # mcfgthreads rides on that same crossThreadsStdenv upstream
+                  # (`callPackage ./mcfgthreads { stdenv = self.crossThreadsStdenv; }`),
+                  # but must NOT follow it into the engine: it is gcc's own thread
+                  # runtime (`--enable-threads=mcf`), here only because the mingw gcc
+                  # propagates it, and nothing links it under libc++. Hand it the
+                  # stdenv it had — the override is then bit-identical to upstream,
+                  # so it substitutes instead of building.
+                  #
+                  # This is no longer load-bearing for the LINK: its DLL is built
+                  # `-shared -nostdlib`, which the engine's mingw front used to
+                  # override (appending crt2.o + libmingw32.a regardless, so
+                  # mainCRTStartup dragged in `main` and the link died on an
+                  # undefined WinMain). The front honours -nostdlib now. Kept
+                  # because the reason above stands on its own.
+                  mcfgthreads = _wp.mcfgthreads.override { stdenv = _wp.crossThreadsStdenv; };
                 });
-              } else { });
+              }
+              // nixpkgs.lib.optionalAttrs
+                ((p.stdenv.hostPlatform.isMinGW or false) && p ? x264)
+                # Same pin the pkgsStatic engine scope already carries, for the
+                # same reason and the same symptom: x264's `base.o` forces the
+                # LLVM module flag `override-stack-alignment=64`, which collides
+                # with a bitcode consumer's `i32 16` at the final LTO link (`ld.lld:
+                # error: linking module flags 'override-stack-alignment'`) — hit by
+                # ffmpeg on both sides. LTO buys assembly-dominated x264 nothing.
+                #
+                # Worth noting beyond x264: this scope applies NONE of the other
+                # per-package escapes its pkgsStatic sibling does (libjpeg-turbo's
+                # lto=false, the pkg-config-unwrapped and bash pins). Each is a
+                # latent windows bug, reachable as soon as a windows target links
+                # the dep in question.
+                #
+                # The stdenv handed over must be the STATIC-LIBRARIES one, spelled
+                # exactly as `mingwStaticCross` spells it. That overlay is appended
+                # AFTER this scope and swaps `stdenv` set-wide — which never reaches
+                # an attribute that already pins its own, so a bare
+                # `windowsEngineStdenvSharedNoLto` here silently loses static-ness
+                # and x264 installs `libx264.dll.a` + `-DX264_API_IMPORTS`
+                # ("ERROR: x264 not found using pkg-config").
+                {
+                  x264 = p.x264.override {
+                    stdenv =
+                      let b = p.stdenvAdapters.makeStaticLibraries
+                                windowsEngineStdenvSharedNoLto;
+                      in b // { hostPlatform = b.hostPlatform // { isStatic = true; }; };
+                  };
+                }
+              else { });
           };
         });
 
@@ -4544,6 +4817,10 @@ CBODY
               # sidecar the mega-link adds alongside module.bc. Always present,
               # possibly empty.
               nativeArchive = "${drv.module}/lib/module_native.a";
+              # The capture sidecars themselves. The mega reads the STOREA rows to
+              # recover the Win32 import stubs each program's own link line named
+              # — see winSidecarPrelude.
+              linksDir = "${drv.module}/links";
               # Verbatim store paths: a passthru reference, NOT linked into the
               # shipped binary.
               depArchives = inScope pkgs (multicall.depArchives or [ ]);
@@ -4931,6 +5208,9 @@ CBODY
                   # objects under --whole-archive, so the sidecar carries no OBJ at
                   # all (srt). Autotools/meson are unaffected — they still list .o.
                   wholeArchiveObjs = true;
+                  # A compiled .rc resource lands in OBJ as a real COFF object
+                  # (pciutils' lspci-rsrc.o) — hard error for the ELF `-r` fold.
+                  coffObjs = true;
                 }
                 (windowsRawBuild pkgs)
               else windowsRawBuild pkgs;
@@ -5610,9 +5890,11 @@ CBODY
     in
     {
       lib = lib // { inherit nativeFixes; };
-      # LOCAL DEBUG (uncommitted): expose the darwin-host unpin-llvm toolchain
-      # build so we can validate it assembles/builds on a darwin build host
-      # (the mac→mac engine step). Not part of the committed nix-lib surface.
+      # The toolchain builds themselves, by build host. Consumers reach the
+      # toolchain through `lib.unpinToolchain`, which is lazy and has no attr of
+      # its own — so without these there is no way to build or cache it directly,
+      # only to trip over it inside some package's closure.
       packages.x86_64-darwin.unpin-toolchain = lib.unpinToolchain "x86_64-darwin";
+      packages.x86_64-linux.unpin-toolchain = lib.unpinToolchain "x86_64-linux";
     };
 }
