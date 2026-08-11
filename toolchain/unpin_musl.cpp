@@ -136,12 +136,41 @@ std::string selfExe() {
 #endif
 }
 
+// Where the on-demand libc/sysroot variants live. The caller may hand us a
+// writable dir (`sysrootSeedHook` exports XDG_CACHE_HOME and seeds it from the
+// bake) — but nothing guarantees it, because the compiler is also reached by
+// tools that invoke it as a bare path with whatever environment they happen to
+// have. rustc's bootstrap is one: it runs `$CC -print-file-name=crt2.o` with a
+// path taken from its own config, so no setup hook of ours ever ran.
+//
+// A candidate is only usable if it can be CREATED, not merely named. Inside a
+// Nix sandbox HOME is /homeless-shelter, which is set (so a
+// "fall back when unset" chain never fires) and is not a directory (so every
+// write under it fails). Whether that is fatal is a property of the Nix, not of
+// us — 2.19 leaves the chroot root writable and 2.35 does not, which is exactly
+// the shape of bug that passes on a dev box and fails only in CI. So probe.
+//
+// Order is preference, not correctness: an explicit XDG_CACHE_HOME is the seeded
+// one and reuses the bake; the tail entries are private to the build and cost a
+// rebuild of the variant, which is slow but right. Resolved once — the answer
+// must not differ between two calls in one process.
 std::string cacheBase() {
-  if (const char *x = ::getenv("XDG_CACHE_HOME"); x && x[0])
-    return std::string(x) + "/unpin-llvm";
-  if (const char *h = ::getenv("HOME"); h && h[0])
-    return std::string(h) + "/.cache/unpin-llvm";
-  return "/tmp/unpin-llvm";
+  static const std::string base = [] {
+    std::vector<std::string> cands;
+    if (const char *x = ::getenv("XDG_CACHE_HOME"); x && x[0])
+      cands.push_back(std::string(x) + "/unpin-llvm");
+    if (const char *h = ::getenv("HOME"); h && h[0])
+      cands.push_back(std::string(h) + "/.cache/unpin-llvm");
+    if (const char *t = ::getenv("TMPDIR"); t && t[0])
+      cands.push_back(std::string(t) + "/unpin-llvm");
+    cands.push_back("/tmp/unpin-llvm");
+    for (const std::string &c : cands)
+      if (!sys::fs::create_directories(c) &&
+          !sys::fs::access(c, sys::fs::AccessMode::Write))
+        return c;
+    return cands.back(); // nothing worked; let the caller fail with its own error
+  }();
+  return base;
 }
 
 // A cache-key "manifest", in the spirit of zig's Cache.Manifest: the axes that
