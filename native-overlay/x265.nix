@@ -30,6 +30,15 @@
 pkgs:
 let
   isMinGW = pkgs.stdenv.hostPlatform.isMinGW or false;
+  onEngine = lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
+  # The C++ EH sequence, under the names the toolchain actually ships. gcc's
+  # libgcc/libgcc_eh have no counterpart on the engine — the builtins ride in as
+  # libclang_rt.builtins, which the driver already puts on every link — and
+  # mcfgthread only exists because gcc's libstdc++ on mingw calls `_MCF_*`,
+  # which libc++ never does.
+  pcCxxRuntime =
+    if onEngine then "-lc++ -lc++abi -lunwind -lntdll"
+    else "-lstdc++ -lgcc -lgcc_eh -lmcfgthread -lntdll";
 in
 pkgs.x265.overrideAttrs (oa: {
   # Merge in postInstall, NOT postBuild: the installPhase's `make install`
@@ -90,7 +99,7 @@ pkgs.x265.overrideAttrs (oa: {
     for pc in $out/lib/pkgconfig/x265.pc $dev/lib/pkgconfig/x265.pc; do
       [ -f "$pc" ] || continue
       sed -i \
-        -e 's|^\(Libs.private:\).*|\1 -lstdc++ -lgcc -lgcc_eh -lmcfgthread -lntdll|' \
+        -e 's|^\(Libs.private:\).*|\1 ${pcCxxRuntime}|' \
         "$pc"
     done
   '';
