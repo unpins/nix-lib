@@ -738,7 +738,14 @@
               }
               mkt ar llvm-ar ; mkt ranlib llvm-ranlib ; mkt nm llvm-nm
               mkt strip llvm-strip ; mkt objcopy llvm-objcopy ; mkt objdump llvm-objdump
-              mkt ld ld.lld ; mkt ld.lld ld.lld
+              # ld is NOT a plain `mkt` shim. This is the linker a build reaches
+              # DIRECTLY (kbuild's `$(LD) -r`, the bespoke `ld -r` folds): the
+              # wrapper in front of it appends NIX_LDFLAGS unconditionally, so the
+              # partial link sees flags meant for the final one. `-B`-based lld
+              # wrapping never covers this path — the wrapper execs us by path.
+              cp ${rSafeLd pkgs "${toolchain}/bin/llvm ld.lld"} "$out/bin/${target}-ld"
+              cp ${rSafeLd pkgs "${toolchain}/bin/llvm ld.lld"} "$out/bin/${target}-ld.lld"
+              chmod +x "$out/bin/${target}-ld" "$out/bin/${target}-ld.lld"
               # windres: the Windows resource compiler (.rc → .res COFF). mingw
               # autotools packages (libiconv, …) compile a version-info resource via
               # libtool's `--tag=RC`, which needs `${target}-windres`. llvm-windres
@@ -1156,14 +1163,79 @@ EOF
           && !(h.isMips or false)
           && !(h.isS390 or false);
 
-        # `ld.lld` aborts on a relocatable (`-r`) link carrying `--icf`
-        # ("-r and --icf may not be used together"), but lldStdOpts' `--icf=safe`
-        # reaches every $CC link including the `$CC -r` partial-links some builds
-        # emit (busybox kbuild). `--gc-sections` is -r-safe; only `--icf` is fatal.
-        # So wrap ld.lld to strip `--icf*` on -r/-i links. The wrapper dir
-        # symlinks the rest of lld/bin so it's a drop-in for `-B<dir>`/PATH.
-        # `buildPkgs` must be the recursion-safe build-platform scope (see
-        # withLLDLink).
+        # Flags that only make sense on a FULL link, dropped from a relocatable
+        # (`-r`/`-i`) one. Two classes:
+        #   - ILLEGAL there: `--icf` ("-r and --icf may not be used together"),
+        #     which lldStdOpts puts on every $CC link including the `$CC -r`
+        #     partial-links some builds emit;
+        #   - WRONG there: `--wrap` must rewrite each reference exactly once, at
+        #     the final link; and the dns-fallback block rides NIX_LDFLAGS, which
+        #     the ld wrapper appends to EVERY invocation (its own `relocatable`
+        #     flag gates only the build-id) — so a partial link pulls
+        #     libunpindns.a and whatever libc members the re-stated `-lc` resolves
+        #     into the object. `ld -r` really does extract archive members, GNU ld
+        #     and ld.lld alike. Cost: duplicated libc text per applet, and a hard
+        #     i686 failure once a later objcopy localizes their COMDAT pc-thunks —
+        #     moreutils 568662f worked around exactly this with the raw ld.
+        # The libc re-statement (`-lc`; mingw's `-lws2_32 -lkernel32 -lmsvcrt`)
+        # exists ONLY to follow our archive, so it is dropped only alongside it: a
+        # build that states its own libs on an `-r` keeps them.
+        # POSIX sh, no arrays — both shims below embed it verbatim.
+        rSafeStrip = ''
+          __reloc=0; __dns=0
+          for __a in "$@"; do
+            case "$__a" in
+              -r|--relocatable|-i) __reloc=1 ;;
+              -lunpindns|*libunpindns.a) __dns=1 ;;
+            esac
+          done
+          if [ "$__reloc" = 1 ]; then
+            __n=$#; __skip=0
+            while [ "$__n" -gt 0 ]; do
+              __a=$1; shift; __n=$((__n-1))
+              if [ "$__skip" = 1 ]; then __skip=0; continue; fi
+              case "$__a" in
+                --icf|--icf=*) continue ;;
+                --wrap=*) continue ;;
+                --wrap) __skip=1; continue ;;
+              esac
+              if [ "$__dns" = 1 ]; then
+                case "$__a" in
+                  -lunpindns|-l:libunpindns.a) continue ;;
+                  -lc|-lws2_32|-lkernel32|-lmsvcrt) continue ;;
+                  -L*unpin-dns-fallback*) continue ;;
+                  -force_load)
+                    # darwin: two-token, and only ours — a build's own
+                    # -force_load of something else survives.
+                    if [ "$__n" -gt 0 ]; then
+                      case "$1" in
+                        *libunpindns.a) shift; __n=$((__n-1)); continue ;;
+                      esac
+                    fi
+                    ;;
+                esac
+              fi
+              set -- "$@" "$__a"
+            done
+          fi
+        '';
+
+        # An `ld` that applies rSafeStrip and then execs the real one. `real` is a
+        # command prefix, so it can be a plain path or the toolchain's multicall
+        # (`llvm ld.lld`).
+        rSafeLd = wpkgs: real: wpkgs.writeScript "unpin-ld-rsafe" ''
+          #!/bin/sh
+          ${rSafeStrip}
+          exec ${real} "$@"
+        '';
+
+        # Drop-in `-B<dir>`/PATH replacement for lld/bin: same tools, an -r-safe
+        # `ld.lld`. This covers the driver-found linker (`-fuse-ld=lld` + `-B`);
+        # the `ld` a build invokes DIRECTLY is covered in bintoolsUnwrapped.
+        # gc.nix also puts this in a gc'd package's nativeBuildInputs, but NOT in
+        # the unpin-llvm toolchain's own closure (measured: zero references), so
+        # editing it does not force a toolchain rebuild. `buildPkgs` must be the
+        # recursion-safe build-platform scope (see withLLDLink).
         lldRSafe = buildPkgs:
           buildPkgs.runCommand "lld-rsafe-${buildPkgs.lld.version}" { } ''
             mkdir -p $out/bin
@@ -1171,34 +1243,7 @@ EOF
               ln -s "$f" "$out/bin/$(basename "$f")"
             done
             rm -f $out/bin/ld.lld
-            cat > $out/bin/ld.lld <<'WRAP'
-            #!${buildPkgs.bash}/bin/bash
-            reloc=0
-            for a in "$@"; do
-              case "$a" in -r|--relocatable|-i) reloc=1 ;; esac
-            done
-            if [ "$reloc" = 1 ]; then
-              # Strip flags that are illegal or wrong on a relocatable (`-r`)
-              # partial link: --icf ("-r and --icf may not be used together"),
-              # and --wrap (the DNS-fallback wrap must apply only at the FINAL
-              # full link — applying it on a kbuild partial-link too would
-              # double-rewrite getaddrinfo refs). `--wrap SYM` (two-token) and
-              # `--wrap=SYM` (one-token) both handled.
-              args=()
-              skip=0
-              for a in "$@"; do
-                if [ "$skip" = 1 ]; then skip=0; continue; fi
-                case "$a" in
-                  --icf|--icf=*) ;;
-                  --wrap=*) ;;
-                  --wrap) skip=1 ;;
-                  *) args+=("$a") ;;
-                esac
-              done
-              exec ${buildPkgs.lld}/bin/ld.lld "''${args[@]}"
-            fi
-            exec ${buildPkgs.lld}/bin/ld.lld "$@"
-            WRAP
+            cp ${rSafeLd buildPkgs "${buildPkgs.lld}/bin/ld.lld"} $out/bin/ld.lld
             chmod +x $out/bin/ld.lld
           '';
 
