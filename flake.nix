@@ -155,6 +155,11 @@
           # OleCreatePropertyFrame comes from oleaut32, which ole32 above does NOT
           # cover — it is a separate DLL and a separate import lib.
           "gdi32" "oleaut32" "avicap32"
+          # msimg32: cairo's win32 backend (AlphaBlend in the GDI compositor,
+          # GradientFill in the printing surface). cairo is one of the deps still
+          # built by mingw gcc, so it runs no capture shim and writes no sidecar —
+          # the recovery below can never see it, however its own link line reads.
+          "msimg32"
         ];
 
         # mingw-w64's POSIX fills, force-linked on EVERY windows link — the one
