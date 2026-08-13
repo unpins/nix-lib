@@ -1715,6 +1715,20 @@ EOF
             }))
             "-liconv";
 
+        # The READ half of unpins/unpin-vfs — the core a shipped binary links to
+        # serve its embedded ZIP as a filesystem. Nine packages used to vendor
+        # their own copy of these seven files; they had drifted into three states
+        # (current / lagging / a real fork), so this is the one source they all
+        # point at now. A consumer copies them into its build tree and compiles
+        # with its own -D binding flags (see vfs.h for the knobs) — the variation
+        # between packages is entirely in those flags, never in the source.
+        #
+        # Deliberately NOT merged with ./vfs-pack (the WRITE half), which vendors
+        # four of the same files byte-for-byte: repointing unpinPackTool at this
+        # directory would move its drvPath, and it is a build input to every embed
+        # in the catalog. 400 KB duplicated here keeps that re-hash from happening.
+        vfsCore = ./vfs;
+
         # Build-host-native tool that packs a staging `unpin/` tree into a
         # zstd-in-zip (ZIP method 93) overlay — the format withMan/withAliases use.
         # Shipped binaries decode method 93 with unpin's pure-Rust ruzstd reader
