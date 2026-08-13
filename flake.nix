@@ -810,7 +810,19 @@ EOF
                 # reports it as "Compiler for language c for the build machine not
                 # found" (fribidi's gen.tab needs one). Darwin-gated; ELF/PE
                 # targets keep ld.lld byte-identical.
-                mkt ld ld64.lld ; mkt ld.lld ld64.lld ; mkt ld64.lld ld64.lld
+                # Remove before writing: the `-r` guard above installs `ld` with
+                # `cp` from the store, so the file arrives read-only and a
+                # redirect onto it dies with "Permission denied". Only darwin
+                # re-points ld, so only darwin ever hit it.
+                rm -f "$out/bin/${target}-ld" "$out/bin/${target}-ld.lld"
+                # Same guard as the ELF `ld`, around the Mach-O driver — a plain
+                # shim here would drop it, and `-force_load` (two tokens, darwin
+                # only) is the one rule in rSafeStrip that no other target can
+                # exercise.
+                for n in ld ld.lld ld64.lld; do
+                  cp ${rSafeLd pkgs "${toolchain}/bin/llvm ld64.lld"} "$out/bin/${target}-$n"
+                  chmod +x "$out/bin/${target}-$n"
+                done
               ''}
             '';
             # Wrap from `pkgsStatic.buildPackages`, not `pkgsStatic` directly:
