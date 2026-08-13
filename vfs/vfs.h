@@ -40,11 +40,11 @@
  *                       RENAME (objcopy/IR rewrite) instead of `ld --wrap` --
  *                       the mega-safe binding the bitcode engine uses (tcc).
  *                       Implied on macOS (ld64 has no --wrap).
- *   UNPIN_VFS_DLSYM     macOS: DEFINE the libc entry points here (shadowing the
- *                       libSystem import) and reach the real ones via
- *                       dlsym(RTLD_NEXT, ...), instead of renaming the consumer.
- *                       For a consumer with no IR-rewrite pass to drive
- *                       UNPIN_VFS_NOWRAP (zsh). Linker-global: not mega-safe.
+ *   UNPIN_VFS_DLSYM     DEFINE the libc entry points here (shadowing the libc
+ *                       import) and reach the real ones via dlsym(RTLD_NEXT,
+ *                       ...), instead of renaming the consumer. Used on macOS
+ *                       (zsh), where there is no IR-rewrite pass to drive
+ *                       UNPIN_VFS_NOWRAP. Linker-global: not mega-safe.
  *   UNPIN_VFS_WIN_WRAPOPEN  Windows: `ld --wrap=open` on plain msvcrt open()
  *                       (for a consumer that calls open() directly, e.g. tcc),
  *                       instead of the perl win32_* layer or vim marker mode.

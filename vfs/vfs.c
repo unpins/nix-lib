@@ -619,10 +619,12 @@ static int anon_fd(const unsigned char *data, size_t len) {
 #include <dlfcn.h>
 #include <unistd.h>
 #include <sys/stat.h>
-/* x86_64 carries the $INODE64 ABI suffix on the inode-bearing calls; the SDK
- * headers asm-rename OUR definitions to the matching symbol automatically, so
- * only the dlsym lookups have to spell the suffix. */
-#if defined(__x86_64__)
+/* x86_64 macOS carries the $INODE64 ABI suffix on the inode-bearing calls; the
+ * SDK headers asm-rename OUR definitions to the matching symbol automatically,
+ * so only the dlsym lookups have to spell the suffix. Both halves of the test
+ * matter: no other platform has the suffix, and asking for it there makes every
+ * lookup miss. */
+#if defined(__APPLE__) && defined(__x86_64__)
 #  define UVFS_INO64 "$INODE64"
 #else
 #  define UVFS_INO64 ""

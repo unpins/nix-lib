@@ -1722,6 +1722,10 @@ EOF
         # point at now. A consumer copies them into its build tree and compiles
         # with its own -D binding flags (see vfs.h for the knobs) — the variation
         # between packages is entirely in those flags, never in the source.
+        # Vendored, not an input: a `cp` from unpins/unpin-vfs `src/`, refreshed
+        # by hand. A flake input there would mean nine more locks to bump and the
+        # source path in the input hash; this rides the single lock every package
+        # already bumps.
         #
         # Deliberately NOT merged with ./vfs-pack (the WRITE half), which vendors
         # four of the same files byte-for-byte: repointing unpinPackTool at this
