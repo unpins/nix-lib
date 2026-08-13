@@ -572,9 +572,12 @@ static int write_all(int fd, const unsigned char *data, size_t len) {
 }
 
 /* anon_fd: a fresh anonymous SEEKABLE fd — the PLATFORM axis, independent of the
- * VFS binding below. Linux has a real anonymous kernel fd (memfd); macOS has no
- * memfd, so a temp file unlinked immediately. */
-#if defined(__APPLE__)
+ * VFS binding below. Linux has a real anonymous kernel fd (memfd). macOS has no
+ * memfd, and cosmo has no SYS_memfd_create to call at all, but both emulate
+ * POSIX delete-while-open — so there, a mkstemp'd file unlinked immediately.
+ * (Cosmo takes the rest of the Linux path as-is: `ld --wrap` works, and
+ * /proc/self/exe is polyfilled, though self_open still needs its own branch.) */
+#if defined(__APPLE__) || defined(__COSMOPOLITAN__)
 #include <stdio.h>
 static int anon_fd(const unsigned char *data, size_t len) {
     const char *t = getenv("TMPDIR");
@@ -609,7 +612,7 @@ static int anon_fd(const unsigned char *data, size_t len) {
  *     applet's open: the only binding safe to fold into the unpinbox mega.
  *   --wrap (__wrap_*): a standalone GNU-ld link passes -Wl,--wrap=open,… so
  *     __wrap_* intercept and __real_* are the genuine libc. NOT mega-safe.
- *   dlsym (-DUNPIN_VFS_DLSYM, macOS only): this TU DEFINES the libc entry points
+ *   dlsym (-DUNPIN_VFS_DLSYM): this TU DEFINES the libc entry points
  *     themselves, so a definition in a linked object shadows the libSystem
  *     import for every in-binary reference — no rename pass on the consumer at
  *     all. The genuine entry points come back through dlsym(RTLD_NEXT, …). For a
