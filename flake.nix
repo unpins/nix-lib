@@ -4620,6 +4620,14 @@ CBODY
           # pair with `smokePattern` for a stdout substring match. null skips.
           , smoke ? null
           , smokePattern ? null
+          # Opt OUT of running `smoke` against the windows-x86_64 .exe. For a
+          # binary linked `-mwindows` (PE subsystem 2, GUI): Windows attaches no
+          # console to it, so it can never write the stdout the smoke greps, and
+          # a startup error becomes a modal dialog nobody can dismiss — the CI
+          # step hangs until the job's own limit. Only gvim needs this; a console
+          # (CUI) binary must NOT set it, and action-build rejects the claim if
+          # the shipped .exe turns out not to be GUI after all.
+          , smokeWindows ? true
           # Per-package exception to the darwin portability allow-list: Apple
           # PrivateFramework names (e.g. [ "MediaRemote" ]) the verify step accepts
           # for THIS package, beyond the always-allowed public Frameworks/libSystem/
@@ -5648,6 +5656,8 @@ CBODY
               inherit smoke;
               # Optional grep-E pattern matching the smoke command's stdout+stderr.
               smoke_pattern = smokePattern;
+              # false = the .exe is GUI-subsystem and has no stdout to smoke.
+              smoke_windows = smokeWindows;
               # Per-package darwin portability exception (PrivateFramework names).
               darwin_allow_private_frameworks = darwinAllowPrivateFrameworks;
               # Applets that legitimately never answer `--help`: servers that start
