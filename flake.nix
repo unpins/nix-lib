@@ -640,6 +640,55 @@
             '';
             captureCall = nixpkgs.lib.optionalString captureLinks
               "[ -n \"\\$UNPIN_CAPTURE_LINKS\" ] && \"$out/libexec/unpin-capture\" \"\\$@\"";
+            # The `-r`-safe linker for the ENGINE route — lldRSafe's counterpart.
+            #
+            # Off the engine, a `$CC -r` reaches an r-safe ld.lld through the
+            # `-B${lldRSafe}/bin` that gcSectionsFlag/withLLDLink put in
+            # NIX_CFLAGS_LINK. The engine gets neither: `nixpkgsFor` skips the
+            # gc/lto overlays outright when the engine is on, and withLLDLink's
+            # isLLDTarget gate fails against the adapter stdenv — measured
+            # NIX_CFLAGS_LINK is default `-static -B…lld-rsafe…/bin -fuse-ld=lld
+            # -Wl,--gc-sections -Wl,--icf=safe` vs engine ` -static`. The only
+            # linker selection left is the front's own `-fuse-ld=lld
+            # -B<sysroot>/bin` (unpin_musl.cpp:2069 and its darwin/mingw
+            # siblings), whose ld.lld is a bare symlink to the toolchain that the
+            # driver writes into the sysroot cache at link time. Nothing in that
+            # chain strips a partial link.
+            #
+            # What reaches it is not hypothetical, and it is not lldStdOpts: the
+            # CC wrapper pulls NIX_LDFLAGS up onto the COMPILER line as `-Wl,…`,
+            # so kbuild's `$(CC) -nostdlib -r` for built-in.o arrives carrying
+            # `--wrap=getaddrinfo --wrap=freeaddrinfo -lunpindns -lc` and dies on
+            # "unable to find library -lc" (measured on busybox with dnsFallback
+            # on; NIX_DEBUG=1 shows the cc wrapper's dump and NO ld wrapper at
+            # all — on this route there is no ld wrapper to carry the blame).
+            #
+            # Two measured facts shape the mechanism:
+            #  * `-B` is searched in order and the FIRST match wins, and the front
+            #    appends its own last — so a `-B` here takes the selection with no
+            #    change to the toolchain (which would mean a CI-only rebuild).
+            #  * the name must be the plain one clang looks up. Pointing `-B` at
+            #    bintoolsUnwrapped, whose copies are `${target}-ld.lld`, changed
+            #    nothing: the link still picked the sysroot's ld.lld.
+            #
+            # Linux only, and that is a measurement rather than caution. mingw:
+            # lld's MinGW flavour has no relocatable link at all (`ld.lld -m
+            # i386pep -r` → "unknown argument: -r"). darwin: ld64.lld does take
+            # `-r`, but the one thing that poisons a partial link here is the
+            # dnsFallback block, and that is gated on isLinux (`base = if
+            # dnsFallback && …isLinux`) — while lldStdOpts, the other source,
+            # never reaches an engine link on any target per the paragraph above.
+            # So both would buy a shell hop on every link and guard nothing;
+            # keeping them out leaves the darwin and windows link LINES untouched
+            # (the drv still moves — rSafeStrip sits under every bintools).
+            # Give darwin its face the day dnsFallback reaches it.
+            engineLldRSafe = pkgs.runCommand "unpin-engine-lld-rsafe-${target}" { } ''
+              mkdir -p $out/bin
+              cp ${rSafeLd pkgs "${toolchain}/bin/llvm ld.lld"} $out/bin/ld.lld
+              chmod +x $out/bin/ld.lld
+            '';
+            engineRSafeLdFlag = nixpkgs.lib.optionalString
+              (!isDarwinTarget && !isWinTarget) "-B${engineLldRSafe}/bin ";
             # `version` is what nixpkgs' version-gated cc branches read
             # (`versionAtLeast stdenv.cc.version …`), so it must be the LLVM the
             # wrapper actually execs — take it from the toolchain instead of
@@ -698,7 +747,7 @@
                   set -- "\$@" "\$__a"
                 done
               fi
-              ${uniqNamesProbe}${darwinEnvSetup}exec ${toolchain}/bin/llvm $2 -target ${target}${isoWcharFlag}${darwinStubFlag} "\$@" ${optClass}${winFortifyOff}\$__lto${uniqNamesArg}
+              ${uniqNamesProbe}${darwinEnvSetup}exec ${toolchain}/bin/llvm $2 -target ${target}${isoWcharFlag}${darwinStubFlag} "\$@" ${engineRSafeLdFlag}${optClass}${winFortifyOff}\$__lto${uniqNamesArg}
               EOF
                 chmod +x "$out/bin/$1"
               }
@@ -1094,8 +1143,10 @@ EOF
         appendCFlags = appendDrvFlags "NIX_CFLAGS_COMPILE";
 
         # cc-wrapper LINK-time flags. Unlike NIX_LDFLAGS these reach ONLY
-        # $CC-driven links, never a direct `ld -r`, so --gc-sections/--icf are
-        # safe here.
+        # $CC-driven links, never a direct `ld -r`. That is NOT the same as safe:
+        # `$CC -r` is a $CC-driven link (kbuild spells its partial link
+        # `LD = $(CC) -nostdlib`), so --gc-sections/--icf land on one and rSafeStrip
+        # is what saves them — see there.
         appendLinkFlags = appendDrvFlags "NIX_CFLAGS_LINK";
 
         # Raw `ld` flags. Unlike NIX_CFLAGS_LINK these survive a build that wipes
@@ -1180,10 +1231,31 @@ EOF
         #   - ILLEGAL there: `--icf` ("-r and --icf may not be used together"),
         #     which lldStdOpts puts on every $CC link including the `$CC -r`
         #     partial-links some builds emit;
+        #   - SILENTLY DESTRUCTIVE there: `--gc-sections`, lldStdOpts' other half.
+        #     Unlike --icf it does NOT error — a `-r` has no entry point and no
+        #     roots, so the collection reaches everything and the object comes out
+        #     with zero symbols, rc 0. Measured on one .o defining `f` and `main`
+        #     (`llvm ld.lld -r … -o t.o a.o`, lld 21.1.8, musl x86_64): no flag →
+        #     rc 0, 2 symbols; `--gc-sections` → rc 0, 0 symbols, only debug
+        #     sections left; `--icf=safe` → rc 1, the error above. A `-r` that
+        #     returns 0 proves nothing — count the symbols of the output.
+        #     The drop is unconditional even though a `-r` CARRYING roots is
+        #     meaningful (`-e main` / `-u main` both keep the 2 symbols, measured):
+        #     no build in the catalog spells one, and reading the roots to decide
+        #     buys a second way to be wrong for a case nobody has.
+        #     Every spelling has to be listed twice: lld takes single-dash long
+        #     options, so `-gc-sections` empties the object exactly like
+        #     `--gc-sections` and `-icf=safe` errors exactly like `--icf=safe`
+        #     (measured). `--icf safe` as two tokens is NOT one of them — lld
+        #     rejects it ("unknown argument '--icf'") — so only `--wrap` needs the
+        #     two-token skip below.
         #   - WRONG there: `--wrap` must rewrite each reference exactly once, at
         #     the final link; and the dns-fallback block rides NIX_LDFLAGS, which
-        #     the ld wrapper appends to EVERY invocation (its own `relocatable`
-        #     flag gates only the build-id) — so a partial link pulls
+        #     BOTH wrappers append to every invocation — the ld wrapper directly
+        #     (its own `relocatable` flag gates only the build-id) and the cc
+        #     wrapper by pulling NIX_LDFLAGS up onto the compiler line as `-Wl,…`,
+        #     which is how they reach a `$CC -r` with no ld wrapper in sight — so
+        #     a partial link pulls
         #     libunpindns.a and whatever libc members the re-stated `-lc` resolves
         #     into the object. `ld -r` really does extract archive members, GNU ld
         #     and ld.lld alike. Cost: duplicated libc text per applet, and a hard
@@ -1193,12 +1265,34 @@ EOF
         # exists ONLY to follow our archive, so it is dropped only alongside it: a
         # build that states its own libs on an `-r` keeps them.
         # POSIX sh, no arrays — both shims below embed it verbatim.
+        #
+        # The `@file` clause is the one case this cannot handle. Clang moves the
+        # whole linker argv into a response file once it exceeds ~128 KiB, and
+        # writes it as one line of `"quoted" "tokens"` — `-r` included. The scan
+        # below then sees a single `@…` argument, finds no `-r`, and strips
+        # NOTHING: every flag this exists to remove sails through, `--gc-sections`
+        # in its silent form. Reproduced both halves (500 objects with store-length
+        # paths → clang writes `@/tmp/response-XXXXXX.txt`; `ld.lld @rsp` with `-r
+        # --gc-sections` inside → rc 0, 0 symbols). Parsing that file back would
+        # mean a second implementation of these rules in another language, which is
+        # how the two drift; refusing the link keeps one. Nothing in the catalog
+        # comes near the threshold on a partial link (busybox's biggest is ~100
+        # short relative paths), and this is strictly better than what the case did
+        # before — a silent empty object or a confusing `-lc` failure.
         rSafeStrip = ''
           __reloc=0; __dns=0
           for __a in "$@"; do
             case "$__a" in
-              -r|--relocatable|-i) __reloc=1 ;;
+              -r|-relocatable|--relocatable|-i) __reloc=1 ;;
               -lunpindns|*libunpindns.a) __dns=1 ;;
+              @?*)
+                while IFS= read -r __l; do
+                  case "$__l" in
+                    *'"-r"'*|*'"-relocatable"'*|*'"--relocatable"'*)
+                      echo "unpin ld-rsafe: relocatable link inside a response file ($__a) — the flag strip cannot see it; see rSafeStrip in nix-lib/flake.nix" >&2
+                      exit 1 ;;
+                  esac
+                done < "''${__a#@}" 2>/dev/null || : ;;
             esac
           done
           if [ "$__reloc" = 1 ]; then
@@ -1207,9 +1301,10 @@ EOF
               __a=$1; shift; __n=$((__n-1))
               if [ "$__skip" = 1 ]; then __skip=0; continue; fi
               case "$__a" in
-                --icf|--icf=*) continue ;;
-                --wrap=*) continue ;;
-                --wrap) __skip=1; continue ;;
+                --icf|-icf|--icf=*|-icf=*) continue ;;
+                --gc-sections|-gc-sections) continue ;;
+                --wrap=*|-wrap=*) continue ;;
+                --wrap|-wrap) __skip=1; continue ;;
               esac
               if [ "$__dns" = 1 ]; then
                 case "$__a" in
@@ -1263,8 +1358,10 @@ EOF
         # every channel that adds them (gcSectionsFlag's post-link, gc.nix's two
         # in-build channels, withLLDLink) reads this string. `--icf=all` is NOT
         # used — it breaks function/data-pointer identity and risks codec-table
-        # miscompiles. Valid only on a FULL link, never `ld -r`, where both
-        # --gc-sections and --icf error out; lldRSafe covers the `$CC -r` case.
+        # miscompiles. Valid only on a FULL link, never `ld -r`: there --icf
+        # errors out and --gc-sections empties the object without a word (see
+        # rSafeStrip, which drops both). lldRSafe covers the `$CC -r` case on the
+        # default route, engineLldRSafe on the engine one.
         lldStdOpts = "-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=safe";
         # `-B<lld>/bin` makes the driver find `ld.lld` for `-fuse-ld=lld` without
         # lld on PATH, so appending `${lib.gcSectionsFlag pkgs}` to a post-link is

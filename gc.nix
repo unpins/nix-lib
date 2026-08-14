@@ -44,7 +44,9 @@ let
 
   # Level-1 cover like lto.nix (transitives barely show in the final binary).
   # --gc-sections goes via makeFlagsArray, not NIX_LDFLAGS, which would reach
-  # `ld -r` partial-links where it errors "requires a defined symbol root".
+  # `ld -r` partial-links. It does NOT error there: that message is GNU ld's, and
+  # every linker this reaches is lld, which collects everything and leaves an
+  # object with no symbols and rc 0 (see rSafeStrip in flake.nix, which drops it).
   gcOverlay = self: super:
     let
       isStatic = super.stdenv.hostPlatform.isStatic or false;

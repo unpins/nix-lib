@@ -38,8 +38,9 @@ let
   # link helper progs mid-build, pulling SSP refs from musl's printf chain).
   # The full `-u <sym>` list and `--gc-sections` go via makeFlagsArray at final
   # link instead (see ltoOverlay): NIX_LDFLAGS would also hit `ld -r`
-  # relocatable partial-links (kbuild built-in.o), where --gc-sections errors
-  # "requires a defined symbol root specified by -e or -u".
+  # relocatable partial-links (kbuild built-in.o). Under lld --gc-sections does
+  # not error there the way GNU ld does ("requires a defined symbol root") — it
+  # empties the object and returns 0; rSafeStrip in flake.nix drops it.
   ltoLDFlags = nixpkgs.lib.optionals ssp [ "-u" "__stack_chk_fail" "-u" "__stack_chk_guard" ];
 
   # `${triple}-gcc-ar` (plugin-aware) is PATH-resolved ahead of binutils.
