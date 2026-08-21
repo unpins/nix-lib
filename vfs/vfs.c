@@ -841,9 +841,14 @@ int LSTAT_FN(const char *path, struct stat *st) {
     return REAL_LSTAT(path, st);
 }
 
+/* Existence must be answered the same way as stat(): vfs_find() alone knows
+ * only exact ZIP names, so every virtual directory would exist for stat() and
+ * not for access(). Code that asks both about one path (nmap's nbase) reads
+ * the disagreement as "unreadable". Note the VFS is read-only, so a W_OK probe
+ * still gets 0 here -- pre-existing, unchanged by this. */
 int ACCESS_FN(const char *path, int mode) {
     const char *key = posix_key(path);
-    if (key) return vfs_find(key) >= 0 ? 0 : (errno = ENOENT, -1);
+    if (key) { struct stat st; return vfs_stat_virtual(key, &st) == 0 ? 0 : -1; }
     return REAL_ACCESS(path, mode);
 }
 
