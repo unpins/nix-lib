@@ -2695,7 +2695,9 @@ static void copy_basename(char *dst, size_t cap, const char *src) {
    through one main) is otherwise handed `mdir.exe` and refuses its own name:
    every m* alias on Windows answered "Unknown mtools command 'mdir.exe'" while
    --unpin-program=mdir worked. Edits in place and only ever shortens, so the
-   directory survives for an applet that derives a path from argv[0]. */
+   directory survives — but the string is a NAME now, not a path: with `.exe`
+   cut off it no longer opens. An applet that needs its own image must ask the
+   OS (GetModuleFileName), which is the only reliable answer on Windows anyway. */
 static void strip_argv0_decorations(int argc, char **argv) {
     if (argc <= 0 || !argv[0]) return;
     char *p = argv[0], *s;
@@ -2826,9 +2828,10 @@ CBODY
         # The table a `cppRenameMulticall` spec folds. A pure function of the
         # same spec the fold takes, so a flake can declare what its windows
         # artifact dispatches without instantiating the cross set to ask.
-        cppRenameTable = { primary, programs, aliases ? [ ], ... }:
+        cppRenameTable = { primary, programs, aliases ? [ ], defaultProgram ? null, ... }:
           multicallTable {
             name = primary;
+            inherit defaultProgram;
             applets = (map (p: { inherit (p) name; }) programs)
               ++ (map (a: { inherit (a) name; fn = a.target; }) aliases);
           };
@@ -3492,6 +3495,7 @@ CBODY
           , primary                 # bin/<primary> is the real binary (== package name)
           , programs                # [ { name; buildDir ? makeSubdir; objs = [ "rel/obj.o" … ]; } ]
           , aliases ? [ ]           # [ { name; target; } ]  extra dispatch names (symlink only)
+          , defaultProgram ? null   # what a bare invocation runs; null = the naming rule
           , makeSubdir ? "."        # dir whose Makefile defines $(LINK) + the lib vars
           , linkExtra ? ""          # shared static libs / automake lib vars for the final link
           , extraInstall ? ""       # raw shell appended to installPhase (man pages)
@@ -3525,7 +3529,7 @@ CBODY
             # `mtools` does on the native half. This fold used to pass a
             # hardcoded null instead, and the two halves of the same package
             # disagreed about what their own name means.
-            table = cppRenameTable { inherit primary programs aliases; };
+            table = cppRenameTable { inherit primary programs aliases defaultProgram; };
 
             # Phase A: discover defined globals per program (canonical names,
             # before any recompile) and emit the rename header.
@@ -5473,17 +5477,32 @@ CBODY
             # the cross set — so the flake says it, and says it with the same
             # value, which is why the two cannot drift.
             windowsTable =
-              let t = if multicall == null then null else multicall.windowsTable or null;
-                  dp = if multicall == null then null else multicall.defaultProgram or null;
+              let
+                t = if multicall == null then null else multicall.windowsTable or null;
+                dp = if multicall == null then null else multicall.defaultProgram or null;
+                # The native naming rule (selfFoldDefault), applied to the
+                # bespoke table: a bare invocation runs `defaultProgram`, or the
+                # binary's own name when that name is one of its programs, or it
+                # lists.
+                want =
+                  if t == null then null
+                  else
+                    let r = nixpkgs.lib.findFirst
+                      (a: a.name == (if dp != null then dp else binName)) null t.rows;
+                    in if r == null then null else sanCSym r.fn;
+                shown = a: if a == null then "the listing" else "\"${a}\"";
               in
               # The naming rule has one spelling per package, not one per target:
-              # if a flake overrides what a bare invocation runs, the bespoke
-              # windows fold has to be told too, or the .exe and the native
-              # binary disagree about their own name. Nothing else can catch
-              # this — the two are rendered by different code.
-              if t != null && dp != null && t.defaultApplet != sanCSym dp then
+              # if the two halves disagree about what their own name means, the
+              # .exe and the native binary answer differently to it. Nothing else
+              # can catch this — they are rendered by different code. Both
+              # directions, because the drift is symmetric: a flake that sets
+              # `multicall.defaultProgram` and forgets the table is the case that
+              # first showed up, and a table that sets its own while the flake
+              # sets none is the same bug mirrored.
+              if t != null && t.defaultApplet != want then
                 throw ''
-                  ${name}: multicall.defaultProgram is "${dp}" but multicall.windowsTable defaults to ${if t.defaultApplet == null then "the listing" else "\"${t.defaultApplet}\""}. Pass `defaultProgram = "${dp}";` to the table too.
+                  ${name}: a bare invocation runs ${shown want} natively but ${shown t.defaultApplet} on windows. ${if dp != null then "Pass `defaultProgram = \"${dp}\";` to multicall.windowsTable too." else "Drop `defaultProgram` from multicall.windowsTable, or set multicall.defaultProgram to match it."}
                 ''
               else t;
             # The programs the mingw fold builds — `multicall.programs` filtered
