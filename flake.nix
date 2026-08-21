@@ -2746,6 +2746,93 @@ ${fallbackC}
 CBODY
       } > multicall/dispatcher.c'';
 
+        # ── One applet table, four renderings ────────────────────────────────
+        # A bespoke `windowsBuild` folds a table only its own flake knows, and
+        # used to spell that table once per consumer: the `applets.list` the
+        # generator above reads, the `defaultApplet` argument that decides the
+        # bare invocation, the alias list `withAliases` embeds — and, for want of
+        # anywhere to put it, nothing at all in `applets_by_target`, which is the
+        # only rendering CI gets to read. Three spellings to keep in step, and
+        # the missing fourth switched OFF the check that would have caught them:
+        # a declared `dispatcher = false` tells CI not to mind a binary that
+        # never parses `--unpin-program=`. procps-ng hand-rolled a dispatcher
+        # that never did, and was green for as long as it existed.
+        #
+        # So declare the table once, here, and render it four ways.
+        #
+        #   applets  [ { name; fn ? name; } ] — the WHOLE dispatch table, the
+        #            binary's own name included when it is a program. An alias is
+        #            an extra row at another row's `fn` (zipinfo → unzip); `fn` is
+        #            sanitised to a C identifier the same way everywhere else, so
+        #            `fsck.ext2` reaches `e2fsck_main`.
+        #   name     what the binary is called — not decoration: it is what
+        #            decides the bare invocation. See `defaultApplet`.
+        multicallTable = { name, applets, defaultProgram ? null }:
+          let
+            # `fn` names the PROGRAM behind the row, not its C symbol —
+            # sanitising happens once, at emission, so `programs` below reads as
+            # a person wrote it (`fsck.fat`, not `fsck_fat`) and the error CI
+            # prints names something the flake actually says.
+            rows = map (a: { inherit (a) name; fn = a.fn or a.name; }) applets;
+            names = map (a: a.name) rows;
+            # THE naming rule, in the one place a bespoke fold can reach it: a
+            # bare invocation runs the program the binary is named after, and a
+            # name that is no program (a suite — findutils, e2fsprogs) lists
+            # instead. Same rule as mkStandaloneFlake's selfFoldDefault, and it
+            # has to be the same: one decision, one spelling. mtools is what a
+            # second spelling costs — its native half ran mtools on a bare
+            # invocation while its windows half listed, because the fold that
+            # built the .exe passed a hardcoded null and never asked.
+            dp = if defaultProgram != null then defaultProgram else name;
+            row = nixpkgs.lib.findFirst (a: a.name == dp) null rows;
+          in
+          if defaultProgram != null && row == null then
+            throw ''
+              ${name}: defaultProgram "${defaultProgram}" is not one of its programs (${nixpkgs.lib.concatStringsSep ", " names}).
+            ''
+          else rec {
+            inherit rows;
+            announced = names;
+            # The real programs behind the table; aliases collapse onto theirs.
+            programs = nixpkgs.lib.unique (map (a: a.fn) rows);
+            defaultApplet = if row == null then null else sanCSym row.fn;
+            # The generator's whole shell side, so a caller cannot write the
+            # table and forget the dispatcher, or write one table for each.
+            emit = { windows ? false }: ''
+              mkdir -p multicall
+              printf '${nixpkgs.lib.concatStringsSep "\\n" (map (a: "${a.name}\t${sanCSym a.fn}") rows)}\n' > multicall/applets.list
+            '' + multicallTableDispatcherC { inherit name defaultApplet windows; };
+            # What the flake declares to CI for this target — the same value the
+            # build rendered, so the declaration cannot drift from the binary.
+            # That is the whole reason it lives here and not in the flake.
+            declaration = { dispatcher = true; inherit programs announced; };
+          };
+
+        # The table a `multicall.programs` list implies: a program is a row, each
+        # of its aliases another row at that program. Most bespoke windows folds
+        # dispatch exactly what their native half does, and this is how they say
+        # so with the SAME list rather than a second copy of it. A fold that
+        # ships a subset (usbutils drops usbhid-dump, moreutils drops ifdata)
+        # writes its own `applets` instead — the subset is the point there.
+        multicallTableOf = { name, programs, defaultProgram ? null }:
+          multicallTable {
+            inherit name defaultProgram;
+            applets = nixpkgs.lib.concatMap
+              (p: [ { inherit (p) name; } ]
+                ++ map (a: { name = a; fn = p.name; }) (p.aliases or [ ]))
+              programs;
+          };
+
+        # The table a `cppRenameMulticall` spec folds. A pure function of the
+        # same spec the fold takes, so a flake can declare what its windows
+        # artifact dispatches without instantiating the cross set to ask.
+        cppRenameTable = { primary, programs, aliases ? [ ], ... }:
+          multicallTable {
+            name = primary;
+            applets = (map (p: { inherit (p) name; }) programs)
+              ++ (map (a: { inherit (a) name; fn = a.target; }) aliases);
+          };
+
         # ── Multicall MODULE artifact (the `.a`-generation scheme) ──────────
         # Add a `module` output carrying a self-describing multicall module: the
         # package's code with `main`→`unpin__<pkg>__<prog>_main` and every other
@@ -3432,9 +3519,13 @@ CBODY
             groupClose = if noGroup then "" else "-Wl,--end-group";
             libgcc = if noGroup then "" else "-lgcc";
 
-            appletLines =
-              (map (p: "${p.name}\t${sanCSym p.name}") programs)
-              ++ (map (a: "${a.name}\t${sanCSym a.target}") aliases);
+            # The dispatch table, from the one renderer — see multicallTable.
+            # It carries the naming rule with it: `mtools` is one of its own
+            # programs, so a bare `mtools.exe` runs mtools, exactly as a bare
+            # `mtools` does on the native half. This fold used to pass a
+            # hardcoded null instead, and the two halves of the same package
+            # disagreed about what their own name means.
+            table = cppRenameTable { inherit primary programs aliases; };
 
             # Phase A: discover defined globals per program (canonical names,
             # before any recompile) and emit the rename header.
@@ -3494,13 +3585,6 @@ CBODY
               		${groupOpen} ${linkExtra} $(LIBS) ${libgcc} ${groupClose}
             '';
 
-            # Every dispatch name the binary answers to, its own included — the
-            # dispatcher's whole table, and exactly what the payload announces.
-            # Subtracting the primary is the installer's job, not the builder's:
-            # only `unpin install` knows which name the binary itself took, and
-            # it drops that one (install/linker.rs). One list, one renderer.
-            announcedNames = (map (p: p.name) programs) ++ (map (a: a.name) aliases);
-
             multicall = basePkg.overrideAttrs (old: {
               pname = "${old.pname or "pkg"}-multi";
               doCheck = false;
@@ -3516,8 +3600,7 @@ CBODY
                 # Phase B: recompile + isolate
                 ${nixpkgs.lib.concatMapStringsSep "\n" rebuild programs}
 
-                printf '${nixpkgs.lib.concatStringsSep "\\n" appletLines}\n' > multicall/applets.list
-              ${multicallTableDispatcherC { name = primary; defaultApplet = null; windows = isWindows; }}
+              ${table.emit { windows = isWindows; }}
                 $CC -O2 -c -o multicall/dispatcher.o multicall/dispatcher.c
 
                 install -m644 ${multicallMk} ${makeSubdir}/unpin-multicall.mk
@@ -3537,7 +3620,7 @@ CBODY
               '';
             });
           in
-          withAliases pkgs { primary = outName; aliases = announcedNames; } multicall;
+          withAliases pkgs { primary = outName; aliases = table.announced; } multicall;
 
         # The external static archives a multicall build links, derived from the
         # build drv rather than hand-named. Walks the transitive propagated-input
@@ -4887,7 +4970,7 @@ CBODY
                                  "depArchives" "internalArchives" "keepAutoArchives"
                                  "inferLinkInputs" "foldSharedArchives"
                                  "removeReferences" "requires" "runtimeDataRoot"
-                                 "windows" ];
+                                 "windows" "windowsTable" ];
               multicallCosmo = [ "program" "programObjs" "aliases" "appletArchives"
                                  "gnulibArchives" "depArchives" "requires" ];
               requires       = [ "cxx" "group" "frameworks" ];
@@ -5374,6 +5457,26 @@ CBODY
             # heavy engine-swapped set is the shared thunk. Byte-identical.
             windowsEnginePkgs =
               if !wantWindowsModule then windowsPkgs else windowsEnginePkgsShared;
+            # What a BESPOKE `windowsBuild` folds, declared by the flake from the
+            # very `lib.multicallTable` its generator renders the dispatcher
+            # from. Nothing in eval can look inside that build to find out —
+            # forcing a derivation attr here would make preflight instantiate
+            # the cross set — so the flake says it, and says it with the same
+            # value, which is why the two cannot drift.
+            windowsTable =
+              let t = if multicall == null then null else multicall.windowsTable or null;
+                  dp = if multicall == null then null else multicall.defaultProgram or null;
+              in
+              # The naming rule has one spelling per package, not one per target:
+              # if a flake overrides what a bare invocation runs, the bespoke
+              # windows fold has to be told too, or the .exe and the native
+              # binary disagree about their own name. Nothing else can catch
+              # this — the two are rendered by different code.
+              if t != null && dp != null && t.defaultApplet != sanCSym dp then
+                throw ''
+                  ${name}: multicall.defaultProgram is "${dp}" but multicall.windowsTable defaults to ${if t.defaultApplet == null then "the listing" else "\"${t.defaultApplet}\""}. Pass `defaultProgram = "${dp}";` to the table too.
+                ''
+              else t;
             # The programs the mingw fold builds — `multicall.programs` filtered
             # against the PE host, not the native one `mcPrograms` uses.
             windowsPrograms = supportedOn
@@ -5799,7 +5902,8 @@ CBODY
               #     argv[0] self-dispatch (bunzip2/bzcat are bzip2).
               #   announced — exactly what nix-lib packs as `unpin/aliases`, or
               #     null where the wrap harvests the build's own symlinks instead
-              #     and nix-lib does not know the set.
+              #     and nix-lib does not know the set. A bespoke windowsBuild
+              #     does know it, and declares it: `multicall.windowsTable`.
               #
               # Keyed `<os>-<arch>` to match build.yml's matrix. A target absent
               # here (every cross but windows) is simply not swept.
@@ -5821,11 +5925,7 @@ CBODY
                         then wantWindowsModule && builtins.length programs > 1
                         else multicall != null && isEngineHost platform
                           && builtins.length programs > 1;
-                      # Mirrors declaredAliases / windowsDeclaredAliases. The
-                      # windows branch that reads the flake's own build
-                      # (`unpinEmbedsAliases`) is deliberately left null: forcing a
-                      # derivation attr here would make preflight instantiate the
-                      # cross set.
+                      # Mirrors declaredAliases / windowsDeclaredAliases.
                       announced =
                         if platform.isWindows then
                           (if multicallCosmo != null
@@ -5836,7 +5936,16 @@ CBODY
                         else if multicall == null then null
                         else nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) programs;
                     in
-                    {
+                    # A bespoke windowsBuild's own table wins here, and it is the
+                    # whole entry rather than a patch on one: its programs are not
+                    # `multicall.programs` either (usbutils folds lsusb alone, and
+                    # a declaration of two would name an applet the .exe hasn't
+                    # got). This used to fall through to `dispatcher = false`,
+                    # which reads as "nothing to check" and switched off the ONE
+                    # check that sees a missing dispatcher — the negative control.
+                    if platform.isWindows && windowsTable != null
+                    then windowsTable.declaration
+                    else {
                       dispatcher = folds;
                       programs = map (p: p.name) programs;
                       inherit announced;
