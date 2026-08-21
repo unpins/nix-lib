@@ -2157,8 +2157,15 @@ EOF
 
               postInstall = (old.postInstall or "")
                 + nixpkgs.lib.optionalString hasAuto ''
-                # Harvest every multi-call symlink (skipping the primary, which
-                # is the real binary). No name filtering here: alias policy —
+                # Harvest every multi-call symlink. The primary is skipped for
+                # want of a source, not by rule: it is the real binary, so no
+                # symlink carries its name and the harvest cannot see whether it
+                # is also an applet. Every path that KNOWS the table announces it
+                # (declaredAliases, mkMegaMulticall, cppRenameMulticall); the
+                # harvest's users are suites whose container name is no applet
+                # (procps-ng, perl), where the two agree anyway.
+                #
+                # No name filtering here: alias policy —
                 # charset/length rules, Windows-reserved names, blocklist, the
                 # catalog-owner gate, the MAX_ALIASES cap — lives solely in
                 # unpin and runs at install time (`validate_alias` in
@@ -3487,17 +3494,12 @@ CBODY
               		${groupOpen} ${linkExtra} $(LIBS) ${libgcc} ${groupClose}
             '';
 
-            # Every dispatch name the binary answers to EXCEPT its own: on native
-            # these become the in-store symlinks withAliases harvests, on windows
-            # the alias list it embeds directly. The primary is dropped because it
-            # IS the binary — announcing it makes `unpin install` resolve the alias
-            # to the slot the primary just took and report "`<name>` is provided by
-            # more than one binary in this package", which is false. mtools is the
-            # one package where that can bite (its canonical name is also an
-            # applet); the harvest path and mkMegaMulticall both filter it too.
-            binSymlinks =
-              (map (p: p.name) (nixpkgs.lib.filter (p: p.name != primary) programs))
-              ++ (map (a: a.name) aliases);
+            # Every dispatch name the binary answers to, its own included — the
+            # dispatcher's whole table, and exactly what the payload announces.
+            # Subtracting the primary is the installer's job, not the builder's:
+            # only `unpin install` knows which name the binary itself took, and
+            # it drops that one (install/linker.rs). One list, one renderer.
+            announcedNames = (map (p: p.name) programs) ++ (map (a: a.name) aliases);
 
             multicall = basePkg.overrideAttrs (old: {
               pname = "${old.pname or "pkg"}-multi";
@@ -3526,8 +3528,6 @@ CBODY
                 runHook preInstall
                 mkdir -p "$out/bin"
                 install -m755 "multicall/${primary}" "$out/bin/${installName}"
-                ${nixpkgs.lib.optionalString (!isWin)
-                    (nixpkgs.lib.concatMapStringsSep "\n      " (n: ''ln -s "${primary}" "$out/bin/${n}"'') binSymlinks)}
                 ${extraInstall}
                 runHook postInstall
               '';
@@ -3537,12 +3537,7 @@ CBODY
               '';
             });
           in
-          withAliases pkgs
-            ({ primary = outName; }
-             // (if isWin
-                 then { aliases = binSymlinks; }
-                 else { aliasesFromSymlinksIn = "bin"; }))
-            multicall;
+          withAliases pkgs { primary = outName; aliases = announcedNames; } multicall;
 
         # The external static archives a multicall build links, derived from the
         # build drv rather than hand-named. Walks the transitive propagated-input
@@ -3935,9 +3930,9 @@ CBODY
           in
           unpinEmbedWrap pkgs {
             primary = name;
-            # Load-bearing filter for the N=1 self-fold whose package name is itself
-            # an applet (flac+metaflac → binary `flac`, alias `metaflac`).
-            aliases = nixpkgs.lib.filter (n: n != name) names;
+            # The whole table, the binary's own name included — `unpin install`
+            # is what drops the name that collides with the binary itself.
+            aliases = names;
             man = combinedMan != null;
             manRoot = combinedMan;
             inherit removeReferences;
@@ -5257,8 +5252,8 @@ CBODY
                 # harvest embeds, but stdbuf works by LD_PRELOADing libstdbuf.so
                 # and cannot function in a static single binary — `programs` omits
                 # it deliberately.
-                declaredAliases = nixpkgs.lib.filter (a: a != binName)
-                  (nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) mcPrograms);
+                declaredAliases =
+                  nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) mcPrograms;
                 nativeEmbedOpts = { primary = binName; man = embedMan; removeReferences = removeReferences ++ (if multicall == null then [ ] else multicall.removeReferences or [ ]); }
                   // nixpkgs.lib.optionalAttrs (binName != name) { compatLinks = [ name ]; }
                   // nixpkgs.lib.optionalAttrs (declaredAliases != [ ]) { aliases = declaredAliases; }
@@ -5465,7 +5460,7 @@ CBODY
                 then nixpkgs.lib.concatMap (p: p.aliases or [ ])
                   (nixpkgs.lib.filter (p: p.name == binName) multicall.programs)
                 else [ ];
-              in nixpkgs.lib.filter (a: a != binName) names;
+              in names;
             # Windows embed defaults; a VFS flake's `runtimeEmbed.windows` overrides
             # (manRoot graft, runtimeStage, explicit aliases). The cross build ships
             # no man, so the man source is `winManRoot` (explicit) or the
@@ -5844,9 +5839,7 @@ CBODY
                     {
                       dispatcher = folds;
                       programs = map (p: p.name) programs;
-                      announced =
-                        if announced == null then null
-                        else nixpkgs.lib.filter (a: a != binName) announced;
+                      inherit announced;
                     };
                 in
                 {
