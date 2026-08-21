@@ -3976,8 +3976,8 @@ CBODY
               + nixpkgs.lib.concatStringsSep ", " dups
               + " — pass nameOverrides to rename");
           # ONE post-build embed over the linked mega (unpinEmbedWrap, the same
-          # primitive every shipped binary uses). aliases = every applet name except
-          # the primary (which IS the binary). Man MERGE: per-package man embeds into
+          # primitive every shipped binary uses). aliases = the whole applet table,
+          # the binary's own name included. Man MERGE: per-package man embeds into
           # each tool's OWN binary, which the mega never ships, so re-stage every
           # folded package's share/man into one tree and embed once over the mega.
           # Same for RUNTIME DATA (file's magic.mgc). The mega binary is already
@@ -5335,8 +5335,7 @@ CBODY
                 # harvest embeds, but stdbuf works by LD_PRELOADing libstdbuf.so
                 # and cannot function in a static single binary — `programs` omits
                 # it deliberately.
-                declaredAliases =
-                  nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) mcPrograms;
+                declaredAliases = announcedNamesOf mcPrograms;
                 nativeEmbedOpts = { primary = binName; man = embedMan; removeReferences = removeReferences ++ (if multicall == null then [ ] else multicall.removeReferences or [ ]); }
                   // nixpkgs.lib.optionalAttrs (binName != name) { compatLinks = [ name ]; }
                   // nixpkgs.lib.optionalAttrs (declaredAliases != [ ]) { aliases = declaredAliases; }
@@ -5457,6 +5456,16 @@ CBODY
             # heavy engine-swapped set is the shared thunk. Byte-identical.
             windowsEnginePkgs =
               if !wantWindowsModule then windowsPkgs else windowsEnginePkgsShared;
+            # The names a payload announces: the dispatcher's whole table, the
+            # binary's own name included, so builder and installer read one list
+            # rather than two that differ by a name. ONE row that is the binary
+            # itself is no table — nothing dispatches it, declaring it switches
+            # off the wrap's symlink harvest (the mechanism for exactly the
+            # packages nix-lib cannot enumerate), and `unpin install` links the
+            # binary over its own slot. Announce nothing there.
+            announcedNamesOf = progs:
+              let all = nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) progs;
+              in if all == [ binName ] then [ ] else all;
             # What a BESPOKE `windowsBuild` folds, declared by the flake from the
             # very `lib.multicallTable` its generator renders the dispatcher
             # from. Nothing in eval can look inside that build to find out —
@@ -5558,7 +5567,7 @@ CBODY
                 if multicallCosmo != null
                 then [ multicallCosmo.program ] ++ (multicallCosmo.aliases or [ ])
                 else if wantWindowsModule
-                then nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) windowsPrograms
+                then announcedNamesOf windowsPrograms
                 else if multicall != null && !(windowsBase.unpinEmbedsAliases or false)
                 then nixpkgs.lib.concatMap (p: p.aliases or [ ])
                   (nixpkgs.lib.filter (p: p.name == binName) multicall.programs)
@@ -5931,10 +5940,10 @@ CBODY
                           (if multicallCosmo != null
                            then [ multicallCosmo.program ] ++ (multicallCosmo.aliases or [ ])
                            else if wantWindowsModule
-                           then nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) programs
+                           then announcedNamesOf programs
                            else null)
                         else if multicall == null then null
-                        else nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) programs;
+                        else announcedNamesOf programs;
                     in
                     # A bespoke windowsBuild's own table wins here, and it is the
                     # whole entry rather than a patch on one: its programs are not
