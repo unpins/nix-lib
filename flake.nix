@@ -2683,6 +2683,21 @@ static void copy_basename(char *dst, size_t cap, const char *src) {
     if (n > 4 && strcasecmp(dst + n - 4, ".exe") == 0) dst[n - 4] = 0;
     if (strncmp(dst, "lt-", 3) == 0) memmove(dst, dst + 3, strlen(dst + 3) + 1);
 }
+/* Strip from argv[0] itself the two decorations copy_basename only ignores.
+   An applet that dispatches AGAIN on argv[0] (mtools routes its 24 m* commands
+   through one main) is otherwise handed `mdir.exe` and refuses its own name:
+   every m* alias on Windows answered "Unknown mtools command 'mdir.exe'" while
+   --unpin-program=mdir worked. Edits in place and only ever shortens, so the
+   directory survives for an applet that derives a path from argv[0]. */
+static void strip_argv0_decorations(int argc, char **argv) {
+    if (argc <= 0 || !argv[0]) return;
+    char *p = argv[0], *s;
+    size_t n = strlen(p);
+    if (n > 4 && strcasecmp(p + n - 4, ".exe") == 0) p[n - 4] = 0;
+    s = strrchr(p, '/');  if (s) p = s + 1;
+    s = strrchr(p, '\\'); if (s) p = s + 1;
+    if (strncmp(p, "lt-", 3) == 0) memmove(p, p + 3, strlen(p + 3) + 1);
+}
 CBODY
 ${winCmdlineFixDecl}        cat <<CBODY
 static void list_programs(FILE *out) {
@@ -2695,6 +2710,7 @@ int main(int argc, char **argv) {
     char base[256];
     const char *a0 = (argc > 0 && argv[0]) ? argv[0] : "${name}";
     copy_basename(base, sizeof base, a0);
+    strip_argv0_decorations(argc, argv);
     int is_canon = strcmp(base, "${name}") == 0;
     /* Alias path: a symlink whose basename is an applet (and not the canonical
        binary "${name}") -> run that applet via argv[0]. --unpin-program is
