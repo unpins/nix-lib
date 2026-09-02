@@ -2816,12 +2816,23 @@ CBODY
         # so with the SAME list rather than a second copy of it. A fold that
         # ships a subset (usbutils drops usbhid-dump, moreutils drops ifdata)
         # writes its own `applets` instead — the subset is the point there.
+        #
+        # A `{ name; supportedTarget; }` alias has no answer here — this table is
+        # a single declaration shared by every target that reads it, and there is
+        # no platform in scope to resolve the condition against. Say so instead of
+        # rendering the attrset into a row nobody can dispatch.
         multicallTableOf = { name, programs, defaultProgram ? null }:
           multicallTable {
             inherit name defaultProgram;
             applets = nixpkgs.lib.concatMap
               (p: [ { inherit (p) name; } ]
-                ++ map (a: { name = a; fn = p.name; }) (p.aliases or [ ]))
+                ++ map
+                  (a:
+                    if builtins.isString a then { name = a; fn = p.name; }
+                    else throw ("multicallTableOf (${name}): alias "
+                      + "'${a.name or "?"}' of '${p.name}' is target-conditional; "
+                      + "this table has no target. Spell the applets out."))
+                  (p.aliases or [ ]))
               programs;
           };
 
@@ -4980,6 +4991,7 @@ CBODY
               requires       = [ "cxx" "group" "frameworks" ];
               program        = [ "name" "objs" "aliases" "buildDir" "noHelp"
                                  "supportedTarget" ];
+              alias          = [ "name" "supportedTarget" ];
               runtimeEmbed   = [ "native" "windows" ];
             };
             unknownOpts =
@@ -4987,8 +4999,17 @@ CBODY
                 chk = what: kn: set:
                   map (k: "  ${what}.${k} — known: ${nixpkgs.lib.concatStringsSep ", " kn}")
                     (nixpkgs.lib.subtractLists kn (builtins.attrNames set));
+                # An alias may be a bare name or `{ name; supportedTarget; }`;
+                # the attrset form gets the same unknown-key treatment as the
+                # program that carries it, or a misspelling reads as "no
+                # condition" and the name ships everywhere.
                 progs = what: ps: nixpkgs.lib.concatMap
-                  (p: chk "${what}.programs[\"${p.name or "?"}\"]" knownOpts.program p) ps;
+                  (p: chk "${what}.programs[\"${p.name or "?"}\"]" knownOpts.program p
+                    ++ nixpkgs.lib.concatMap
+                      (a: nixpkgs.lib.optionals (!builtins.isString a)
+                        (chk "${what}.programs[\"${p.name or "?"}\"].aliases[\"${a.name or "?"}\"]"
+                          knownOpts.alias a))
+                      (p.aliases or [ ])) ps;
               in
               chk "optimize" knownOpts.optimize optimize
               ++ chk "runtimeEmbed" knownOpts.runtimeEmbed
@@ -5079,8 +5100,25 @@ CBODY
             # missing-sidecar hard-error and no dangling dispatcher entry. Purely
             # eval-time (no IFD): the arch is a target-platform property, so
             # evaluating the flake never forces a build.
-            supportedOn = platform: nixpkgs.lib.filter
-              (p: (p.supportedTarget or (_: true)) platform);
+            #
+            # An ALIAS carries the same condition, for the same reason one step
+            # down: util-linux's setarch dispatches `i386`/`x86_64` from a
+            # transitions[] table gated on `#if defined(__x86_64__) ||
+            # defined(__i386__)`, so on the other four linux arches those two
+            # names reach setarch and die with "Unrecognized architecture" —
+            # announced, installed by `unpin install`, and dead. Written as
+            # `{ name; supportedTarget; }` in place of the plain string.
+            # Filtering here rather than at each reader is what keeps the set
+            # single: `announcedNamesOf`, `appletsOf` and `applets_by_target` all
+            # take a list this has already been through.
+            aliasesOn = platform: p: builtins.filter (a: a != null) (map
+              (a: if builtins.isString a then a
+              else if (a.supportedTarget or (_: true)) platform then a.name
+              else null)
+              (p.aliases or [ ]));
+            supportedOn = platform: progs:
+              map (p: p // { aliases = aliasesOn platform p; })
+                (nixpkgs.lib.filter (p: (p.supportedTarget or (_: true)) platform) progs);
             appletsOf = nixpkgs.lib.concatMap
               (p:
                 let entry = "unpin__${sanCSym name}__${sanCSym p.name}_main"; in
@@ -5588,8 +5626,12 @@ CBODY
                 else if wantWindowsModule
                 then announcedNamesOf windowsPrograms
                 else if multicall != null && !(windowsBase.unpinEmbedsAliases or false)
+                # `windowsPrograms`, not `multicall.programs`: the list has to be
+                # the one already resolved against the PE host, or an alias gated
+                # by `supportedTarget` reaches here as an attrset instead of a
+                # name (and a program gated off windows would still be read).
                 then nixpkgs.lib.concatMap (p: p.aliases or [ ])
-                  (nixpkgs.lib.filter (p: p.name == binName) multicall.programs)
+                  (nixpkgs.lib.filter (p: p.name == binName) windowsPrograms)
                 else [ ];
               in names;
             # Windows embed defaults; a VFS flake's `runtimeEmbed.windows` overrides
