@@ -2987,8 +2987,21 @@ CBODY
             # paths need it identically; the LOCALA dedup matters because a gnulib
             # archive double-listed for circular refs folds to one — lld -r
             # resolves back-references without the repeat.
+            #
+            # `linkName`: the ONE place a program's BUILD-TREE name is required.
+            # The sidecar is written by the capture shim under the basename of the
+            # linker's `-o`, which upstream often spells differently from the tool
+            # it installs (binutils links `nm-new` and installs `nm`; procps-ng
+            # links `src/ps/pscommand`). `name` had to carry that spelling because
+            # this lookup is keyed on it — and `name` is ALSO the applet name, so
+            # the build-internal spelling leaked into `announced`, i.e. into
+            # `unpin/aliases` and into the slot `unpin install` links. Splitting
+            # them puts the build-tree name here alone: `appletsOf`,
+            # `announcedNamesOf`, the entry symbol and every intermediate file keep
+            # reading `name` and come out right for free. Defaults to `name`, so a
+            # package that doesn't set it is byte-identical.
             readSidecar = p: ''
-              __side="$UNPIN_LINK_DIR/${p.name}.link"
+              __side="$UNPIN_LINK_DIR/${p.linkName or p.name}.link"
               [ -f "$__side" ] || { echo "multicallModuleHookLTO: no link sidecar for ${p.name} ($__side)" >&2; exit 1; }
               __objs=$(awk '$1=="OBJ"{print $2}' "$__side")
               __arch=$(awk '$1=="LOCALA"{print $2}' "$__side" | awk '!seen[$0]++')${
@@ -4989,8 +5002,8 @@ CBODY
               multicallCosmo = [ "program" "programObjs" "aliases" "appletArchives"
                                  "gnulibArchives" "depArchives" "requires" ];
               requires       = [ "cxx" "group" "frameworks" ];
-              program        = [ "name" "objs" "aliases" "buildDir" "noHelp"
-                                 "supportedTarget" ];
+              program        = [ "name" "linkName" "objs" "aliases" "buildDir"
+                                 "noHelp" "supportedTarget" ];
               alias          = [ "name" "supportedTarget" ];
               runtimeEmbed   = [ "native" "windows" ];
             };
@@ -5004,10 +5017,10 @@ CBODY
                 # program that carries it, or a misspelling reads as "no
                 # condition" and the name ships everywhere.
                 progs = what: ps: nixpkgs.lib.concatMap
-                  (p: chk "${what}.programs[\"${p.name or "?"}\"]" knownOpts.program p
+                  (p: chk "${what}[\"${p.name or "?"}\"]" knownOpts.program p
                     ++ nixpkgs.lib.concatMap
                       (a: nixpkgs.lib.optionals (!builtins.isString a)
-                        (chk "${what}.programs[\"${p.name or "?"}\"].aliases[\"${a.name or "?"}\"]"
+                        (chk "${what}[\"${p.name or "?"}\"].aliases[\"${a.name or "?"}\"]"
                           knownOpts.alias a))
                       (p.aliases or [ ])) ps;
               in
@@ -5017,17 +5030,41 @@ CBODY
               ++ nixpkgs.lib.optionals (multicall != null) (
                    chk "multicall" knownOpts.multicall multicall
                 ++ chk "multicall.requires" knownOpts.requires (multicall.requires or { })
-                ++ progs "multicall" (multicall.programs or [ ]))
+                ++ progs "multicall.programs" (multicall.programs or [ ])
+                # darwinPrograms went unchecked: a typo in the darwin subset ate
+                # the same silence the whole check exists to close, and only on
+                # the platform hardest to re-test.
+                ++ progs "multicall.darwinPrograms" (multicall.darwinPrograms or [ ]))
               ++ nixpkgs.lib.optionals (multicallCosmo != null) (
                    chk "multicallCosmo" knownOpts.multicallCosmo multicallCosmo
                 ++ chk "multicallCosmo.requires" knownOpts.requires
                      (multicallCosmo.requires or { }));
+            # `linkName` is read in exactly ONE place (the capture sidecar's
+            # filename), so where the fold does not read a sidecar — explicit
+            # `objs`, or `inferLinkInputs = false` — it is inert while still
+            # READING as "this program links as X". Inert-and-assertive is the
+            # pair that produced the leak this option exists to fix; refuse it
+            # rather than ignore it.
+            deadLinkNames =
+              let
+                infer = multicall != null && (multicall.inferLinkInputs or true);
+                dead = p: (p.linkName or null) != null
+                  && !(infer && (p.objs or null) == null);
+              in map (p: "  ${p.name or "?"} (linkName = ${p.linkName})")
+                (nixpkgs.lib.filter dead
+                  (nixpkgs.lib.optionals (multicall != null)
+                    ((multicall.programs or [ ]) ++ (multicall.darwinPrograms or [ ]))));
             checkOpts = v:
-              if unknownOpts == [ ] then v
-              else throw ''
+              if unknownOpts != [ ] then throw ''
                 ${name}: unknown option(s) in a nested option set —
                 ${nixpkgs.lib.concatStringsSep "\n" unknownOpts}
-              '';
+              ''
+              else if deadLinkNames != [ ] then throw ''
+                ${name}: linkName on a program whose objects are not read from a
+                capture sidecar, where it does nothing —
+                ${nixpkgs.lib.concatStringsSep "\n" deadLinkNames}
+              ''
+              else v;
             runtimeEmbedNative = if runtimeEmbed == null then null else runtimeEmbed.native or null;
             runtimeEmbedWindows = if runtimeEmbed == null then null else runtimeEmbed.windows or null;
             optimize_ = { lto = false; opt = null; ssp = true; gc = true; } // optimize;
