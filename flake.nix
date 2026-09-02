@@ -4816,6 +4816,12 @@ CBODY
           # man (codec libs, coreutils/busybox) skip gracefully. Set false to
           # opt a package out.
           , embedMan ? true
+          # The one page that documents every applet, where a suite writes it
+          # that way. Top-level and not a `multicall` sub-option, because the
+          # package that needs it most has no `multicall` attr at all: busybox
+          # is a multicall by upstream design, and its 396 announced names come
+          # from the wrap's own symlink harvest. See `applets_man_page`.
+          , manPage ? null
           # Dead-store-ref scrub patterns for unpinEmbedWrap, native AND windows,
           # for packages that DON'T carry an engine `multicall` attr (single-binary or
           # cppRenameMulticall folds like acl/brotli/cpio). Same semantics as
@@ -4996,7 +5002,7 @@ CBODY
               optimize       = [ "lto" "opt" "ssp" "gc" ];
               multicall      = [ "programs" "darwinPrograms" "defaultProgram"
                                  "depArchives" "internalArchives" "keepAutoArchives"
-                                 "inferLinkInputs" "foldSharedArchives" "manPage"
+                                 "inferLinkInputs" "foldSharedArchives"
                                  "removeReferences" "requires" "runtimeDataRoot"
                                  "windows" "windowsTable" ];
               multicallCosmo = [ "program" "programObjs" "aliases" "appletArchives"
@@ -6005,16 +6011,6 @@ CBODY
               # blanket waiver would be the one thing able to hide it. Declared
               # on the program or on the alias, since either can be announced;
               # `darwinPrograms` too, whose names the darwin sweep reads.
-              # One page that documents every applet, for a suite that writes it
-              # that way: busybox's 396 applets are all described in
-              # `busybox.1`, and bash documents `sh` inside `bash.1`. Naming
-              # the page is not the same as waiving the check — the sweep
-              # demands THIS page be embedded, so 396 names stay covered by one
-              # declaration and all 396 fail at once if it ever goes missing.
-              # `applets_no_man` is for the other case, a name documented
-              # nowhere at all.
-              applets_man_page =
-                if multicall == null then null else multicall.manPage or null;
               applets_no_man =
                 if multicall == null then [ ]
                 else nixpkgs.lib.unique (nixpkgs.lib.concatMap
@@ -6023,6 +6019,13 @@ CBODY
                       (a: !(builtins.isString a) && (a.noMan or false))
                       (p.aliases or [ ])))
                   ((multicall.programs or [ ]) ++ (multicall.darwinPrograms or [ ])));
+              # The other case: ONE page documents every applet. busybox
+              # describes all 396 in `busybox.1`, and demanding a page each
+              # would have meant 396 waivers — bookkeeping, not a record.
+              # Naming the page is checkable where a blanket waiver is not: the
+              # sweep requires THAT page to be embedded, so the whole set rides
+              # one declaration and fails together if it ever goes missing.
+              applets_man_page = manPage;
               # What each smoke target DECLARES, so the CI applet sweep can check
               # the shipped binary against the declaration instead of against
               # itself. `manifest` is a flake output, not part of any derivation —
