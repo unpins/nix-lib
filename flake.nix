@@ -4996,15 +4996,15 @@ CBODY
               optimize       = [ "lto" "opt" "ssp" "gc" ];
               multicall      = [ "programs" "darwinPrograms" "defaultProgram"
                                  "depArchives" "internalArchives" "keepAutoArchives"
-                                 "inferLinkInputs" "foldSharedArchives"
+                                 "inferLinkInputs" "foldSharedArchives" "manPage"
                                  "removeReferences" "requires" "runtimeDataRoot"
                                  "windows" "windowsTable" ];
               multicallCosmo = [ "program" "programObjs" "aliases" "appletArchives"
                                  "gnulibArchives" "depArchives" "requires" ];
               requires       = [ "cxx" "group" "frameworks" ];
               program        = [ "name" "linkName" "objs" "aliases" "buildDir"
-                                 "noHelp" "supportedTarget" ];
-              alias          = [ "name" "supportedTarget" ];
+                                 "noHelp" "noMan" "supportedTarget" ];
+              alias          = [ "name" "noMan" "supportedTarget" ];
               runtimeEmbed   = [ "native" "windows" ];
             };
             unknownOpts =
@@ -5989,6 +5989,40 @@ CBODY
                 if multicall == null then [ ]
                 else map (p: p.name)
                   (nixpkgs.lib.filter (p: p.noHelp or false) multicall.programs);
+              # Announced names upstream documents NOWHERE, so the sweep's
+              # demand that every announced name carry a page is waived for
+              # them. binutils-2.46 is the case: `ld.bfd`, `ld.gold`, `dwp` and
+              # `dllwrap` all run, and `binutils/doc` holds 14 `.1` plus
+              # `cxxfilt.man` while `ld/Makefile.am` says `man_MANS = ld.1` —
+              # one page for a binary installed under two names, by design.
+              # Writing a stub would be inventing a page, not repairing a
+              # dropped one (which is what `pkill` and `lz4cat` were).
+              #
+              # A waiver, not an assertion: the sweep ALSO fails a name declared
+              # here that does carry a page on the target being swept. Missing
+              # here and present there is the six-defect class — a page shipped
+              # on one target and absent where the name is announced — and a
+              # blanket waiver would be the one thing able to hide it. Declared
+              # on the program or on the alias, since either can be announced;
+              # `darwinPrograms` too, whose names the darwin sweep reads.
+              # One page that documents every applet, for a suite that writes it
+              # that way: busybox's 396 applets are all described in
+              # `busybox.1`, and bash documents `sh` inside `bash.1`. Naming
+              # the page is not the same as waiving the check — the sweep
+              # demands THIS page be embedded, so 396 names stay covered by one
+              # declaration and all 396 fail at once if it ever goes missing.
+              # `applets_no_man` is for the other case, a name documented
+              # nowhere at all.
+              applets_man_page =
+                if multicall == null then null else multicall.manPage or null;
+              applets_no_man =
+                if multicall == null then [ ]
+                else nixpkgs.lib.unique (nixpkgs.lib.concatMap
+                  (p: nixpkgs.lib.optional (p.noMan or false) p.name
+                    ++ map (a: a.name) (nixpkgs.lib.filter
+                      (a: !(builtins.isString a) && (a.noMan or false))
+                      (p.aliases or [ ])))
+                  ((multicall.programs or [ ]) ++ (multicall.darwinPrograms or [ ])));
               # What each smoke target DECLARES, so the CI applet sweep can check
               # the shipped binary against the declaration instead of against
               # itself. `manifest` is a flake output, not part of any derivation —
