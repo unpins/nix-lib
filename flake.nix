@@ -6058,11 +6058,28 @@ CBODY
                       inherit announced;
                     };
                 in
-                {
+                # Only the targets `packages.<system>.*` actually publishes. A
+                # key here is a DECLARATION the CI sweep checks the shipped
+                # binary against; where nothing is built there is no binary, so
+                # the row is a claim nothing can contradict — and the shape it
+                # takes, `dispatcher = false` with `announced = null`, is
+                # exactly a real single-program windows package. Absence is
+                # already how "not a target" is spelled (every cross is absent);
+                # these have to be absent too. Measured before this gate: 30
+                # phantom rows over 15 packages, loudest `util-linux
+                # darwin-x86_64` — a dispatcher, 118 programs and 125 announced
+                # names for a `linuxOnly` package with no darwin attr at all,
+                # and 123 for `darwin-aarch64`, the two phantoms disagreeing
+                # with each other. Predicates mirror `packages` above.
+                nixpkgs.lib.optionalAttrs nativeBuild {
                   "linux-x86_64" = entry "x86_64-linux";
                   "linux-aarch64" = entry "aarch64-linux";
+                }
+                // nixpkgs.lib.optionalAttrs (nativeBuild && !linuxOnly) {
                   "darwin-aarch64" = entry "aarch64-darwin";
                   "darwin-x86_64" = entry "x86_64-darwin";
+                }
+                // nixpkgs.lib.optionalAttrs windowsEnabled {
                   "windows-x86_64" = entry "x86_64-w64-mingw32";
                 };
             };
