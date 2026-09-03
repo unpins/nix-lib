@@ -186,15 +186,98 @@
             inherit unpinPackTool;
           };
 
+        # The engine's VFS BINDING pass, as shell functions to interpolate into a
+        # buildPhase after `MT=<multitool>` is set. Under the engine every object
+        # is LLVM bitcode: `objcopy --redefine-sym` cannot touch a bitcode symtab
+        # at all, and `ld --wrap` binds the WHOLE link (fine for a standalone,
+        # not mega-safe), so the consumer's libc file-op references are renamed
+        # IN THE IR to the `unpinvfs_*` shims vfs.c defines under
+        # -DUNPIN_VFS_NOWRAP. This is the one binding that is mega-safe, works on
+        # bitcode, and is the SAME on linux and darwin.
+        #
+        # ONE home, and it has to be: the rule set is fix-prone — the darwin
+        # stat/lstat arch asymmetry lives in it — and a per-flake copy drifts in
+        # silence. It already did: tcc kept its own copy and sat two rules behind
+        # (the plain `\01_stat`/`\01_lstat`, i.e. the arm64-darwin spelling),
+        # harmless only because tcc happens never to call stat().
+        vfsBindFns =
+          # WHICH libc file ops to bind is per-PACKAGE, and it has to be: tcc's
+          # single fopen() is the `-E` OUTPUT file, which must reach the real
+          # filesystem, so binding fopen there would be a bug; nmap needs the dir
+          # family for NSE's script directories. What must NOT vary per package
+          # is the SPELLING logic below — that is the fix-prone part, and the
+          # reason this lives here instead of as a copy in each flake.
+          { syms ? [ "open" "stat" "lstat" "access" ] }:
+          let
+            # Alternate spellings a symbol can carry. darwin's SDK asm-labels the
+            # inode64 variants on x86_64; arm64 was inode64 from day one and so
+            # carries the PLAIN raw label. 32-bit musl's _REDIR_TIME64 renames the
+            # stat family. A rule that matches nothing in a given IR is a no-op,
+            # so listing a spelling a target never emits costs one sed pass.
+            inode64 = [ "stat" "lstat" "fstat" "opendir" "readdir" "fdopendir" ];
+            time64 = [ "stat" "lstat" "fstat" ];
+            keep = xs: builtins.filter (x: builtins.elem x xs) syms;
+            drop = xs: builtins.filter (x: !(builtins.elem x xs)) syms;
+            rule = pat: sym: "    -e 's/" + pat + "/@unpinvfs_" + sym + "/g' \\";
+            rules = builtins.concatStringsSep "\n" (
+                 (map (x: rule ("@" + x + "\\b") x) syms)
+              ++ (map (x: rule ("@__" + x + "_time64\\b") x) (keep time64))
+              ++ (map (x: rule ("@\"\\\\01__" + x + "_time64\"") x) (keep time64))
+              ++ (map (x: rule ("@\"\\\\01_" + x + "\"") x) (drop inode64 ++ keep inode64))
+              ++ (map (x: rule ("@\"\\\\01_" + x + "\\$INODE64\"") x) (keep inode64)));
+          in ''
+          # bitcode magic: raw 4243c0de (linux) / darwin-wrapped dec0170b.
+          isbc() { case "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" in 4243c0de|dec0170b) return 0;; *) return 1;; esac; }
+          # Rename perl's libc file-op refs to the VFS shims. @sym is a FUNCTION
+          # symbol (sigil differs from %struct.stat), so @stat never touches
+          # `struct stat`. darwin's SDK emits raw-label imports and the
+          # stat/lstat spelling is ARCH-specific: x86_64 carries the legacy
+          # inode32 ABI so the alias is `_stat$INODE64`, but arm64 was inode64
+          # from day one so it's the PLAIN `_stat` (open/access are plain on
+          # both arches). Miss the plain `_stat`/`_lstat` and perl's require
+          # stat()s the real FS for /zip modules -> ENOENT -> "Can't locate
+          # strict.pm" on arm64-darwin only. 32-bit musl's _REDIR_TIME64
+          # renames stat->__stat_time64. Rules that miss a given IR are no-ops.
+          vfsSed() {
+            sed -i \
+          ${rules}
+              "$1"
+          }
+          bcrewrite() { $MT opt -S "$1" -o "$1.ll"; vfsSed "$1.ll"; $MT opt "$1.ll" -o "$1"; rm -f "$1.ll"; }
+        '';
+
+        # Archive-level variants, biber only (perl rewrites libperl.a members
+        # by hand). bcrewriteArchive rewrites every bitcode member then repacks
+        # with the bitcode-aware llvm ar; weakenArchive is the engine analogue
+        # of objcopy --weaken-symbol (prepend `weak` to the matching define).
+        vfsBindArchiveFns = ''
+          bcrewriteArchive() {
+            local a; a=$(readlink -f "$1"); local d; d=$(mktemp -d)
+            ( cd "$d" && $MT ar x "$a" )
+            for o in "$d"/*; do [ -f "$o" ] || continue; isbc "$o" && bcrewrite "$o"; done
+            rm -f "$1" && $MT ar rcs "$1" "$d"/*
+          }
+          weakenArchive() {  # $1 = archive, $2 = symbol
+            local a; a=$(readlink -f "$1"); local d; d=$(mktemp -d)
+            ( cd "$d" && $MT ar x "$a" )
+            for o in "$d"/*; do
+              [ -f "$o" ] || continue; isbc "$o" || continue
+              $MT opt -S "$o" -o "$o.ll"
+              sed -i -E "/@$2\(/ s/^define /define weak /" "$o.ll"
+              $MT opt "$o.ll" -o "$o"; rm -f "$o.ll"
+            done
+            rm -f "$1" && $MT ar rcs "$1" "$d"/*
+          }
+        '';
+
         # Shared engine plumbing for the Perl-family packages (unpins/perl,
         # unpins/biber). Under the unpin-llvm engine pkgsStatic is the bitcode
         # set, so perl + its XS/deps are all LLVM bitcode and the binary is
-        # LTO-linked. The VFS that serves the embedded /zip @INC can't be bound by
-        # `ld --wrap` or `objcopy --redefine-sym` (neither touches a bitcode
-        # symtab), so perl's libc file-op refs are rewritten IN THE IR
-        # (`llvm opt -S | sed | llvm opt`). `vfsSed` is the fix-prone core — the
-        # darwin stat/lstat arch asymmetry lives there — so it gets ONE home here
-        # instead of a copy in each flake that can silently drift.
+        # LTO-linked. The VFS that serves the embedded /zip @INC is bound by the
+        # shared IR-rename pass (`vfsBindFns`, above): `objcopy --redefine-sym`
+        # cannot edit a bitcode symtab, and `ld --wrap` — which DOES bind under
+        # LTO, measured — is linker-global and so not mega-safe. This function
+        # only re-exports that pass for the Perl-family call sites.
         #
         # `introspectName` is the writeShellScript name for the bitcode-lowering
         # helper (per-package so hoisting keeps each cross drv byte-identical).
@@ -233,67 +316,11 @@
               exec "$mt" "$tool" "$@"
             '';
 
-            # The engine bitcode shell helpers, interpolated into buildPhase after
-            # `MT=<multitool>` is set. isbc + vfsSed + bcrewrite are used by every
-            # Perl-family build; the archive variants (vfsArchiveFns) only by
-            # biber.
-            vfsShellFns = ''
-              # bitcode magic: raw 4243c0de (linux) / darwin-wrapped dec0170b.
-              isbc() { case "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" in 4243c0de|dec0170b) return 0;; *) return 1;; esac; }
-              # Rename perl's libc file-op refs to the VFS shims. @sym is a FUNCTION
-              # symbol (sigil differs from %struct.stat), so @stat never touches
-              # `struct stat`. darwin's SDK emits raw-label imports and the
-              # stat/lstat spelling is ARCH-specific: x86_64 carries the legacy
-              # inode32 ABI so the alias is `_stat$INODE64`, but arm64 was inode64
-              # from day one so it's the PLAIN `_stat` (open/access are plain on
-              # both arches). Miss the plain `_stat`/`_lstat` and perl's require
-              # stat()s the real FS for /zip modules -> ENOENT -> "Can't locate
-              # strict.pm" on arm64-darwin only. 32-bit musl's _REDIR_TIME64
-              # renames stat->__stat_time64. Rules that miss a given IR are no-ops.
-              vfsSed() {
-                sed -i \
-                  -e 's/@open\b/@unpinvfs_open/g' \
-                  -e 's/@stat\b/@unpinvfs_stat/g' \
-                  -e 's/@lstat\b/@unpinvfs_lstat/g' \
-                  -e 's/@access\b/@unpinvfs_access/g' \
-                  -e 's/@__stat_time64\b/@unpinvfs_stat/g' \
-                  -e 's/@__lstat_time64\b/@unpinvfs_lstat/g' \
-                  -e 's/@"\\01__stat_time64"/@unpinvfs_stat/g' \
-                  -e 's/@"\\01__lstat_time64"/@unpinvfs_lstat/g' \
-                  -e 's/@"\\01_open"/@unpinvfs_open/g' \
-                  -e 's/@"\\01_access"/@unpinvfs_access/g' \
-                  -e 's/@"\\01_stat"/@unpinvfs_stat/g' \
-                  -e 's/@"\\01_lstat"/@unpinvfs_lstat/g' \
-                  -e 's/@"\\01_stat\$INODE64"/@unpinvfs_stat/g' \
-                  -e 's/@"\\01_lstat\$INODE64"/@unpinvfs_lstat/g' \
-                  "$1"
-              }
-              bcrewrite() { $MT opt -S "$1" -o "$1.ll"; vfsSed "$1.ll"; $MT opt "$1.ll" -o "$1"; rm -f "$1.ll"; }
-            '';
-
-            # Archive-level variants, biber only (perl rewrites libperl.a members
-            # by hand). bcrewriteArchive rewrites every bitcode member then repacks
-            # with the bitcode-aware llvm ar; weakenArchive is the engine analogue
-            # of objcopy --weaken-symbol (prepend `weak` to the matching define).
-            vfsArchiveFns = ''
-              bcrewriteArchive() {
-                local a; a=$(readlink -f "$1"); local d; d=$(mktemp -d)
-                ( cd "$d" && $MT ar x "$a" )
-                for o in "$d"/*; do [ -f "$o" ] || continue; isbc "$o" && bcrewrite "$o"; done
-                rm -f "$1" && $MT ar rcs "$1" "$d"/*
-              }
-              weakenArchive() {  # $1 = archive, $2 = symbol
-                local a; a=$(readlink -f "$1"); local d; d=$(mktemp -d)
-                ( cd "$d" && $MT ar x "$a" )
-                for o in "$d"/*; do
-                  [ -f "$o" ] || continue; isbc "$o" || continue
-                  $MT opt -S "$o" -o "$o.ll"
-                  sed -i -E "/@$2\(/ s/^define /define weak /" "$o.ll"
-                  $MT opt "$o.ll" -o "$o"; rm -f "$o.ll"
-                done
-                rm -f "$1" && $MT ar rcs "$1" "$d"/*
-              }
-            '';
+            # The binding pass lives at lib level (vfsBindFns) so every consumer
+            # shares the one rule set; re-exported here for the Perl-family
+            # call sites.
+            vfsShellFns = vfsBindFns { };
+            vfsArchiveFns = vfsBindArchiveFns;
           };
 
         # mkUnpinStdenv (route A: bespoke, no cc-wrapper). Returns
