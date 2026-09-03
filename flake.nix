@@ -5695,7 +5695,43 @@ CBODY
             # llvm-strip on a cosmo APE. The `module` output rides in this same
             # build, so the manifests reference the very build the binary ships from
             # (the [bin out] forcing the linux path used for the same reason).
-            windowsForEmbed = windowsBase.overrideAttrs (_: { stripAllList = [ "bin" "out" ]; });
+            #
+            # `-p` goes away on the ENGINE path: the strip there is llvm-strip,
+            # which answers `option is not supported for COFF` and exits 1 — and
+            # nixpkgs' stripDirs swallows that, so the build stays green and the
+            # .exe ships its whole DWARF. It cost 63% of the published file.exe
+            # (1132544 -> 409088 bytes) and 70% of qrencode's. It hid because
+            # CMake Release never passes `-g`, so brotli and x265 came out clean
+            # while every autotools package (`-g -O2` by default) did not.
+            # `--preserve-dates` buys nothing in the store (timestamps are
+            # normalized), and the mingw-gcc path keeps the nixpkgs default, so
+            # nothing off the engine re-hashes.
+            windowsForEmbed = windowsBase.overrideAttrs (old: {
+              stripAllList = [ "bin" "out" ];
+            } // nixpkgs.lib.optionalAttrs wantWindowsModule {
+              stripAllFlags = [ "-s" ];
+              stripDebugFlags = [ "-S" ];
+              # A strip that fails into silence is what let this ride through a
+              # whole wave of migrations, so prove it ran instead of trusting the
+              # flags. llvm-objdump comes from the toolchain the module hook
+              # already pulls in — no new input.
+              postFixup = (old.postFixup or "") + ''
+                # Every output, not just $out: a multi-output recipe puts the
+                # binary in $bin (qrencode), where a check anchored on $out sees
+                # an empty glob and passes without looking at anything.
+                for __o in $outputs; do
+                  __d=''${!__o}
+                  for __e in "$__d"/bin/*.exe; do
+                    [ -f "$__e" ] || continue
+                    if ${unpinToolchain windowsPkgs.stdenv.buildPlatform.system}/bin/llvm \
+                         llvm-objdump -h "$__e" | grep -q '\.debug_'; then
+                      echo "FATAL: $__e still carries DWARF after strip." >&2
+                      exit 1
+                    fi
+                  done
+                done
+              '';
+            });
             # Windows counterpart of `declaredAliases`. Where nix-lib itself did
             # the fold it knows the whole applet set: a cosmo build dispatches the
             # table `multicallCosmo` declares (which can differ from the linux one
