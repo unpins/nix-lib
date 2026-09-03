@@ -186,6 +186,18 @@
             inherit unpinPackTool;
           };
 
+        # Alternate spellings a libc file op can carry, shared by BOTH binding
+        # back-ends below (the IR rename and the Mach-O objcopy map) so the
+        # fix-prone part has exactly one home. darwin's SDK asm-labels the
+        # inode64 variants on x86_64; arm64 was inode64 from day one and so
+        # carries the PLAIN raw label. 32-bit musl's _REDIR_TIME64 renames the
+        # stat family. A rule that matches nothing in a given input is a no-op,
+        # so listing a spelling a target never emits costs one pass.
+        vfsBindSpellings = {
+          inode64 = [ "stat" "lstat" "fstat" "opendir" "readdir" "fdopendir" ];
+          time64 = [ "stat" "lstat" "fstat" ];
+        };
+
         # The engine's VFS BINDING pass, as shell functions to interpolate into a
         # buildPhase after `MT=<multitool>` is set. Under the engine every object
         # is LLVM bitcode: `objcopy --redefine-sym` cannot touch a bitcode symtab
@@ -209,13 +221,7 @@
           # reason this lives here instead of as a copy in each flake.
           { syms ? [ "open" "stat" "lstat" "access" ] }:
           let
-            # Alternate spellings a symbol can carry. darwin's SDK asm-labels the
-            # inode64 variants on x86_64; arm64 was inode64 from day one and so
-            # carries the PLAIN raw label. 32-bit musl's _REDIR_TIME64 renames the
-            # stat family. A rule that matches nothing in a given IR is a no-op,
-            # so listing a spelling a target never emits costs one sed pass.
-            inode64 = [ "stat" "lstat" "fstat" "opendir" "readdir" "fdopendir" ];
-            time64 = [ "stat" "lstat" "fstat" ];
+            inherit (vfsBindSpellings) inode64 time64;
             keep = xs: builtins.filter (x: builtins.elem x xs) syms;
             drop = xs: builtins.filter (x: !(builtins.elem x xs)) syms;
             rule = pat: sym: "    -e 's/" + pat + "/@unpinvfs_" + sym + "/g' \\";
@@ -245,6 +251,29 @@
           }
           bcrewrite() { $MT opt -S "$1" -o "$1.ll"; vfsSed "$1.ll"; $MT opt "$1.ll" -o "$1"; rm -f "$1.ll"; }
         '';
+
+        # The SAME binding, for a target whose objects are NATIVE Mach-O rather
+        # than bitcode — i.e. a package still off the engine, where `opt` has
+        # nothing to rewrite and `llvm-objcopy --redefine-syms` is the only tool
+        # that reaches the symtab. Returns the map TEXT; the caller wraps it in
+        # its own `writeText` (keeping the file NAME at the call site is what
+        # lets a converted flake keep its exact store path).
+        #
+        # Two back-ends, one contract: both rename the CONSUMER's refs to the
+        # `unpinvfs_*` names vfs.c defines, and both take their spellings from
+        # vfsBindSpellings. The back-end differs because the object format does,
+        # not because the binding does. Mach-O only — hence the leading `_` and
+        # no `__*_time64` lines (that alias is 32-bit musl's, never darwin's).
+        vfsBindMap =
+          { syms ? [ "open" "stat" "lstat" "access" ] }:
+          let
+            inherit (vfsBindSpellings) inode64;
+            lines = builtins.concatMap
+              (x: (if builtins.elem x inode64
+                   then [ ("_" + x + "$INODE64 _unpinvfs_" + x) ] else [ ])
+                  ++ [ ("_" + x + " _unpinvfs_" + x) ])
+              syms;
+          in builtins.concatStringsSep "\n" lines + "\n";
 
         # Archive-level variants, biber only (perl rewrites libperl.a members
         # by hand). bcrewriteArchive rewrites every bitcode member then repacks
