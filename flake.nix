@@ -2431,11 +2431,23 @@ EOF
               ++ nixpkgs.lib.optional man pkgs.buildPackages.python3Minimal
               ++ nixpkgs.lib.optional cosmoSymtabTrim pkgs.buildPackages.zip
               ++ nixpkgs.lib.optional nukeRefs pkgs.buildPackages.removeReferencesTo;
-              # Carry the base passthru (notably `module` for a multicall fold and
-              # version/pname) so the mega manifest and withMetaPins still resolve
-              # against the shipped drv.
+              # Carry the base passthru (notably `module` for a multicall fold) so
+              # the mega manifest and withMetaPins still resolve against the
+              # shipped drv.
+              #
+              # `version`/`pname` are NOT in it: mkDerivation keeps them as
+              # top-level attrs of the derivation and leaves `passthru` empty
+              # (`nixpkgs.tree.passthru` is `{}`), so copying the passthru alone
+              # dropped them from every shipped artifact. `.#default.version` is
+              # what release.yml reads to compute the tag and what the website
+              # generator reads for its version column — both had been broken
+              # catalog-wide since the fold became the default artifact. Restore
+              # them the way `meta` is restored below; passthru is not hashed, so
+              # nothing rebuilds.
               passthru = (base.passthru or { })
-                // nixpkgs.lib.optionalAttrs (base ? module) { inherit (base) module; };
+                // nixpkgs.lib.optionalAttrs (base ? module) { inherit (base) module; }
+                // nixpkgs.lib.optionalAttrs (base ? version) { inherit (base) version; }
+                // nixpkgs.lib.optionalAttrs (base ? pname) { inherit (base) pname; };
               # Carry upstream meta (license/description) but pin outputsToInstall to
               # this runCommand's single `out` — base.meta lists the multi-output
               # openssl's `[bin man …]`, which `nix build` would otherwise try to
@@ -5546,9 +5558,26 @@ CBODY
                   modules = [ multicallManifest ];
                   defaultApplet = selfFoldDefault;
                 };
+                # A self-fold ships a NEW derivation (the mkMegaMulticall link),
+                # so the package's own `version`/`pname`/`meta` never reach the
+                # artifact: `strippedOrJoined` restores meta from the drv it is
+                # handed, and that drv is the mega link, which has none. Carry
+                # them over from the pristine base — `.#default.version` is what
+                # release.yml reads to compute the tag and what the website
+                # generator reads for its version column, and license/description
+                # feed `unpin info` and the same page. Identity only: neither
+                # passthru nor meta is hashed, so nothing rebuilds.
+                withBaseIdentity = d: d
+                  // nixpkgs.lib.optionalAttrs (base ? version) { inherit (base) version; }
+                  // nixpkgs.lib.optionalAttrs (base ? pname) { inherit (base) pname; }
+                  // {
+                    meta = (d.meta or { }) // builtins.intersectAttrs
+                      { license = null; description = null; homepage = null; longDescription = null; }
+                      (base.meta or { });
+                  };
                 shipped =
                   if useEmbedWrap then unpinEmbedWrap pkgs nativeEmbedOpts base
-                  else if selfFold then strippedOrJoined pkgs name selfFolded
+                  else if selfFold then withBaseIdentity (strippedOrJoined pkgs name selfFolded)
                   else strippedOrJoined pkgs name legacyMaybeMan;
                 result = withMetaPins shipped;
                 multicallManifest = bitcodeManifest {
