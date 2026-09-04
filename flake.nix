@@ -3429,7 +3429,39 @@ CBODY
               # each shared archive member (and its module-level inline asm) is
               # pulled a single time. lld's on-demand archive semantics resolve the
               # per-program undefined libav* refs against these members.
-              __union=$(sort -u multicall/union.arch.raw)${nixpkgs.lib.optionalString machoAsm ''
+              #
+              # Dedup by RESOLVED path, not by the string the sidecar recorded.
+              # The capture shim makes every archive path absolute but not
+              # canonical, and CMake spells a shared archive relative to each
+              # program's own link directory: binaryen's one libbinaryen.a
+              # arrives as five paths (`src/tools/../../lib/…`,
+              # `src/tools/wasm2c/../../../lib/…`, …), all absolute, all
+              # different, all the same file. A plain `sort -u` keeps the five.
+              #
+              # On ELF that is invisible — `ld.lld -r` pulls members on demand, so
+              # the four repeats never generate demand. On darwin it is fatal:
+              # union_bc.a below is taken with `--whole-archive`, so every member
+              # lands five times and the link dies in `duplicate symbol` against
+              # ITSELF. Canonicalize on BOTH paths rather than only under
+              # machoAsm: an asymmetry here is exactly what let this sit unseen —
+              # broken on the platform that gets built least, tolerated on the one
+              # everybody builds.
+              #
+              # The resolved path is the dedup KEY only; what goes on the link
+              # line is the spelling the sidecar recorded. Resolving it there
+              # too would rewrite paths that are not duplicates at all —
+              # ffmpeg reaches libaom.a through a store symlink into the `-static`
+              # output, so `readlink -f` would move that one entry and change a
+              # link line that has nothing to dedup (measured: 114 entries, no two
+              # sharing a real path). Key by identity, emit what was recorded, and
+              # a package with no aliasing gets a byte-identical command line.
+              __union=$(sort -u multicall/union.arch.raw | while IFS= read -r __a; do
+                          [ -n "$__a" ] || continue
+                          __r=$(readlink -f "$__a" 2>/dev/null || echo "$__a")
+                          case " $__useen " in *" $__r "*) continue ;; esac
+                          __useen="$__useen $__r"
+                          printf '%s\n' "$__a"
+                        done)${nixpkgs.lib.optionalString machoAsm ''
 
               __bcu=multicall/union_bc.a
               rm -f "$__bcu"
