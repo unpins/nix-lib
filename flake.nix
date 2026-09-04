@@ -2606,6 +2606,22 @@ EOF
         # below builds symbols (`unpin__<pkg>__<prog>_main`) and per-program file
         # names out of it, so they must all spell it the same way.
         sanCSym = nixpkgs.lib.replaceStrings [ "." "-" "+" ] [ "_" "_" "_" ];
+
+        # The C name of a folded program's ENTRY. `opt -internalize` runs PER
+        # PROGRAM and keeps only this symbol external, so it is the one name a
+        # SIBLING applet of the same fold can call — the modules are merged by
+        # llvm-link afterwards, which is what resolves the reference.
+        #
+        # diffutils is why it is public: diff3 and sdiff run `diff` themselves,
+        # and a folded binary has no external `diff` to exec. Left to PATH they
+        # find the SYSTEM's diff, or nothing at all. The caller declares
+        # `extern int <sym>(int, char **, char **)` — the trampoline's signature,
+        # envp included — and gets it as a -D so no flake spells it by hand;
+        # `entryOf` in the multicall emitter IS this function, so the two cannot
+        # drift. A program name that is not in the fold fails at the link, by
+        # name.
+        multicallEntrySym = { name, program }:
+          "unpin__${sanCSym name}__${sanCSym program}_main";
         spaceSep = nixpkgs.lib.concatStringsSep " ";
 
         # Recipe-A multicall dispatcher generator (the `ld -r` family:
@@ -3024,7 +3040,7 @@ CBODY
                                     # Hence this note lives out here.
           }: drv:
           let
-            entryOf = p: "unpin__${sanCSym package}__${sanCSym p.name}_main";
+            entryOf = p: multicallEntrySym { name = package; program = p.name; };
             # The two nm scrapes that build the asm-referenced keep-list, in ONE
             # place: the per-program path and the shared-archive path below both
             # need them, and Mach-O spells both sides differently in ways that
