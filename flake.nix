@@ -4974,6 +4974,23 @@ CBODY
           # (CUI) binary must NOT set it, and action-build rejects the claim if
           # the shipped .exe turns out not to be GUI after all.
           , smokeWindows ? true
+          # …and how to smoke it anyway. A GUI-subsystem .exe writes no stdout,
+          # but it writes FILES: run it with args that make it produce one and
+          # grep that. Without this the .exe is built, unpacked and inspected by
+          # CI and never EXECUTED — which is how gvim shipped an embedded
+          # runtime tree that no glob could search.
+          #
+          #   smokeWindowsGui = {
+          #     files   = { "probe.vim" = "…script the .exe runs…"; };
+          #     args    = [ "-f" "-S" "probe.vim" ];
+          #     outFile = "probe.out";
+          #     pattern = "…grep -E over outFile…";
+          #   };
+          #
+          # Files are written next to the .exe before the run; `outFile` must
+          # exist afterwards and match `pattern`. Only meaningful with
+          # smokeWindows = false (a console binary is smoked through stdout).
+          , smokeWindowsGui ? null
           # Per-package exception to the darwin portability allow-list: Apple
           # PrivateFramework names (e.g. [ "MediaRemote" ]) the verify step accepts
           # for THIS package, beyond the always-allowed public Frameworks/libSystem/
@@ -5133,6 +5150,7 @@ CBODY
                                  "noHelp" "noMan" "supportedTarget" ];
               alias          = [ "name" "noMan" "supportedTarget" ];
               runtimeEmbed   = [ "native" "windows" ];
+              smokeWindowsGui = [ "files" "args" "outFile" "pattern" ];
             };
             unknownOpts =
               let
@@ -5154,6 +5172,8 @@ CBODY
               chk "optimize" knownOpts.optimize optimize
               ++ chk "runtimeEmbed" knownOpts.runtimeEmbed
                    (if runtimeEmbed == null then { } else runtimeEmbed)
+              ++ chk "smokeWindowsGui" knownOpts.smokeWindowsGui
+                   (if smokeWindowsGui == null then { } else smokeWindowsGui)
               ++ nixpkgs.lib.optionals (multicall != null) (
                    chk "multicall" knownOpts.multicall multicall
                 ++ chk "multicall.requires" knownOpts.requires (multicall.requires or { })
@@ -6156,6 +6176,8 @@ CBODY
               smoke_pattern = smokePattern;
               # false = the .exe is GUI-subsystem and has no stdout to smoke.
               smoke_windows = smokeWindows;
+              # …and the file-writing smoke that runs in its place. null = none.
+              smoke_windows_gui = smokeWindowsGui;
               # Per-package darwin portability exception (PrivateFramework names).
               darwin_allow_private_frameworks = darwinAllowPrivateFrameworks;
               # Applets that legitimately never answer `--help`: servers that start
