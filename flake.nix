@@ -1610,7 +1610,12 @@ EOF
                # the `-l:` colon exact-file form (and bare abs paths) onto ld.lld
                # verbatim → `cannot open …-Wl,-l:libunpindns.a`. The dns dir is
                # static-only so `-lunpindns` resolves to libunpindns.a.
-               ("--wrap=getaddrinfo --wrap=freeaddrinfo -L${lib} -lunpindns -lc")
+               # `gethostbyname` too: musl answers it without going through
+               # getaddrinfo, so a program on the legacy door (GNU netcat) got a
+               # linked archive and no fallback at all. Wrapping a symbol the
+               # binary never references is a no-op for the linker.
+               ("--wrap=getaddrinfo --wrap=freeaddrinfo --wrap=gethostbyname"
+                + " -L${lib} -lunpindns -lc")
              else if h.isWindows
              then appendLdFlags drv
                # -lws2_32 for the socket calls, -lkernel32 for GetCurrentProcessId,

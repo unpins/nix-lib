@@ -1,5 +1,5 @@
 /*
- * unpin DNS fallback — getaddrinfo interposition with a UDP + DoH safety net
+ * unpin DNS fallback — name-resolution interposition with a UDP + DoH safety net
  * =========================================================================
  *
  * Why this exists
@@ -50,8 +50,14 @@
  *     (the linker binds every in-binary reference to ours; the build force-loads
  *     this archive so the definition wins over libSystem's) and reach the real
  *     libSystem ones via dlsym(RTLD_NEXT, …).
- * The linker pulls this object only when getaddrinfo is referenced, so it is
- * dropped from non-resolving tools (tree/jq/coreutils/…).
+ * The linker pulls this object only when one of those symbols is referenced, so
+ * it is dropped from non-resolving tools (tree/jq/coreutils/…).
+ *
+ * getaddrinfo is not the only door: a program old enough to predate it resolves
+ * through gethostbyname(), which musl answers without going through getaddrinfo,
+ * so wrapping getaddrinfo alone leaves that program with an archive linked in
+ * and nothing behind it. On Linux gethostbyname is wrapped too and routed
+ * through the same fallback — see __wrap_gethostbyname at the bottom.
  *
  * Second stage — DoH over HTTPS/443 (optional)
  * --------------------------------------------
@@ -552,21 +558,17 @@ static int parse_resp(const unsigned char *r, int rlen, int qtype, int port,
     return 0;
 }
 
-int ENTRY_GETADDRINFO(const char *node, const char *service,
-                      const struct addrinfo *hints, struct addrinfo **res)
+/* The fallback proper — everything past the "should we take over?" gate. Split
+ * out of ENTRY_GETADDRINFO so the gethostbyname wrapper below can reach it
+ * WITHOUT paying a second system-resolver timeout. `rc` is the caller's own
+ * error, returned unchanged whenever we cannot answer. */
+static int unpin_dns_fallback(const char *node, const char *service,
+                              const struct addrinfo *hints,
+                              struct addrinfo **res, int rc)
 {
-    /* Always try the system resolver first — identical path on every platform. */
-    int rc = real_getaddrinfo(node, service, hints, res);
-
-    /* Take over only when it could not REACH a resolver (the reach_failure
-     * whitelist — EAI_NONAME and the caller errors pass through untouched, see
-     * its comment); numeric literals / AI_NUMERICHOST need no DNS. */
     int flags = hints ? hints->ai_flags : 0;
-    if (!reach_failure(rc) ||
-        (flags & AI_NUMERICHOST) || !want_fallback(node))
-        return rc;
 
-    /* …and only when the user OPTED IN (env $UNPIN_DNS or config `dns`). With
+    /* Only when the user OPTED IN (env $UNPIN_DNS or config `dns`). With
      * no resolver configured we can't help: surface the real error unchanged
      * (unpin prints a hint pointing at the opt-in when an error reads like a
      * resolution failure). `dnsbuf` backs the parsed strings and must outlive
@@ -674,6 +676,97 @@ int ENTRY_GETADDRINFO(const char *node, const char *service,
     *res = &b->ai[0];
     return 0;
 }
+
+int ENTRY_GETADDRINFO(const char *node, const char *service,
+                      const struct addrinfo *hints, struct addrinfo **res)
+{
+    /* Always try the system resolver first — identical path on every platform. */
+    int rc = real_getaddrinfo(node, service, hints, res);
+
+    /* Take over only when it could not REACH a resolver (the reach_failure
+     * whitelist — EAI_NONAME and the caller errors pass through untouched, see
+     * its comment); numeric literals / AI_NUMERICHOST need no DNS. */
+    int flags = hints ? hints->ai_flags : 0;
+    if (!reach_failure(rc) ||
+        (flags & AI_NUMERICHOST) || !want_fallback(node))
+        return rc;
+
+    return unpin_dns_fallback(node, service, hints, res, rc);
+}
+
+/* ---- the OTHER door: gethostbyname ---------------------------------------- *
+ * getaddrinfo is not the only way a program asks for a name, and wrapping it
+ * alone is not a partial fix — it is an invisible one. GNU netcat (0.7.1,
+ * src/network.c) resolves through gethostbyname(), which musl answers without
+ * ever calling getaddrinfo, so --wrap=getaddrinfo never fires: the archive
+ * still links, the binary still grows ~16 KB, and the fallback does nothing.
+ * That reads as coverage from the outside, which is worse than not having it.
+ *
+ * Route this door through the SAME fallback: one opt-in, one UDP path, one DoH
+ * escalation. We call the real gethostbyname first (identical rule to
+ * getaddrinfo) and take over only on TRY_AGAIN/NO_RECOVERY — musl's h_errno for
+ * "could not reach a resolver". HOST_NOT_FOUND is an authoritative answer and
+ * is passed through, exactly as EAI_NONAME is above.
+ *
+ * Linux only. That is where the option applies at all (withDnsFallback gates on
+ * isLinux) and where the resolver-less host lives; Windows' gethostbyname is
+ * Winsock's, with its own hostent, and macOS always has a resolver.
+ *
+ * hostent is v4-only as an interface and returns static storage by contract —
+ * so does this, and it is no less thread-safe than the libc function it stands
+ * in for. gethostbyname2/gethostbyaddr are deliberately NOT wrapped: nothing in
+ * the catalog calls them, and wrapping a symbol musl's own gethostbyname calls
+ * internally would reroute that internal call back into us. */
+#if defined(UNPIN_LINUX)
+extern struct hostent *__real_gethostbyname(const char *name);
+void ENTRY_FREEADDRINFO(struct addrinfo *res);   /* defined just below */
+
+struct hostent *__wrap_gethostbyname(const char *name)
+{
+    struct hostent *he = __real_gethostbyname(name);
+    if (he) return he;
+    if (h_errno != TRY_AGAIN && h_errno != NO_RECOVERY) return NULL;
+    if (!want_fallback(name)) return NULL;
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *res = NULL;
+    /* rc = -1: any non-zero sentinel; unpin_dns_fallback returns it verbatim
+     * when it cannot answer, and we only test against 0. */
+    if (unpin_dns_fallback(name, NULL, &hints, &res, -1) != 0 || !res)
+        return NULL;
+
+    static struct hostent hb;
+    static char           hb_name[256];
+    static struct in_addr hb_addr[MAXADDR];
+    static char          *hb_list[MAXADDR + 1];
+    static char          *hb_aliases[1];
+
+    int n = 0;
+    for (struct addrinfo *a = res; a && n < MAXADDR; a = a->ai_next) {
+        if (a->ai_family != AF_INET || !a->ai_addr) continue;
+        hb_addr[n] = ((struct sockaddr_in *)a->ai_addr)->sin_addr;
+        hb_list[n] = (char *)&hb_addr[n];
+        n++;
+    }
+    ENTRY_FREEADDRINFO(res);
+    if (n == 0) return NULL;
+    hb_list[n] = NULL;
+    hb_aliases[0] = NULL;
+
+    strncpy(hb_name, name, sizeof hb_name - 1);
+    hb_name[sizeof hb_name - 1] = '\0';
+    hb.h_name      = hb_name;
+    hb.h_aliases   = hb_aliases;
+    hb.h_addrtype  = AF_INET;
+    hb.h_length    = (int)sizeof(struct in_addr);
+    hb.h_addr_list = hb_list;
+    return &hb;
+}
+#endif /* UNPIN_LINUX */
 
 void ENTRY_FREEADDRINFO(struct addrinfo *res)
 {
