@@ -237,6 +237,36 @@ int unpin_vfs_is_virtual(const char *path) {
 #endif
 }
 
+/* Extract the child segment that central-directory entry `i` contributes to
+ * the directory `prefix` (prefix_len 0 = the mount root), or 0 when it
+ * contributes none. Shared by the POSIX readdir cursor and the win32 Find*
+ * shim so both see the same children and dedup them the same way. */
+static int vfs_child_seg(mz_uint i, const char *prefix, size_t prefix_len,
+                         char *out, size_t outsz, int *is_dir) {
+    char name[VFS_PATHMAX];
+    mz_uint fl = mz_zip_reader_get_filename(&g_zip, i, name, sizeof name);
+    if (fl <= prefix_len + 1) return 0;  /* fl counts the NUL: skips name <= prefix */
+    if (vfs_hidden(name)) return 0;      /* keep the unpin namespaces unlisted */
+
+    /* Children of the mount root have no leading separator to strip; deeper
+     * dirs match "<prefix>/" then the child. */
+    const char *seg;
+    if (prefix_len == 0) {
+        seg = name;
+    } else {
+        if (memcmp(name, prefix, prefix_len) != 0) return 0;
+        if (name[prefix_len] != '/') return 0;
+        seg = name + prefix_len + 1;
+    }
+    const char *seg_end = strchr(seg, '/');
+    size_t seg_len = seg_end ? (size_t)(seg_end - seg) : strlen(seg);
+    if (seg_len == 0 || seg_len >= outsz) return 0;
+    memcpy(out, seg, seg_len);
+    out[seg_len] = '\0';
+    if (is_dir) *is_dir = seg_end != NULL;
+    return 1;
+}
+
 /* ======================================================================= */
 #if defined(_WIN32)
 /* ----- Windows: materialise to a temp file, then hand back a real fd ----
@@ -328,6 +358,170 @@ const char *unpin_vfs_winpath(const char *path) {
     int i = vfs_find(key);
     if (i < 0) return NULL;
     return materialize(i);
+}
+
+/* 1 when a virtual path names a directory: the mount root, an explicit
+ * "<key>/" entry, or a key that some entry sits under. The POSIX side answers
+ * this from find_entry + is_implicit_dir; marker mode has neither, and without
+ * it every directory under the mount was invisible to the consumer's own
+ * stat/attribute calls -- files listed, directories did not. */
+int unpin_vfs_win_isdir(const char *path) {
+    char key[VFS_PATHMAX];
+    if (!marker_key(path, key, sizeof key)) return 0;
+    if (vfs_hidden(key) || !unpin_vfs_init()) return 0;
+    size_t kl = strlen(key);
+    if (kl == 0) return 1;                       /* the mount root itself */
+
+    char slashed[VFS_PATHMAX];
+    int n = snprintf(slashed, sizeof slashed, "%s/", key);
+    if (n > 0 && (size_t)n < sizeof slashed
+        && mz_zip_reader_locate_file(&g_zip, slashed, NULL, 0) >= 0)
+        return 1;
+
+    mz_uint cnt = mz_zip_reader_get_num_files(&g_zip);
+    char name[VFS_PATHMAX];
+    for (mz_uint i = 0; i < cnt; i++) {
+        mz_uint fl = mz_zip_reader_get_filename(&g_zip, i, name, sizeof name);
+        if (fl <= kl) continue;
+        if (memcmp(name, key, kl) == 0 && name[kl] == '/') return 1;
+    }
+    return 0;
+}
+
+/* Drop-in for GetFileAttributesW. vim asks it whether a path is a directory
+ * (win32_getattrs -> mch_isdir), and the kernel says "no such file" for every
+ * virtual one, so `:packadd` and any other directory test failed under the
+ * mount. Virtual paths are answered here; everything else is forwarded. */
+DWORD unpin_vfs_get_file_attributes_w(const wchar_t *wname) {
+    char u8[VFS_PATHMAX];
+    if (!wname
+        || WideCharToMultiByte(CP_UTF8, 0, wname, -1, u8, sizeof u8, NULL, NULL) == 0
+        || !unpin_vfs_is_virtual(u8))
+        return GetFileAttributesW(wname);
+    if (unpin_vfs_win_isdir(u8)) return FILE_ATTRIBUTE_DIRECTORY;
+    char key[VFS_PATHMAX];
+    if (marker_key(u8, key, sizeof key) && vfs_find(key) >= 0)
+        return FILE_ATTRIBUTE_READONLY;   /* the mount is read-only */
+    return INVALID_FILE_ATTRIBUTES;
+}
+
+/* ---- win32 wildcard enumeration ----------------------------------------
+ * vim expands a wildcard by asking the kernel: FindFirstFileW("<dir>\\*.*"),
+ * which only ever answers for a directory that exists on disk. So every glob
+ * under the mount came back empty while the very same files opened fine by
+ * exact name -- `:packadd matchit` loaded nothing (all 16 bundled optional
+ * packages unreachable), `:colorscheme <Tab>` offered nothing. Serve the three
+ * calls from the ZIP for a virtual directory; every other pattern goes to the
+ * real API untouched, so a consumer can redirect the names unconditionally.
+ * The handle we hand back is looked up by identity in a small registry and
+ * NEVER dereferenced blindly: a real Find handle is a kernel value, not a
+ * pointer we may read. */
+#define UVFS_FIND_MAX 64
+struct unpin_find {
+    char         **names;
+    unsigned char *isdir;
+    int            n, cap, i;
+};
+static struct unpin_find *g_finds[UVFS_FIND_MAX];
+
+static int find_slot(HANDLE h) {
+    for (int k = 0; k < UVFS_FIND_MAX; k++)
+        if (g_finds[k] && (HANDLE)g_finds[k] == h) return k;
+    return -1;
+}
+
+static void find_free(struct unpin_find *f) {
+    for (int k = 0; k < f->n; k++) free(f->names[k]);
+    free(f->names); free(f->isdir); free(f);
+}
+
+static int find_push(struct unpin_find *f, const char *name, int isdir) {
+    for (int k = 0; k < f->n; k++)
+        if (strcmp(f->names[k], name) == 0) return 1;   /* already listed */
+    if (f->n == f->cap) {
+        int cap = f->cap ? f->cap * 2 : 32;
+        char **nn = realloc(f->names, (size_t)cap * sizeof *nn);
+        if (!nn) return 0;
+        f->names = nn;
+        unsigned char *nd = realloc(f->isdir, (size_t)cap);
+        if (!nd) return 0;
+        f->isdir = nd; f->cap = cap;
+    }
+    f->names[f->n] = _strdup(name);
+    if (!f->names[f->n]) return 0;
+    f->isdir[f->n] = (unsigned char)isdir;
+    f->n++;
+    return 1;
+}
+
+static void find_fill(WIN32_FIND_DATAW *d, const char *name, int isdir) {
+    memset(d, 0, sizeof *d);
+    d->dwFileAttributes = isdir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    MultiByteToWideChar(CP_UTF8, 0, name, -1, d->cFileName,
+                        (int)(sizeof d->cFileName / sizeof d->cFileName[0]));
+    d->cAlternateFileName[0] = L'\0';    /* no 8.3 alias to match against */
+}
+
+HANDLE unpin_vfs_find_first_w(const wchar_t *pat, WIN32_FIND_DATAW *data) {
+    char u8[VFS_PATHMAX];
+    if (!pat || !data
+        || WideCharToMultiByte(CP_UTF8, 0, pat, -1, u8, sizeof u8, NULL, NULL) == 0
+        || !unpin_vfs_is_virtual(u8))
+        return FindFirstFileW(pat, data);
+
+    /* Drop the trailing wildcard component ("*.*" from dos_expandpath); what
+     * is left is the directory to list. A pattern with no separator at all
+     * cannot name a directory under the mount. */
+    char *sep = strrchr(u8, '\\');
+    char *fwd = strrchr(u8, '/');
+    if (fwd && (!sep || fwd > sep)) sep = fwd;
+    if (!sep) return FindFirstFileW(pat, data);
+    *sep = '\0';
+
+    char key[VFS_PATHMAX];
+    if (!marker_key(u8, key, sizeof key) || !unpin_vfs_init())
+        return FindFirstFileW(pat, data);
+
+    struct unpin_find *f = calloc(1, sizeof *f);
+    if (!f) return FindFirstFileW(pat, data);
+    size_t klen = strlen(key);
+    mz_uint n = mz_zip_reader_get_num_files(&g_zip);
+    char seg[256];
+    for (mz_uint i = 0; i < n; i++) {
+        int isdir = 0;
+        if (!vfs_child_seg(i, key, klen, seg, sizeof seg, &isdir)) continue;
+        if (!find_push(f, seg, isdir)) { find_free(f); return FindFirstFileW(pat, data); }
+    }
+    if (f->n == 0) {
+        find_free(f);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    int slot = -1;
+    for (int k = 0; k < UVFS_FIND_MAX; k++) if (!g_finds[k]) { slot = k; break; }
+    if (slot < 0) { find_free(f); return FindFirstFileW(pat, data); }
+    g_finds[slot] = f;
+    find_fill(data, f->names[0], f->isdir[0]);
+    f->i = 1;
+    return (HANDLE)f;
+}
+
+BOOL unpin_vfs_find_next_w(HANDLE h, WIN32_FIND_DATAW *data) {
+    int k = find_slot(h);
+    if (k < 0) return FindNextFileW(h, data);
+    struct unpin_find *f = g_finds[k];
+    if (f->i >= f->n) { SetLastError(ERROR_NO_MORE_FILES); return FALSE; }
+    find_fill(data, f->names[f->i], f->isdir[f->i]);
+    f->i++;
+    return TRUE;
+}
+
+BOOL unpin_vfs_find_close(HANDLE h) {
+    int k = find_slot(h);
+    if (k < 0) return FindClose(h);
+    find_free(g_finds[k]);
+    g_finds[k] = NULL;
+    return TRUE;
 }
 
 int unpin_vfs_open(const char *path, int flags, ...) {
@@ -865,9 +1059,38 @@ struct vfs_dir {
     char     prefix[PATH_MAX];   /* ZIP key, no trailing slash */
     size_t   prefix_len;
     mz_uint  cursor;             /* central-directory walk position */
-    char     last_emitted[256];  /* single-slot dedup of child segments */
+    char     last_emitted[256];  /* fast path: collapses a contiguous run */
+    char    *seen;               /* every name emitted, NUL-separated */
+    size_t   seen_len, seen_cap;
     struct dirent ent;
 };
+
+/* readdir must never repeat a name, and the one-slot check above is not enough
+ * on its own: the packer sorts entries by their path WITHOUT the trailing
+ * slash, so a sibling file sorts between a directory and its children whenever
+ * the character after the shared stem is below '/'. vim's own runtime is that
+ * shape -- "ftplugin/", "ftplugin.vim", "ftplugin/8th.vim" -- and the segment
+ * "ftplugin" then came back twice. Keep every name emitted for this DIR*;
+ * that is bounded by the child count and independent of any ordering. */
+static int seen_has(const struct vfs_dir *d, const char *seg, size_t len) {
+    for (size_t o = 0; o < d->seen_len; o += strlen(d->seen + o) + 1)
+        if (strncmp(d->seen + o, seg, len) == 0 && d->seen[o + len] == '\0')
+            return 1;
+    return 0;
+}
+
+static void seen_add(struct vfs_dir *d, const char *seg, size_t len) {
+    if (d->seen_len + len + 1 > d->seen_cap) {
+        size_t cap = d->seen_cap ? d->seen_cap * 2 : 1024;
+        while (cap < d->seen_len + len + 1) cap *= 2;
+        char *p = realloc(d->seen, cap);
+        if (!p) return;            /* out of memory: the one-slot check stands */
+        d->seen = p; d->seen_cap = cap;
+    }
+    memcpy(d->seen + d->seen_len, seg, len);
+    d->seen[d->seen_len + len] = '\0';
+    d->seen_len += len + 1;
+}
 
 DIR *OPENDIR_FN(const char *path) {
     const char *key = posix_key(path);
@@ -904,40 +1127,25 @@ struct dirent *READDIR_FN(DIR *dir) {
     if (d->magic != VFS_DIR_MAGIC) return REAL_READDIR(dir);
 
     mz_uint n = mz_zip_reader_get_num_files(&g_zip);
-    char name[PATH_MAX];
+    char seg[256];
     while (d->cursor < n) {
         mz_uint i = d->cursor++;
-        mz_uint fl = mz_zip_reader_get_filename(&g_zip, i, name, sizeof name);
-        if (fl <= d->prefix_len + 1) continue;  /* fl counts the NUL: skips name <= prefix */
-        if (vfs_hidden(name)) continue;  /* keep the unpin namespaces unlisted */
-
-        /* Children of the mount root (prefix_len == 0) have no leading
-         * separator to strip; deeper dirs match "<prefix>/" then the child. */
-        const char *seg;
-        if (d->prefix_len == 0) {
-            seg = name;
-        } else {
-            if (memcmp(name, d->prefix, d->prefix_len) != 0) continue;
-            if (name[d->prefix_len] != '/') continue;
-            seg = name + d->prefix_len + 1;
-        }
-        const char *seg_end = strchr(seg, '/');
-        size_t seg_len = seg_end ? (size_t)(seg_end - seg) : strlen(seg);
-        if (seg_len == 0 || seg_len >= sizeof d->ent.d_name) continue;
-
-        /* ZIP entries under a subdir cluster together, so single-slot dedup
-         * collapses the repeated parent into one child entry. */
-        if (d->last_emitted[0] &&
-            strncmp(d->last_emitted, seg, seg_len) == 0 &&
-            d->last_emitted[seg_len] == '\0')
+        int is_dir = 0;
+        if (!vfs_child_seg(i, d->prefix, d->prefix_len, seg, sizeof seg, &is_dir))
             continue;
-        memcpy(d->last_emitted, seg, seg_len);
-        d->last_emitted[seg_len] = '\0';
+        size_t seg_len = strlen(seg);
+        if (seg_len >= sizeof d->ent.d_name) continue;  /* d_name is 260 on mingw */
 
-        memcpy(d->ent.d_name, seg, seg_len);
-        d->ent.d_name[seg_len] = '\0';
+        /* One slot absorbs the common contiguous run without searching; the
+         * set catches a run broken by a sibling that sorts in between. */
+        if (d->last_emitted[0] && strcmp(d->last_emitted, seg) == 0) continue;
+        if (seen_has(d, seg, seg_len)) continue;
+        memcpy(d->last_emitted, seg, seg_len + 1);
+        seen_add(d, seg, seg_len);
+
+        memcpy(d->ent.d_name, seg, seg_len + 1);
         d->ent.d_ino = i + 1;                       /* nonzero, stable */
-        d->ent.d_type = seg_end ? DT_DIR : DT_REG;
+        d->ent.d_type = is_dir ? DT_DIR : DT_REG;
         return &d->ent;
     }
     return NULL;
@@ -947,6 +1155,7 @@ int CLOSEDIR_FN(DIR *dir) {
     if (!dir) { errno = EBADF; return -1; }
     struct vfs_dir *d = (struct vfs_dir *)dir;
     if (d->magic != VFS_DIR_MAGIC) return REAL_CLOSEDIR(dir);
+    free(d->seen);
     free(d);
     return 0;
 }

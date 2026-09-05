@@ -81,6 +81,27 @@ int unpin_vfs_access(const char *path, int mode);
  * back through its OWN native open/stat so its platform stat struct is filled
  * correctly -- vim's vim_stat patch uses this so :runtime/:syntax resolve. */
 const char *unpin_vfs_winpath(const char *path);
+
+/* Wildcard enumeration for the win32 glob. vim expands a wildcard by calling
+ * FindFirstFileW/FindNextFileW/FindClose, which the kernel answers only for a
+ * directory that exists on disk -- so every glob under the mount returned
+ * nothing while the same files opened fine by exact name. Redirect those three
+ * names in the consumer (a #define is enough) and virtual directories list;
+ * any other pattern is forwarded to the real API unchanged. */
+#include <windows.h>
+HANDLE unpin_vfs_find_first_w(const wchar_t *pat, WIN32_FIND_DATAW *data);
+BOOL   unpin_vfs_find_next_w(HANDLE h, WIN32_FIND_DATAW *data);
+BOOL   unpin_vfs_find_close(HANDLE h);
+
+/* 1 when a virtual path names a directory. The consumer's stat needs it: a
+ * marker-mode hit is served by materialising a FILE, so without this a
+ * directory under the mount stats as "does not exist". */
+int    unpin_vfs_win_isdir(const char *path);
+
+/* Drop-in for GetFileAttributesW: answers for virtual paths (directory or
+ * read-only file), forwards everything else. Redirect the name in the consumer
+ * so its own directory tests (vim's mch_isdir) see the mount. */
+DWORD  unpin_vfs_get_file_attributes_w(const wchar_t *wname);
 #endif
 
 /* Directory-iteration + fopen superset, compiled in with -DUNPIN_VFS_DIRS.
