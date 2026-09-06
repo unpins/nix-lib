@@ -2722,9 +2722,16 @@ static void unpin_fix_cmdline(const char *sel) {
     if (wcsncmp(tok, L"--unpin-program=", 16) != 0) return;
     for (rest = tok; *rest != 0 && *rest != L' ' && *rest != L'\t'; rest++) { }
     n = strlen(sel);
-    /* The applet name displaces the whole .exe path, so it fits many times over;
-       bail out rather than clobber the token we are about to read. */
-    if (cl + n > tok) return;
+    /* Writing the applet name over argv[0] needs the .exe path to be at least
+       as long as the name; a short path (`f.exe`, or a bare `x` on PATH) is not.
+       Deleting the selector always fits, since `rest` is past `tok` — so fall
+       back to that: the applet still stops seeing an option that is not its
+       own, it just reports argv[0] as the .exe path. Returning here instead
+       would leave `--unpin-program=` in the line for the applet to choke on. */
+    if (cl + n > tok) {
+        memmove(tok, rest, (wcslen(rest) + 1) * sizeof(wchar_t));
+        return;
+    }
     for (i = 0; i < n; i++) cl[i] = (wchar_t)(unsigned char)sel[i];
     memmove(cl + n, rest, (wcslen(rest) + 1) * sizeof(wchar_t));
 }
