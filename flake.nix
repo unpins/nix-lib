@@ -4650,7 +4650,31 @@ CBODY
                       # this scope instead is not available: `libiconvReal` is
                       # reachable from the very attributes being overridden, so
                       # the extend closes a cycle (infinite recursion at eval).
-                      base = (
+                      # librsvg is a Rust staticlib, so librsvg-2.a bundles the
+                      # OBJECTS of every C library it linked — libxml2 included,
+                      # with its baked-in XML_SYSCONFDIR. That string lands in the
+                      # consumer's binary as a live store reference to a directory
+                      # nothing installs into. The retarget is autoWired into the
+                      # ENGINE scope; this one is pristine and never sees it, which
+                      # is why chafa still shipped
+                      # `/nix/store/…-libxml2-…/etc/xml/catalog` after the set-wide
+                      # fix landed. Every platform, not just darwin: the string is
+                      # in the archive on all of them.
+                      #
+                      # Its own layer, and GATED. An `extend` applies to every
+                      # stage of the set, buildPackages included, and on darwin
+                      # libxml2 is in the stdenv bootstrap: ungated, the override
+                      # rebuilt ld64/cctools/clang from source, off any cache, and
+                      # ld64's installCheck (`ld -v` must report LTO support)
+                      # fails on x86_64-darwin — a source path nixpkgs' Hydra no
+                      # longer covers. A per-stage gate is exactly what
+                      # `engineLayer` gives the autoWired fixes, which is why the
+                      # same override never disturbed the bootstrap over there.
+                      # Overriding librsvg's own `libxml2` ARGUMENT also dodges
+                      # the bootstrap, but it leaves the copy `shared-mime-info`
+                      # pulls unfixed (measured, both linux and darwin); the
+                      # gated attr covers the whole chain.
+                      base = ((
                         if pkgs.pkgsStatic.stdenv.hostPlatform.isDarwin or false
                         then pkgs.pkgsStatic.extend (_f: p: {
                           glib       = nativeFixes.glib       p;
@@ -4660,15 +4684,19 @@ CBODY
                           cairo      = nativeFixes.cairo      p;
                           dav1d      = nativeFixes.dav1d      p;
                         })
-                        # Everywhere else only graphite2 is needed, and for a
-                        # different reason than darwin's: CMake's libtool emulation
-                        # writes a `libgraphite2.la` naming a `libgraphite2.so` the
-                        # static build never produced. Only a LIBTOOL consumer of
-                        # this injected chain trips on it — libtool rewrites
-                        # `-lgraphite2` into that absolute path and the link dies
-                        # (chafa; ffmpeg's own build system never reads a `.la`).
-                        else pkgs.pkgsStatic.extend
-                          (_f: p: { graphite2 = nativeFixes.graphite2 p; }));
+                        # Everywhere else graphite2 is the only one, and for a
+                        # different reason than darwin's: CMake's libtool
+                        # emulation writes a `libgraphite2.la` naming a
+                        # `libgraphite2.so` the static build never made. Only a
+                        # LIBTOOL consumer of this chain trips on it — libtool
+                        # rewrites `-lgraphite2` into that absolute path and the
+                        # link dies (chafa; ffmpeg's own build system never reads
+                        # a `.la`).
+                        else pkgs.pkgsStatic.extend (_f: p: {
+                          graphite2 = nativeFixes.graphite2 p;
+                        })).extend (_f: p:
+                          if !(p.stdenv.hostPlatform.isStatic or false) then { }
+                          else { libxml2 = nativeFixes.libxml2 p; }));
                     in
                     nativeFixes.librsvg (
                       if pkgs.pkgsStatic.stdenv.hostPlatform.isRiscV or false
