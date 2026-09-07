@@ -1768,11 +1768,19 @@ EOF
         #     references crypto → mbedtls stays OUT of e2fsprogs even though it
         #     links this same crypto-enabled `.a`. So one shared libarchive serves
         #     both without dragging crypto into the fs tools.
-        #   * darwin: --without-mbedtls (nixpkgs-mbedtls + darwin engine-cc don't
-        #     build cleanly — clang-detected-as-GNU cmake flags, -static-libgcc in
-        #     the test link, a threading postConfigure that can't find its script).
-        #     darwin tar therefore has no encrypted-archive/digest support, as
-        #     before this convergence; core formats + compression are unaffected.
+        #   * NOT linux: --without-mbedtls, and NOTHING IS LOST — libarchive
+        #     finds a platform backend first, so mbedtls is only ever the
+        #     musl-Linux fallback (docs/crypto-backend.md). Measured 2026-09-07
+        #     on tar, all three: mtree sha256digest and reading an AES-256 ZIP
+        #     work identically everywhere. `tar --version` names the backend and
+        #     is the cheap probe — mbedtls/3.6.6 on linux, cng/1.0 on windows,
+        #     CommonCrypto/system on darwin. (This block used to claim darwin had
+        #     no encrypted-archive/digest support at all. It was wrong: darwin
+        #     never needed mbedtls, it has CommonCrypto.)
+        #     The darwin reason to skip mbedtls is that it doesn't BUILD —
+        #     nixpkgs-mbedtls + darwin engine-cc trip on clang-detected-as-GNU
+        #     cmake flags, -static-libgcc in the test link, and a threading
+        #     postConfigure that can't find its script.
         #     archive_string.c calls iconv, which GNU libiconvReal (the
         #     engine-darwin swap) renames to libiconv(); bake libiconvReal into
         #     buildInputs so the object references libiconv() — the consumer's
