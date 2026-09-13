@@ -1737,10 +1737,52 @@ EOF
             "ENGINESDIR=${sslDir}/engines-3"
             "MODULESDIR=${sslDir}/ossl-modules"
           ];
+          # CA roots. With OPENSSLDIR retargeted, the default trust file is one
+          # compiled path, so only hosts laid out like Debian verified anything;
+          # Fedora/openSUSE, a macOS without nix and every Windows box failed.
+          # openssl-ca/ca_fallback.h (spliced into the default-file lookup of
+          # crypto/x509/by_file.c) probes the distributions' bundles and hashed
+          # dirs, and only a host with none of them - or Windows, whose ROOT
+          # store is incomplete by design and whose C:\ssl any user can create -
+          # gets the Mozilla roots embedded from openssl-ca/mozilla-roots.pem
+          # (regenerate with gen-roots.py on every nixpkgs bump). SSL_CERT_FILE
+          # keeps its upstream meaning; UNPIN_CA_FALLBACK=off|force overrides.
+          #
+          # nixpkgs' NIX_SSL_CERT_FILE patch and its darwin default (a nix
+          # profile path) go: a standalone binary must not trust a file because
+          # nix happens to be installed - nix-daemon.sh exports that variable on
+          # every nix host, which also turned every local test green. Dropping
+          # the darwin patch leaves upstream's OPENSSLDIR/cert.pem = the
+          # /etc/ssl/cert.pem macOS ships. The by_file.c hunk is applied with
+          # fuzz 0, so a nixpkgs that still carries NIX_SSL_CERT_FILE fails here.
+          patches = builtins.filter
+            (p: !(builtins.elem (baseNameOf p)
+              [ "nix-ssl-cert-file.patch" "use-etc-ssl-certs-darwin.patch" ]))
+            (oa.patches or [ ]);
+          postPatch = (oa.postPatch or "") + ''
+            patch -p1 --fuzz=0 --no-backup-if-mismatch < ${./openssl-ca/by_file.patch}
+            cp ${./openssl-ca/ca_fallback.h} crypto/x509/unpin_ca_fallback.h
+            perl ${./openssl-ca/der-header.pl} < ${./openssl-ca/mozilla-roots.pem} \
+              > crypto/x509/unpin_ca_der.h
+          '';
           postInstall = ''
             makeWrapper() { :; }
           '' + (oa.postInstall or "") + ''
             rm -f "''${bin:-$out}/bin/c_rehash"
+            # Static check for the targets installCheck cannot run (cross,
+            # mingw, cosmo): the table's version string reached the CLI - or,
+            # in a shared build, the libcrypto it loads.
+            grep -aqs "unpins embedded CA roots: Mozilla NSS" "''${bin:-$out}"/bin/openssl* \
+                "$out"/lib/libcrypto* \
+              || { echo "retargetOpenssl: embedded CA roots missing from openssl/libcrypto" >&2; exit 1; }
+          '';
+          # Runs wherever the build platform can execute the result (stdenv
+          # drops it otherwise - no emulation at build time).
+          doInstallCheck = true;
+          installCheckPhase = ''
+            runHook preInstallCheck
+            sh ${./openssl-ca/install-check.sh} "''${bin:-$out}/bin/openssl" ${./openssl-ca/mozilla-roots.pem}
+            runHook postInstallCheck
           '';
         };
 
