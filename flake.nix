@@ -1740,27 +1740,31 @@ EOF
           # CA roots. With OPENSSLDIR retargeted, the default trust file is one
           # compiled path, so only hosts laid out like Debian verified anything;
           # Fedora/openSUSE, a macOS without nix and every Windows box failed.
-          # openssl-ca/ca_fallback.h (spliced into the default-file lookup of
-          # crypto/x509/by_file.c) probes the distributions' bundles and hashed
-          # dirs, and only a host with none of them - or Windows, whose ROOT
-          # store is incomplete by design and whose C:\ssl any user can create -
-          # gets the Mozilla roots embedded from openssl-ca/mozilla-roots.pem
-          # (regenerate with gen-roots.py on every nixpkgs bump). SSL_CERT_FILE
-          # keeps its upstream meaning; UNPIN_CA_FALLBACK=off|force overrides.
+          # openssl-ca/ca_fallback.h (spliced into the default lookups of
+          # crypto/x509/by_file.c and by_dir.c) probes the distributions' bundles
+          # and hashed dirs, and only a host with none of them - or Windows, whose
+          # ROOT store is incomplete by design - gets the Mozilla roots embedded
+          # from openssl-ca/mozilla-roots.pem (regenerate with gen-roots.py on
+          # every nixpkgs bump). On Windows neither lookup ever reads OPENSSLDIR
+          # (C:\ssl): any user can create it, and upstream's default directory
+          # lookup alone would trust a certs\ dropped there. SSL_CERT_FILE and
+          # SSL_CERT_DIR keep their upstream meaning; UNPIN_CA_FALLBACK=off|force
+          # overrides the rest.
           #
           # nixpkgs' NIX_SSL_CERT_FILE patch and its darwin default (a nix
           # profile path) go: a standalone binary must not trust a file because
           # nix happens to be installed - nix-daemon.sh exports that variable on
           # every nix host, which also turned every local test green. Dropping
           # the darwin patch leaves upstream's OPENSSLDIR/cert.pem = the
-          # /etc/ssl/cert.pem macOS ships. The by_file.c hunk is applied with
-          # fuzz 0, so a nixpkgs that still carries NIX_SSL_CERT_FILE fails here.
+          # /etc/ssl/cert.pem macOS ships. Both hunks are applied with fuzz 0, so
+          # a nixpkgs that still carries NIX_SSL_CERT_FILE fails here.
           patches = builtins.filter
             (p: !(builtins.elem (baseNameOf p)
               [ "nix-ssl-cert-file.patch" "use-etc-ssl-certs-darwin.patch" ]))
             (oa.patches or [ ]);
           postPatch = (oa.postPatch or "") + ''
             patch -p1 --fuzz=0 --no-backup-if-mismatch < ${./openssl-ca/by_file.patch}
+            patch -p1 --fuzz=0 --no-backup-if-mismatch < ${./openssl-ca/by_dir.patch}
             cp ${./openssl-ca/ca_fallback.h} crypto/x509/unpin_ca_fallback.h
             perl ${./openssl-ca/der-header.pl} < ${./openssl-ca/mozilla-roots.pem} \
               > crypto/x509/unpin_ca_der.h

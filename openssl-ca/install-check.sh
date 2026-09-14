@@ -6,8 +6,11 @@ unset NIX_SSL_CERT_FILE SSL_CERT_FILE SSL_CERT_DIR UNPIN_CA_FALLBACK
 export OPENSSL_CONF=/dev/null
 t=$(mktemp -d)
 fail() { echo "openssl CA fallback check: $*" >&2; exit 1; }
-# -no-CApath/-no-CAstore: only the default FILE lookup - the one patched - is consulted.
-verify() { "$o" verify -no-CApath -no-CAstore "$@" >/dev/null 2>&1; }
+# -no-CApath/-no-CAstore: only the default FILE lookup is consulted; the default
+# directory is exercised by the no-host-store block below. -no_check_time: a
+# root that expires must not fail the build - nor rebuilds of old tags.
+verify() { "$o" verify -no-CApath -no-CAstore -no_check_time "$@" >/dev/null 2>&1; }
+verify_dir() { "$o" verify -no-CAstore -no_check_time "$@" >/dev/null 2>&1; }
 
 awk -v d="$t" '/-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/root%03d.pem", d, n) }
   f { print > f } /-----END CERTIFICATE-----/ { close(f); f = "" }' "$roots"
@@ -35,6 +38,9 @@ SSL_CERT_FILE="$t/self.pem" verify "$t/root001.pem" \
 if [ ! -e /etc/ssl ] && [ ! -e /etc/pki ] && [ ! -e /var/lib/ca-certificates ] \
   && [ ! -e /system/etc/security ] && [ ! -e /data/data/com.termux ]; then
   verify "$t/root001.pem" || fail "no host trust store, yet the embedded roots were not used"
+  verify_dir "$t/root001.pem" || fail "the default directory lookup broke the default trust"
+  UNPIN_CA_FALLBACK=force verify_dir "$t/root001.pem" \
+    || fail "UNPIN_CA_FALLBACK=force with the default directory lookup failed"
   UNPIN_CA_FALLBACK=off verify "$t/root001.pem" \
     && fail "UNPIN_CA_FALLBACK=off still used the embedded roots"
 else
