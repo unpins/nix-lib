@@ -3905,6 +3905,20 @@ CBODY
             cosmoMode = builtins.any (m: m.moduleFormat == "cosmo-elf") modules;
             anyCxx = builtins.any (m: m.requires.cxx or false) modules;
             anyGroup = builtins.any (m: m.requires.group or false) modules;
+            # A module whose package opted into the DNS fallback (see
+            # bitcodeManifest) gets the same interposition withDnsFallback gives a
+            # single binary: `--wrap` of the resolver entry points plus the
+            # archive, on the linux-static link only. The archive trails the
+            # command line so the module's __wrap_* references resolve from it and
+            # its __real_* from the libc the face appends. Empty otherwise, which
+            # leaves every other mega's link line byte-identical.
+            anyDns = builtins.any (m: m.requires.dnsFallback or false) modules;
+            dnsHost = pkgs.pkgsStatic.stdenv.hostPlatform;
+            dnsLinkFlags =
+              if anyDns && dnsHost.isLinux && (dnsHost.isStatic or false)
+              then " -Wl,--wrap=getaddrinfo -Wl,--wrap=freeaddrinfo -Wl,--wrap=gethostbyname"
+                + " ${dnsFallbackLib pkgs.pkgsStatic}/lib/libunpindns.a"
+              else "";
             moduleArchives = map (m: m.moduleArchive) modules;
             # Native (asm/SIMD) sidecars rescued by the bitcode hook — one per
             # bitcode module, linked in the back-ref group alongside depArchives so
@@ -4110,7 +4124,7 @@ CBODY
                     multicall/dispatcher.c \
                     ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
                     ${groupOpen} ${nixpkgs.lib.concatStringsSep " " nativeArchives} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose} \
-                    ${darwinFrameworkFlags}${winForceFlags}${winSidecarFlags}
+                    ${darwinFrameworkFlags}${winForceFlags}${winSidecarFlags}${dnsLinkFlags}
                 '';
                 postLink = "";
                 install = ''
@@ -5419,7 +5433,15 @@ CBODY
               # additive override for archives not in the closure.
               depInputDirs = multicallExternalDepDirs drv;
               applets = appletsOf programs;
-              requires = { cxx = false; group = true; } // (multicall.requires or { });
+              requires = { cxx = false; group = true; } // (multicall.requires or { })
+                # The DNS fallback rides the base build's NIX_LDFLAGS, which only
+                # reach the programs that build links — never the mega link a
+                # self-fold ships. Measured on opus-tools: every pre-fold program
+                # carried the wrap and the shipped binary came out byte-identical
+                # with and without `dnsFallback`. So the module says it, and the
+                # mega adds the wrap to its own link (mkMegaMulticall, anyDns).
+                // nixpkgs.lib.optionalAttrs (dnsFallback && pkgs.stdenv.hostPlatform.isLinux)
+                  { dnsFallback = true; };
               # Basenames to rescue from the auto-derive's libc-split skip list
               # (e.g. "libcrypt.a" for a package that folds libxcrypt). Empty by
               # default — only libxcrypt-consuming folds (shadow) set it.
