@@ -3358,6 +3358,16 @@ CBODY
             foldShared = foldSharedArchives && builtins.length programs > 1;
             entriesCsv = nixpkgs.lib.concatMapStringsSep "," entryOf programs;
             modsList = spaceSep (map (p: "multicall/mod_${sanCSym p.name}.bc") programs);
+            # Step 1 keeps the C++ typeinfo (`_ZTI*`, and its name `_ZTS*`) external
+            # next to the entry. An exception class with no key function (binaryen's
+            # wasm::ParseException) has a linkonce_odr typeinfo in EVERY TU that
+            # throws or catches it. Internalized there, the program's copy turns
+            # private, step 2 cannot merge it with the shared archive's, and
+            # libc++abi matches a catch by typeinfo ADDRESS: an exception thrown in
+            # the library and caught in the program finds no handler and aborts
+            # ("terminating due to uncaught exception"). Kept external, step 2's
+            # `ld.lld -r` folds the copies into one; step 3 still internalizes
+            # everything but the entries.
             perProgramShared = p:
               let
                 entry = entryOf p;
@@ -3383,7 +3393,7 @@ CBODY
                 for __a in $__arch; do echo "$__a" >> multicall/union.arch.raw; done
                 ${llvm} ld.lld -r ${foldObjs} multicall/tramp_${sanCSym p.name}.bc \
                   --lto-emit-llvm -o ${partial}
-                ${llvm} opt -passes=internalize -internalize-public-api-list='${entry}' \
+                ${llvm} opt -passes=internalize -internalize-public-api-list='${entry},_ZTI*,_ZTS*' \
                   ${partial} -o multicall/mod_${sanCSym p.name}.bc
                 # rescue native asm from a program's OWN objects (none for ffmpeg;
                 # general-safety for other shared-code packages)
