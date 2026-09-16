@@ -22,6 +22,13 @@ let
     hash = "sha256-xHsnD5UZCwpmPOtgWklpbXzDCFY2aVaY0YUkpTpb54k=";
   };
 
+  # Upstream scanf engine. Gets `%[` and an unbounded width-less `%s`; see
+  # cosmocc-scanf-fix/.
+  cosmoVcscanfSrc = pkgs.fetchurl {
+    url = "https://raw.githubusercontent.com/jart/cosmopolitan/${version}/libc/stdio/vcscanf.c";
+    hash = "sha256-9Jrq1zbZtw7oYlyKoJg1NYDFQsje0rt4LRTuY6ClgB8=";
+  };
+
   # Upstream third_party/tz sources. localtime.c gets the Windows
   # system-timezone fix (see cosmocc-tz-fix/); the headers are its quoted
   # includes, which cosmocc.zip doesn't ship.
@@ -104,6 +111,22 @@ let
         $out/x86_64-linux-cosmo/lib/libcosmo.a $TMPDIR/tzbuild/localtime.o
       $out/bin/aarch64-linux-cosmo-ar r \
         $out/aarch64-linux-cosmo/lib/libcosmo.a $TMPDIR/tzbuild/.aarch64/localtime.o
+
+      # And vcscanf.o: 4.0.2's scanf has no `%[`, and returns EOF on one, so
+      # a `while (fscanf(…) != EOF)` loop reads nothing and says nothing —
+      # X font directories came back empty on Windows. It also cut a
+      # width-less `%s` at 31 bytes. See cosmocc-scanf-fix/.
+      mkdir -p $TMPDIR/cosmosrc/libc/stdio $TMPDIR/scanfbuild/.aarch64
+      cp ${cosmoVcscanfSrc} $TMPDIR/cosmosrc/libc/stdio/vcscanf.c
+      chmod u+w $TMPDIR/cosmosrc/libc/stdio/vcscanf.c
+      patch -p1 -d $TMPDIR/cosmosrc < ${./cosmocc-scanf-fix/vcscanf-scanset.patch}
+      ( cd $TMPDIR/scanfbuild && $out/bin/cosmocc -U__COSMOCC__ -D_COSMO_SOURCE \
+          -O2 -ffunction-sections -fdata-sections \
+          -c -o vcscanf.o $TMPDIR/cosmosrc/libc/stdio/vcscanf.c )
+      $out/bin/x86_64-linux-cosmo-ar r \
+        $out/x86_64-linux-cosmo/lib/libcosmo.a $TMPDIR/scanfbuild/vcscanf.o
+      $out/bin/aarch64-linux-cosmo-ar r \
+        $out/aarch64-linux-cosmo/lib/libcosmo.a $TMPDIR/scanfbuild/.aarch64/vcscanf.o
 
       runHook postUnpack
     '';

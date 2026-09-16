@@ -1,0 +1,136 @@
+Give scanf a working `%[` and stop `%s` truncating at 31 bytes.
+
+cosmo 4.0.2's __vcscanf (behind scanf, fscanf, sscanf, vfscanf …) has no
+scanset. `%[` falls into the specifier switch's default, `items =
+einval()`, and returns -1 — which is EOF. A caller looping
+`while (fscanf(f, fmt, …) != EOF)` therefore reads nothing and reports
+nothing. That is exactly how X's font directories are read (libXfont2
+FontFileReadDirectory, `%1023s %1023[^\n]`): the Windows Xvfb accepted
+fonts.dir, parsed its count, added zero of its 334 fonts and logged no
+error, serving 11 fonts where Linux serves 509. libXfont2's BDF reader
+and libfontenc's encodings.dir reader use the same form.
+
+Second, a `%s` (or `%[`) with no width into a caller-supplied buffer was
+capped at a hard-coded 32-byte buffer: the 32nd byte onward stayed in the
+input for the NEXT directive, so `sscanf("<40-char word> tail", "%s %s")`
+returned the word split in two. C11 7.21.6.2 puts no bound there; the
+caller owns the buffer size. `%ms` keeps its growable 32-byte start.
+
+The upstream fix is a full rewrite of the scanf engine (jart/cosmopolitan
+5ddb5c2ada, after 4.0.2, with a new __vcscanf signature), so it cannot be
+lifted alone. This adds the scanset to the 4.0.2 decoder instead, byte
+strings only (`%l[` still refuses, as before): `^` inverts, `]` first is
+a member, `-` first or last is a member, `a-z` is a range, no leading
+whitespace is skipped, and matching zero characters is a matching failure
+rather than EOF.
+
+Verified on a Windows 10 VM with a 21-case battery plus a real fonts.dir,
+compared against glibc: the stock build diverged on 18 lines, the patched
+one is byte-identical to glibc's output.
+
+--- a/libc/stdio/vcscanf.c	2026-09-16 16:21:25.617911902 -0300
++++ b/libc/stdio/vcscanf.c	2026-09-16 16:21:25.637911100 -0300
+@@ -126,6 +126,8 @@
+         bool isneg = false;
+         bool thousands = false;
+         bool discard = false;
++        bool isscanset = false;
++        unsigned char scanset[256];
+         for (;;) {
+           switch (p[i++]) {
+             case '%':  // %% → %
+@@ -159,6 +161,47 @@
+                 c = READ;
+               }
+               goto DecodeString;
++            case '[': {
++              // Scanset. Byte strings only; the set is decoded into a
++              // 256-entry table. `]` first (after an optional `^`) is a
++              // member, `-` first or last is a member, `a-z` is a range.
++              // Unlike %s, no leading whitespace is skipped.
++              bool invert = false;
++              unsigned first;
++              if (charbytes != sizeof(char)) {
++                items = einval();
++                goto Done;
++              }
++              memset(scanset, 0, sizeof(scanset));
++              if (p[i] == '^') {
++                invert = true;
++                ++i;
++              }
++              first = i;
++              while (p[i] && (p[i] != ']' || i == first)) {
++                if (p[i] == '-' && i != first && p[i + 1] && p[i + 1] != ']' &&
++                    p[i - 1] <= p[i + 1]) {
++                  for (unsigned r = p[i - 1]; r <= p[i + 1]; ++r) {
++                    scanset[r] = 1;
++                  }
++                  i += 2;
++                } else {
++                  scanset[p[i++]] = 1;
++                }
++              }
++              if (p[i] != ']') {
++                items = einval();
++                goto Done;
++              }
++              ++i;
++              if (invert) {
++                for (unsigned r = 0; r < 256; ++r) {
++                  scanset[r] = !scanset[r];
++                }
++              }
++              isscanset = true;
++              goto DecodeString;
++            }
+             case '\'':
+               thousands = true;
+               break;
+@@ -513,7 +556,8 @@
+         }
+         continue;
+       DecodeString:
+-        bufsize = !width ? 32 : rawmode ? width : width + 1;
++        bufsize = !width ? (ismalloc ? 32 : (size_t)-1)
++                         : rawmode ? width : width + 1;
+         if (discard) {
+           buf = NULL;
+         } else if (ismalloc) {
+@@ -538,7 +582,9 @@
+                 !__grow(&buf, &bufsize, charbytes, 0)) {
+               width = bufsize - 1;
+             }
+-            if (c != -1 && j + !rawmode < bufsize && (rawmode || !isspace(c))) {
++            if (c != -1 && j + !rawmode < bufsize &&
++                (isscanset ? scanset[(unsigned char)c]
++                           : (rawmode || !isspace(c)))) {
+               if (charbytes == 1) {
+                 buf[j++] = (unsigned char)c;
+                 c = READ;
+@@ -560,6 +606,9 @@
+               if (!j && c == -1 && !items) {
+                 items = -1;
+                 goto Done;
++              } else if (isscanset && !j) {
++                /* A scanset must match at least one character. */
++                goto Done;
+               } else if (rawmode && j != width) {
+                 /* The C standard says that %c "matches a sequence of characters
+                  * of
+@@ -584,10 +633,14 @@
+           }
+           buf = NULL;
+         } else {
++          size_t j = 0;
+           do {
+-            if (isspace(c))
++            if (isscanset ? !scanset[(unsigned char)c] : isspace(c))
+               break;
++            ++j;
+           } while ((c = READ) != -1);
++          if (isscanset && !j)
++            goto Done;
+         }
+         break;
+       }
