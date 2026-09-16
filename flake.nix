@@ -3150,9 +3150,19 @@ CBODY
             # `announcedNamesOf`, the entry symbol and every intermediate file keep
             # reading `name` and come out right for free. Defaults to `name`, so a
             # package that doesn't set it is byte-identical.
-            readSidecar = p: ''
-              __side="$UNPIN_LINK_DIR/${p.linkName or p.name}.link"
-              [ -f "$__side" ] || { echo "multicallModuleHookLTO: no link sidecar for ${p.name} ($__side)" >&2; exit 1; }
+            #
+            # Emitted ONCE per module as shell functions (`_unpin_read_sidecar`
+            # here, `_unpin_fold_prog` below) and called with one line per program.
+            # The whole postBuild travels to the builder as ONE environment
+            # variable, which Linux caps at 128 KiB (MAX_ARG_STRLEN). Inlined per
+            # program, this text cost ~6 KB each on windows: binutils' 22 programs
+            # already came to 126.8 KB, and adding three more made the builder die
+            # before running a line ("executing bash: Argument list too long").
+            # A call line is under 100 bytes.
+            readSidecarFn = ''
+              _unpin_read_sidecar() { # $1=program name $2=build-tree link name $3=file stem
+              __side="$UNPIN_LINK_DIR/$2.link"
+              [ -f "$__side" ] || { echo "multicallModuleHookLTO: no link sidecar for $1 ($__side)" >&2; exit 1; }
               __objs=$(awk '$1=="OBJ"{print $2}' "$__side")
               __arch=$(awk '$1=="LOCALA"{print $2}' "$__side" | awk '!seen[$0]++')${
                 nixpkgs.lib.optionalString wholeArchiveObjs ''
@@ -3169,7 +3179,7 @@ CBODY
               # $__whole. Magic bytes, not suffixes: `.obj` says nothing about
               # whether clang emitted bitcode or the assembler emitted COFF.
               if [ -n "$__whole" ]; then
-                __wd="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-whole/${sanCSym p.name}"
+                __wd="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-whole/$3"
                 rm -rf "$__wd"; __wn=0
                 for __wa in $__whole; do
                   __wn=$((__wn+1)); mkdir -p "$__wd/$__wn"
@@ -3190,7 +3200,22 @@ CBODY
                 if [ "$(_unpin_natkind "$__o")" = bc ]; then __objsBc="$__objsBc
               $__o"; fi
               done''}
-              [ -n "$__objs" ] ${nixpkgs.lib.optionalString wholeArchiveObjs ''|| [ -n "$__whole" ] ''}|| { echo "multicallModuleHookLTO: sidecar for ${p.name} has no objects" >&2; exit 1; }
+              [ -n "$__objs" ] ${nixpkgs.lib.optionalString wholeArchiveObjs ''|| [ -n "$__whole" ] ''}|| { echo "multicallModuleHookLTO: sidecar for $1 has no objects" >&2; exit 1; }
+              }
+            '';
+            readSidecar = p: ''
+              _unpin_read_sidecar ${nixpkgs.lib.escapeShellArg p.name} ${nixpkgs.lib.escapeShellArg (p.linkName or p.name)} ${sanCSym p.name}
+            '';
+            # A program with hand-listed `objs` sets the same variables the
+            # sidecar reader does, so both kinds share one fold function.
+            # Hand-listed objs are never COFF, but foldObjs reads $__objsBc
+            # unconditionally once coffObjs is on.
+            explicitInputs = p: ''
+              __objs="${spaceSep (p.objs or [ ])}"
+              __arch="${spaceSep internalArchives}"
+            ''
+            + nixpkgs.lib.optionalString coffObjs ''
+              __objsBc="$__objs"
             '';
             # What the `-r` fold reads. Same as $__objs everywhere but windows,
             # where the COFF members are filtered out above.
@@ -3206,75 +3231,54 @@ CBODY
             # undefined for the mega-link; `--lto-emit-llvm` writes bitcode (not
             # codegen) so the cross-module LTO chain stays intact. Then opt
             # internalizes everything but the entry.
-            perProgram = p:
+            #
+            # SIMD/asm rescue (the `_unpin_collect` line): native ELF objects
+            # (NASM/yasm asm) can't live in a .bc, so --lto-emit-llvm silently
+            # drops them and their symbols go undefined at the mega-link. Carry
+            # them out-of-band in a per-module `module_native.a` the mega links
+            # alongside module.bc, keeping SIMD on without a per-package SIMD-off.
+            # _unpin_collect classifies inputs by magic and archives the native
+            # ones.
+            #
+            # The asm-referenced keep-list reads the program OBJECTS only ($__objs,
+            # no archives). A symbol an asm object references is kept external ONLY
+            # if it's defined in an own object (gzip's deflate.o → window: lives
+            # solely in module.bc, so internalize orphans the asm). Symbols that
+            # come from an archive (xz's lzma_crc32_table, in liblzma.a) are left
+            # internalized: the same archive is also an external depArchive at the
+            # mega-link, so the asm resolves there — keeping module.bc's copy
+            # external instead would duplicate it (ld.lld: duplicate symbol).
+            #
+            # The `main` guard: the trampoline calls `main`. If this program's
+            # objects don't DEFINE one, `main` stays undefined in the module and
+            # binds at the final fold link to the only `main` in sight — the
+            # dispatcher's. The applet then re-enters the dispatcher, which
+            # dispatches it again, until the stack dies. It is silent: the binary
+            # links, installs, and only that one applet is broken. (mtools on
+            # darwin stacked cppRenameMulticall under the module fold, so `main`
+            # had already become `mkmanifest_main`; SIGSEGV on both darwin arches,
+            # shipped until the applet sweep ran it.) Undefined `main` is the exact
+            # static signal — 0 across every healthy module measured, 1 on the
+            # broken one.
+            #
+            # mingw compiles a package's public API (and the gnulib getline/
+            # getdelim it ships) with __declspec(dllexport). opt -internalize
+            # PRESERVES dllexport symbols by design (they are a DLL's export
+            # table), so on mingw they would survive as defined externals and
+            # collide across the mega — every gnulib package exports `getline`.
+            # Nothing is a DLL here (we fold into one static binary), so strip
+            # the storage class from the merged module before internalize; the
+            # result matches the Linux module's single external. No-op on
+            # Linux (visibility("default"), which internalize already lowers),
+            # so this is gated to the mingw module path. The dllstorageclass is
+            # always grammar at the HEAD of a def/global line (before any
+            # operand), so strip ` dllexport ` only in each line's prefix up to
+            # its first `"` — never inside a c"..." constant whose bytes happen
+            # to spell " dllexport " (a blunt global substitution would corrupt
+            # such a literal).
+            foldProgFn =
               let
-                linkBc = "multicall/link_${sanCSym p.name}.bc";
-                infer = inferLinkInputs && (p.objs or null) == null;
-                inferSetup = readSidecar p;
-                linkLine =
-                  if infer
-                  then ''${llvm} ld.lld -r ${foldObjs} multicall/tramp_${sanCSym p.name}.bc $__arch \
-                  --lto-emit-llvm -o ${linkBc}''
-                  else ''${llvm} ld.lld -r ${spaceSep (p.objs or [ ])} multicall/tramp_${sanCSym p.name}.bc ${spaceSep internalArchives} \
-                  --lto-emit-llvm -o ${linkBc}'';
-                # SIMD/asm rescue: native ELF objects (NASM/yasm asm) can't live in
-                # a .bc, so --lto-emit-llvm silently drops them and their symbols go
-                # undefined at the mega-link. Carry them out-of-band in a per-module
-                # `module_native.a` the mega links alongside module.bc, keeping SIMD
-                # on without a per-package SIMD-off. _unpin_collect (in postBuild)
-                # classifies inputs by magic and archives the native ones.
-                natCollect =
-                  if infer
-                  then ''_unpin_collect "$module/lib/module_native.a" $__objs $__arch${nixpkgs.lib.optionalString wholeArchiveObjs " $__whole"}''
-                  else ''_unpin_collect "$module/lib/module_native.a" ${spaceSep (p.objs or [ ])} ${spaceSep internalArchives}'';
-                # Just the program OBJECTS (no archives) — used to decide which
-                # asm-referenced symbols must be kept external (see body). A symbol
-                # an asm object references is kept external ONLY if it's defined in
-                # an own object (gzip's deflate.o → window: lives solely in
-                # module.bc, so internalize orphans the asm). Symbols that come from
-                # an archive (xz's lzma_crc32_table, in liblzma.a) are left
-                # internalized: the same archive is also an external depArchive at
-                # the mega-link, so the asm resolves there — keeping module.bc's
-                # copy external instead would duplicate it (ld.lld: duplicate
-                # symbol). Restricting to objects fixes gzip and is a no-op for xz.
-                progObjs =
-                  if infer then "$__objs" else "${spaceSep (p.objs or [ ])}";
-                # The trampoline calls `main`. If this program's objects don't
-                # DEFINE one, `main` stays undefined in the module and binds at
-                # the final fold link to the only `main` in sight — the
-                # dispatcher's. The applet then re-enters the dispatcher, which
-                # dispatches it again, until the stack dies. It is silent: the
-                # binary links, installs, and only that one applet is broken.
-                # (mtools on darwin stacked cppRenameMulticall under the module
-                # fold, so `main` had already become `mkmanifest_main`; SIGSEGV
-                # on both darwin arches, shipped until the applet sweep ran it.)
-                # Undefined `main` is the exact static signal — 0 across every
-                # healthy module measured, 1 on the broken one.
-                mainGuard = ''
-                  if ${llvm} nm --undefined-only ${linkBc} 2>/dev/null \
-                       | awk '{print $NF}' | grep -qxE '_?main'; then
-                    echo "multicallModuleHookLTO: '${p.name}' defines no main of its own." >&2
-                    echo "  The entry trampoline would bind to the dispatcher's main and" >&2
-                    echo "  recurse until the stack is exhausted. A build whose main was" >&2
-                    echo "  already renamed by an earlier fold must not be folded again." >&2
-                    exit 1
-                  fi
-                '';
-                # mingw compiles a package's public API (and the gnulib getline/
-                # getdelim it ships) with __declspec(dllexport). opt -internalize
-                # PRESERVES dllexport symbols by design (they are a DLL's export
-                # table), so on mingw they would survive as defined externals and
-                # collide across the mega — every gnulib package exports `getline`.
-                # Nothing is a DLL here (we fold into one static binary), so strip
-                # the storage class from the merged module before internalize; the
-                # result matches the Linux module's single external. No-op on
-                # Linux (visibility("default"), which internalize already lowers),
-                # so this is gated to the mingw module path. The dllstorageclass is
-                # always grammar at the HEAD of a def/global line (before any
-                # operand), so strip ` dllexport ` only in each line's prefix up to
-                # its first `"` — never inside a c"..." constant whose bytes happen
-                # to spell " dllexport " (a blunt global substitution would corrupt
-                # such a literal).
+                linkBc = "multicall/link_$2.bc";
                 internalizeIn = if stripDllexport then "${linkBc}.ll" else linkBc;
                 stripStep = nixpkgs.lib.optionalString stripDllexport ''
                   ${llvm} opt ${linkBc} -S -o ${linkBc}.ll
@@ -3284,6 +3288,7 @@ CBODY
                 '';
               in
               ''
+                _unpin_fold_prog() { # $1=program name $2=file stem $3=entry symbol
                 # 3-arg trampoline: forwards argc/argv/env so a 3-arg main (bash:
                 # main(argc,argv,env), reads env from the 3rd arg) gets its
                 # environment. 2-arg mains (grep/sed/coreutils) declare main with
@@ -3292,44 +3297,47 @@ CBODY
                 # same as the dispatcher→entry call). A 2-arg trampoline instead
                 # dropped env → a 3-arg main received NULL (verified) → SIGSEGV.
                 printf 'extern int main(int,char**,char**);\nint %s(int c,char**v,char**e){return main(c,v,e);}\n' \
-                  '${entryOf p}' > multicall/tramp_${sanCSym p.name}.c
-                $CC -flto -O2 -c multicall/tramp_${sanCSym p.name}.c -o multicall/tramp_${sanCSym p.name}.bc
-                ${nixpkgs.lib.optionalString infer inferSetup}
-                ${linkLine}
-                ${mainGuard}
-                ${natCollect}
-                # asm→bitcode rescue (the reverse of the SIMD case above): a native
-                # object (e.g. gzip's i386 match.o) may REFERENCE a global DEFINED in
-                # one of this program's own objects (deflate.c's window/strstart/…,
-                # which then live solely in module.bc). The default keep-list is just
-                # the entry trampoline, so opt -internalize makes those globals local
-                # → the native object goes undefined at the mega-link. Preserve them
-                # by adding `undefined(module_native.a) ∩ defined(progObjs)` to the
-                # keep-list. Restricted to OWN OBJECTS (not archives) so xz's
-                # lzma_crc32_table — which comes from liblzma.a and is also an
-                # external depArchive at the mega — is left internalized and resolved
-                # there (keeping it external would duplicate it). Empty — hence
-                # byte-identical — for self-contained asm (zstd, whose asm only
-                # DEFINES symbols) and asm-free packages; natCollect above is
-                # unchanged, so module_native.a stays byte-identical too. Single-
-                # program packages only isolate cleanly here (the shared archive ==
-                # this program's natives); all catalog asm packages are single-prog.
-                keeplist='${entryOf p}'
+                  "$3" > multicall/tramp_$2.c
+                $CC -flto -O2 -c multicall/tramp_$2.c -o multicall/tramp_$2.bc
+                ${llvm} ld.lld -r ${foldObjs} multicall/tramp_$2.bc $__arch \
+                  --lto-emit-llvm -o ${linkBc}
+                if ${llvm} nm --undefined-only ${linkBc} 2>/dev/null \
+                     | awk '{print $NF}' | grep -qxE '_?main'; then
+                  echo "multicallModuleHookLTO: '$1' defines no main of its own." >&2
+                  echo "  The entry trampoline would bind to the dispatcher's main and" >&2
+                  echo "  recurse until the stack is exhausted. A build whose main was" >&2
+                  echo "  already renamed by an earlier fold must not be folded again." >&2
+                  exit 1
+                fi
+                _unpin_collect "$module/lib/module_native.a" $__objs $__arch${nixpkgs.lib.optionalString wholeArchiveObjs " $__whole"}
+                keeplist="$3"
                 if ${llvm} llvm-ar t "$module/lib/module_native.a" >/dev/null 2>&1 \
                    && [ -n "$(${llvm} llvm-ar t "$module/lib/module_native.a" 2>/dev/null)" ]; then
                   ${llvm} llvm-nm --undefined-only "$module/lib/module_native.a" 2>/dev/null \
-                    | ${undefScrape} | sort -u > multicall/nat_${sanCSym p.name}.u
+                    | ${undefScrape} | sort -u > multicall/nat_$2.u
                   # defined externals of the OWN OBJECTS only (skip the "file:"
                   # headers llvm-nm prints when handed several files).
-                  ${llvm} llvm-nm --defined-only --extern-only ${progObjs} 2>/dev/null \
-                    | ${defScrape} | sort -u > multicall/obj_${sanCSym p.name}.d
-                  __extra=$(comm -12 multicall/nat_${sanCSym p.name}.u multicall/obj_${sanCSym p.name}.d)
+                  ${llvm} llvm-nm --defined-only --extern-only $__objs 2>/dev/null \
+                    | ${defScrape} | sort -u > multicall/obj_$2.d
+                  __extra=$(comm -12 multicall/nat_$2.u multicall/obj_$2.d)
                   for __s in $__extra; do keeplist="$keeplist,$__s"; done
-                  [ -n "$__extra" ] && echo "multicall(${p.name}): keeping asm-referenced bitcode syms external:" $__extra >&2 || true
+                  [ -n "$__extra" ] && echo "multicall($1): keeping asm-referenced bitcode syms external:" $__extra >&2 || true
                 fi
                 ${stripStep}
                 ${llvm} opt -passes=internalize -internalize-public-api-list="$keeplist" \
-                  ${internalizeIn} -o multicall/mod_${sanCSym p.name}.bc
+                  ${internalizeIn} -o multicall/mod_$2.bc
+                }
+              '';
+            # One call per program. A hand-listed program clears $__whole, which
+            # a sidecar program before it may have left set.
+            perProgram = p:
+              (if inferLinkInputs && (p.objs or null) == null
+               then readSidecar p
+               else explicitInputs p + nixpkgs.lib.optionalString wholeArchiveObjs ''
+                 __whole=
+               '')
+              + ''
+                _unpin_fold_prog ${nixpkgs.lib.escapeShellArg p.name} ${sanCSym p.name} ${entryOf p}
               '';
 
             # ── option A: shared-archive fold (foldSharedArchives, multi-prog) ──
@@ -3373,17 +3381,7 @@ CBODY
                 entry = entryOf p;
                 infer = inferLinkInputs && (p.objs or null) == null;
                 partial = "multicall/partial_${sanCSym p.name}.bc";
-                readInputs =
-                  if infer then readSidecar p else
-                    ''
-                      __objs="${spaceSep (p.objs or [ ])}"
-                      __arch="${spaceSep internalArchives}"
-                    ''
-                    # hand-listed objs are never COFF, but foldObjs below reads
-                    # $__objsBc unconditionally once coffObjs is on.
-                    + nixpkgs.lib.optionalString coffObjs ''
-                      __objsBc="$__objs"
-                    '';
+                readInputs = if infer then readSidecar p else explicitInputs p;
               in
               ''
                 printf 'extern int main(int,char**,char**);\nint %s(int c,char**v,char**e){return main(c,v,e);}\n' \
@@ -3498,6 +3496,7 @@ CBODY
                   esac
                 done
               }
+              ${readSidecarFn}
               ${if foldShared then ''
               : > multicall/union.arch.raw
               ${nixpkgs.lib.concatMapStringsSep "\n" perProgramShared programs}
@@ -3591,6 +3590,7 @@ CBODY
               ${llvm} opt -passes=internalize -internalize-public-api-list="$keeplist" \
                 multicall/link_all.bc -o "$module/lib/module.bc"
               '' else ''
+              ${foldProgFn}
               ${nixpkgs.lib.concatMapStringsSep "\n" perProgram programs}
               # always materialize module_native.a (empty archive if no asm) so the
               # manifest path is stable and the mega-link can reference it
