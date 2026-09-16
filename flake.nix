@@ -2537,7 +2537,16 @@ EOF
                     # This whole block is gated by `optionalString nukeRefs` glued to
                     # the strip line above: with removeReferences = [] it is "", so the
                     # buildPhase — and the drv — is byte-identical to before.
-                    for __unpin_p in $(grep -aoE '/nix/store/[a-z0-9]{32}-[^ "'"'"'()]*' "$out/bin/$__unpin_v" \
+                    #
+                    # `:` ends a token as surely as a space does. A RUNPATH is one
+                    # string of colon-joined directories, so without this the scan
+                    # saw `A/lib:B/lib:C/lib` as a single match and the sed below
+                    # trimmed it to A — leaving B and C undiscovered and their
+                    # closures attached. Measured on fastfetch, whose embedded
+                    # foreign-dlopen helpers carry exactly that shape: the scan found
+                    # 9 of 13 paths, and the 4 it missed (glibc, gcc-lib, musl and the
+                    # cross gcc-lib) were the whole remaining closure.
+                    for __unpin_p in $(grep -aoE '/nix/store/[a-z0-9]{32}-[^ :"'"'"'()]*' "$out/bin/$__unpin_v" \
                          | sed -E 's#(/nix/store/[a-z0-9]{32}-[a-zA-Z0-9._+-]+).*#\1#' | sort -u); do
                       for __unpin_pat in ${nixpkgs.lib.concatMapStringsSep " " nixpkgs.lib.escapeShellArg removeReferences}; do
                         case "$__unpin_p" in
