@@ -974,15 +974,19 @@ bool buildCxxRuntime(const std::string &self, const std::string &triple,
     bool isAsm = s.ends_with(".S") || s.ends_with(".s");
     bool isCpp = s.ends_with(".cpp");
     if (isCpp) {
-      // Unwind-seh.cpp is the Windows unwinder: its _Unwind_RaiseException
-      // raises THROUGH the caller. -fno-exceptions marks it `nounwind`, and once
-      // the TU and this bitcode share one LTO unit the optimizer believes it:
-      // __cxa_throw is inferred nounwind, every `invoke` of it turns into a
-      // `call`, and the landing pads go — no catch in any engine .exe ever ran,
-      // not even `throw 7; catch (int)` in main. The object keeps the same
+      // Unwind-seh.cpp (Windows) and Unwind-EHABI.cpp (32-bit ARM) are the
+      // unwinders whose _Unwind_RaiseException is C++: it raises THROUGH the
+      // caller. -fno-exceptions marks it `nounwind`, and once the TU and this
+      // bitcode share one LTO unit the optimizer believes it: __cxa_throw is
+      // inferred nounwind, every `invoke` of it turns into a `call`, and the
+      // landing pads go — no catch in any engine .exe ever ran, and on armv7l
+      // even `throw 7; catch (int)` in main aborted. The object keeps the same
       // undefined symbols (no personality reference), so a C `-lunwind` link is
-      // unaffected. The file is empty on the non-SEH targets.
-      a.push_back(s == "src/Unwind-seh.cpp" ? "-fexceptions" : "-fno-exceptions");
+      // unaffected. Each file is empty on the other targets; the DWARF unwinder
+      // everyone else uses is a C file, already -fexceptions below.
+      a.push_back(s == "src/Unwind-seh.cpp" || s == "src/Unwind-EHABI.cpp"
+                      ? "-fexceptions"
+                      : "-fno-exceptions");
       a.push_back("-fno-rtti");
     } else if (!isAsm) {
       a.push_back("-std=c99");
