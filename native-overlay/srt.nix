@@ -14,25 +14,32 @@
 #    the test object where `--as-needed` drops them → unresolvable refs.
 #    Rewrite to `-l` form so cc-wrapper appends at the tail. (libstdc++ only
 #    surfaced on aarch64, but `-l` is correct everywhere.)
+#
+# `.withOpenssl` is the same library on nixpkgs' own OpenSSL backend, with 3
+# and 4 kept: ffmpeg links OpenSSL for its TLS, and a second crypto library
+# for srt alone would only add size.
 { lib }:
 pkgs:
 let
   dropOpenssl = builtins.filter (d: (d.pname or "") != "openssl");
+  mk = mbedtls: pkgs.srt.overrideAttrs (oa: lib.optionalAttrs mbedtls {
+    buildInputs = dropOpenssl (oa.buildInputs or [ ]) ++ [ pkgs.mbedtls ];
+    propagatedBuildInputs = dropOpenssl (oa.propagatedBuildInputs or [ ]) ++ [ pkgs.mbedtls ];
+  } // {
+    cmakeFlags = (oa.cmakeFlags or [ ])
+      ++ lib.optional mbedtls "-DUSE_ENCLIB=mbedtls"
+      ++ [ "-DENABLE_APPS=OFF" ];
+    postInstall = (oa.postInstall or "") + ''
+      for pc in $out/lib/pkgconfig/srt.pc $out/lib/pkgconfig/haisrt.pc; do
+        [ -f "$pc" ] || continue
+        sed -i -E \
+          -e 's|[^ ]*/lib(mbed[a-z0-9]+)\.a|-l\1|g' \
+          -e 's|[^ ]*/libstdc\+\+\.a|-lstdc++|g' \
+          "$pc"
+      done
+    '';
+  } // lib.optionalAttrs mbedtls {
+    passthru = (oa.passthru or { }) // { withOpenssl = mk false; };
+  });
 in
-pkgs.srt.overrideAttrs (oa: {
-  buildInputs = dropOpenssl (oa.buildInputs or [ ]) ++ [ pkgs.mbedtls ];
-  propagatedBuildInputs = dropOpenssl (oa.propagatedBuildInputs or [ ]) ++ [ pkgs.mbedtls ];
-  cmakeFlags = (oa.cmakeFlags or [ ]) ++ [
-    "-DUSE_ENCLIB=mbedtls"
-    "-DENABLE_APPS=OFF"
-  ];
-  postInstall = (oa.postInstall or "") + ''
-    for pc in $out/lib/pkgconfig/srt.pc $out/lib/pkgconfig/haisrt.pc; do
-      [ -f "$pc" ] || continue
-      sed -i -E \
-        -e 's|[^ ]*/lib(mbed[a-z0-9]+)\.a|-l\1|g' \
-        -e 's|[^ ]*/libstdc\+\+\.a|-lstdc++|g' \
-        "$pc"
-    done
-  '';
-})
+mk true
