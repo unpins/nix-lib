@@ -2,9 +2,19 @@
 # expat`, but cairo/pango/librsvg drive pkg-config without `--static`,
 # dropping expat → cascading `XML_*` undef refs. Promote it to public
 # `Requires` (same pattern as brotli.nix / libtiff.nix).
+#
+# Also drop nixpkgs' `--with-default-fonts` (a dejavu store path) and
+# `--with-cache-dir=/var/cache/fontconfig`, so configure picks upstream's Windows
+# defaults: the system and per-user font folders when no fonts.conf is found,
+# and a cache under LOCALAPPDATA. With the store path a Windows binary knew no
+# fonts — ffmpeg's `drawtext` without `fontfile=` found none (see
+# native-overlay/fontconfig.nix).
 { lib }:
 self: super:
 super.fontconfig.overrideAttrs (oa: {
+  configureFlags = builtins.filter
+    (f: !(lib.hasPrefix "--with-default-fonts=" f || lib.hasPrefix "--with-cache-dir=" f))
+    (oa.configureFlags or [ ]);
   postInstall = (oa.postInstall or "") + ''
     # Merge `Requires.private: expat` INTO the existing
     # `Requires: freetype2 ...` line. A naive

@@ -2398,6 +2398,9 @@ EOF
         withRuntimeData = pkgs: { primary, stage }: drv:
           withUnpinEmbed pkgs { inherit primary; runtimeStage = stage; } drv;
 
+        # glibc's default thread stack, and musl's ceiling for PT_GNU_STACK.
+        linuxThreadStack = 8388608;
+
         # unpinEmbedWrap — the SINGLE post-build embed for every shipped binary
         # (native single-binary, mega/self-fold, windows mingw/cosmo, and the
         # build-coupled VFS packages vim/perl). It replaces the older overrideAttrs
@@ -2435,6 +2438,10 @@ EOF
           , runtimeStage ? null
           , stripCmd ? null
           , cosmoSymtabTrim ? false
+          , stackSize ? null        # linux ELF only: raise the primary's
+                                    # PT_GNU_STACK to this many bytes (see the
+                                    # copy loop). null leaves the drv untouched —
+                                    # the windows and darwin wraps pass none.
           , compatLinks ? [ ]       # extra bin/ names symlinked to the primary in
                                     # the SHIPPED tree. The wrap copies only the
                                     # primary variants, so a compat symlink the
@@ -2556,7 +2563,53 @@ EOF
                             break ;;
                         esac
                       done
-                    done''}
+                    done''}${
+                    # Thread stack. musl gives every thread 128 KB unless the
+                    # executable's PT_GNU_STACK asks for more (up to 8 MB); glibc
+                    # gives 8 MB, which is what the software we ship is written and
+                    # tested against, and the clang layout overflows 128 KB where
+                    # gcc's fit: ffmpeg's `-c:v libaom-av1` and `-c:v ffv1`
+                    # segfaulted in the encoder thread on every linux target, and the
+                    # x265 CLI before its own flag. mkUnpinStdenv links with
+                    # `-z stack-size`; here every shipped binary gets the same value
+                    # in the same header field, whichever way it was linked (the mega
+                    # fold, or a single program's own build — changing the engine
+                    # wrapper instead would rebuild every library). Address space
+                    # only: pages are touched on demand. A larger value stays.
+                    nixpkgs.lib.optionalString (stackSize != null) ''
+
+                  if [ "$__unpin_v" = "${primary}" ]; then
+                    __f="$out/bin/$__unpin_v"
+                    [ "$(od -An -tx1 -N6 "$__f" | tr -d ' \n')" = 7f454c460201 ] \
+                      || [ "$(od -An -tx1 -N6 "$__f" | tr -d ' \n')" = 7f454c460101 ] \
+                      || { echo "unpinEmbedWrap: $__f is not a little-endian ELF" >&2; exit 1; }
+                    if [ "$(od -An -tu1 -j4 -N1 "$__f" | tr -d ' ')" = 2 ]; then
+                      __phoff=$(od -An -tu8 -j32 -N8 "$__f"); __phent=$(od -An -tu2 -j54 -N2 "$__f")
+                      __phnum=$(od -An -tu2 -j56 -N2 "$__f"); __memsz=40; __w=8
+                    else
+                      __phoff=$(od -An -tu4 -j28 -N4 "$__f"); __phent=$(od -An -tu2 -j42 -N2 "$__f")
+                      __phnum=$(od -An -tu2 -j44 -N2 "$__f"); __memsz=20; __w=4
+                    fi
+                    __found=0; __i=0
+                    while [ "$__i" -lt $((__phnum)) ]; do
+                      __o=$((__phoff + __i * __phent))
+                      if [ $(od -An -tu4 -j$__o -N4 "$__f") = 1685382481 ]; then  # PT_GNU_STACK
+                        __found=1
+                        __at=$((__o + __memsz))
+                        if [ $(( $(od -An -tu$__w -j$__at -N$__w "$__f") )) -lt ${toString stackSize} ]; then
+                          __v=${toString stackSize}; __b=""
+                          for __k in $(seq 1 $__w); do
+                            __b="$__b$(printf '\\%03o' $((__v % 256)))"; __v=$((__v / 256))
+                          done
+                          printf "$__b" | dd of="$__f" bs=1 seek=$__at conv=notrunc status=none
+                        fi
+                        [ $(( $(od -An -tu$__w -j$__at -N$__w "$__f") )) -ge ${toString stackSize} ] \
+                          || { echo "unpinEmbedWrap: could not set the stack size of $__f" >&2; exit 1; }
+                      fi
+                      __i=$((__i + 1))
+                    done
+                    [ "$__found" = 1 ] || { echo "unpinEmbedWrap: $__f has no PT_GNU_STACK" >&2; exit 1; }
+                  fi''}
                   __unpin_bins+=("$out/bin/$__unpin_v")
                 fi
               done
@@ -4263,6 +4316,8 @@ CBODY
             manRoot = combinedMan;
             inherit removeReferences;
             stripCmd = ":";
+            stackSize =
+              if !cosmoMode && pkgs.stdenv.hostPlatform.isLinux then linuxThreadStack else null;
             runtimeStage =
               if combinedRt == null then null
               else ''
@@ -4617,6 +4672,18 @@ CBODY
                 }
                 // nixpkgs.lib.optionalAttrs (prev ? x264)
                   { x264 = prev.x264.override { stdenv = engStdenvNoLto; }; }
+                # libtheora's x86 kernels are inline asm (`__asm__` inside C
+                # functions) that use xmm0-15 and the MMX registers but declare
+                # only "memory" as clobbered. On x86_64 SSE2 is baseline, so the
+                # encoder calls them DIRECTLY instead of through its CPU vtable, and
+                # whole-program LTO inlines them into callers that keep their own
+                # values in those registers. ffmpeg's `-c:v libtheora` then encoded
+                # 0.7 dB worse than the gcc build on linux, worse again on darwin,
+                # and crashed with an access violation on windows (xmm6-15 are
+                # callee-saved there). Built without LTO the kernels stay calls.
+                # i686, which dispatches through the vtable, already matched gcc.
+                // nixpkgs.lib.optionalAttrs (prev ? libtheora)
+                  { libtheora = prev.libtheora.override { stdenv = engStdenvNoLto; }; }
                 else { });
             withBashFix = engineLayer {
               gate = isEngineScope;
@@ -4950,6 +5017,21 @@ CBODY
                 # ("ERROR: x264 not found using pkg-config").
                 {
                   x264 = p.x264.override {
+                    stdenv =
+                      let b = p.stdenvAdapters.makeStaticLibraries
+                                windowsEngineStdenvSharedNoLto;
+                      in b // { hostPlatform = b.hostPlatform // { isStatic = true; }; };
+                  };
+                }
+              // nixpkgs.lib.optionalAttrs
+                ((p.stdenv.hostPlatform.isMinGW or false) && p ? libtheora)
+                # Same pin as the pkgsStatic scope, and it matters most here: the
+                # inline-asm kernels clobber xmm6-15, which the Windows x64 ABI
+                # makes callee-saved, so once LTO inlined them `-c:v libtheora`
+                # died with an access violation. Same static stdenv spelling as
+                # x264 above, for the same reason.
+                {
+                  libtheora = p.libtheora.override {
                     stdenv =
                       let b = p.stdenvAdapters.makeStaticLibraries
                                 windowsEngineStdenvSharedNoLto;
@@ -5693,6 +5775,7 @@ CBODY
                 # it deliberately.
                 declaredAliases = announcedNamesOf mcPrograms;
                 nativeEmbedOpts = { primary = binName; man = embedMan; removeReferences = removeReferences ++ (if multicall == null then [ ] else multicall.removeReferences or [ ]); }
+                  // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux { stackSize = linuxThreadStack; }
                   // nixpkgs.lib.optionalAttrs (binName != name) { compatLinks = [ name ]; }
                   // nixpkgs.lib.optionalAttrs (declaredAliases != [ ]) { aliases = declaredAliases; }
                   // (if runtimeEmbedNative != null then runtimeEmbedNative pkgs base else { });
