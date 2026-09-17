@@ -4678,10 +4678,10 @@ CBODY
                 # encoder calls them DIRECTLY instead of through its CPU vtable, and
                 # whole-program LTO inlines them into callers that keep their own
                 # values in those registers. ffmpeg's `-c:v libtheora` then encoded
-                # 0.7 dB worse than the gcc build on linux, worse again on darwin,
-                # and crashed with an access violation on windows (xmm6-15 are
-                # callee-saved there). Built without LTO the kernels stay calls.
-                # i686, which dispatches through the vtable, already matched gcc.
+                # 0.7 dB worse than the gcc build on linux and worse again on
+                # darwin. Built without LTO the kernels stay calls. i686, which
+                # dispatches through the vtable, already matched gcc. (Windows is a
+                # different ABI problem, fixed in the mingw scope below.)
                 // nixpkgs.lib.optionalAttrs (prev ? libtheora)
                   { libtheora = prev.libtheora.override { stdenv = engStdenvNoLto; }; }
                 else { });
@@ -5025,18 +5025,22 @@ CBODY
                 }
               // nixpkgs.lib.optionalAttrs
                 ((p.stdenv.hostPlatform.isMinGW or false) && p ? libtheora)
-                # Same pin as the pkgsStatic scope, and it matters most here: the
-                # inline-asm kernels clobber xmm6-15, which the Windows x64 ABI
-                # makes callee-saved, so once LTO inlined them `-c:v libtheora`
-                # died with an access violation. Same static stdenv spelling as
-                # x264 above, for the same reason.
+                # No asm at all on Windows. The x86_64 kernels are written for
+                # the SysV ABI: they use xmm6-15 freely and save none of them, and
+                # the Windows x64 ABI makes xmm6-15 callee-saved. Every call into
+                # them corrupts the caller, inlined or not — `-c:v libtheora` died
+                # with an access violation even with LTO off. libtheora's
+                # configure enables them for any x86_64 host, so turn them off
+                # and fail if the define survives.
                 {
-                  libtheora = p.libtheora.override {
-                    stdenv =
-                      let b = p.stdenvAdapters.makeStaticLibraries
-                                windowsEngineStdenvSharedNoLto;
-                      in b // { hostPlatform = b.hostPlatform // { isStatic = true; }; };
-                  };
+                  libtheora = p.libtheora.overrideAttrs (oa: {
+                    configureFlags = (oa.configureFlags or [ ]) ++ [ "--disable-asm" ];
+                    postConfigure = (oa.postConfigure or "") + ''
+                      if grep -q 'define OC_X86_ASM' config.h; then
+                        echo "libtheora: x86 asm still enabled on mingw" >&2; exit 1
+                      fi
+                    '';
+                  });
                 }
               else { });
           };
