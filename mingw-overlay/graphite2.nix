@@ -1,4 +1,4 @@
-# graphite2 cross-mingw, four fixes:
+# graphite2 cross-mingw, five fixes:
 #
 # 1. `NIX_CFLAGS += -DGRAPHITE2_STATIC` — headers default `GR2_API` to
 #    dllimport; test exes link `libgraphite2.a` and get `__imp_gr_*` undef.
@@ -24,13 +24,18 @@
 #    the three archives it really ships. A C link resolves them too: the driver
 #    builds the C++ runtime and adds its -L when the line NAMES `-lunwind` —
 #    the same door rustc goes through, since rustc drives clang, not clang++.
+#
+# 5. `python3 = buildPackages.python3` — the recipe's
+#    `(python3.withPackages …)` resolves to the HOST (mingw) python, which
+#    nixpkgs marks broken, so nothing that reaches harfbuzz evaluated. See the
+#    fourth note in ../native-overlay/graphite2.nix.
 { lib }:
 self: super:
 let
   onEngine = lib.hasInfix "unpin-cc" (super.stdenv.cc.name or "");
   cxxRuntime = if onEngine then "-lc++ -lc++abi -lunwind" else "-lstdc++";
 in
-lib.appendCFlags (super.graphite2.overrideAttrs (oa: {
+lib.appendCFlags ((super.graphite2.override { python3 = super.buildPackages.python3; }).overrideAttrs (oa: {
   postPatch = (oa.postPatch or "") + ''
     substituteInPlace CMakeLists.txt \
       --replace-fail "add_subdirectory(tests)" "# add_subdirectory(tests) — dropped for mingw static build"

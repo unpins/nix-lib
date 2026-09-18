@@ -4794,9 +4794,8 @@ CBODY
                       # copies never pass through it. Without them the chain dies
                       # one dep at a time: glib/pango "Subsystem not defined" (meson
                       # can't autodetect it in cross mode), cairo's
-                      # ipc_rmid_deferred_release darwin lookup, graphite2's
-                      # unguarded `nolib_test($<TARGET_SONAME_FILE:graphite2>)` on
-                      # a static lib, dav1d's cpu_family='arm64' asm dispatch. Same
+                      # ipc_rmid_deferred_release darwin lookup, dav1d's
+                      # cpu_family='arm64' asm dispatch. Same
                       # set `rsvg-convert` uses to build this chain standalone.
                       # Darwin-gated, so every other host keeps its hash.
                       # NOT iconv-converged, deliberately. This chain is not
@@ -4845,14 +4844,11 @@ CBODY
                           cairo      = nativeFixes.cairo      p;
                           dav1d      = nativeFixes.dav1d      p;
                         })
-                        # Everywhere else graphite2 is the only one, and for a
-                        # different reason than darwin's: CMake's libtool
-                        # emulation writes a `libgraphite2.la` naming a
-                        # `libgraphite2.so` the static build never made. Only a
-                        # LIBTOOL consumer of this chain trips on it — libtool
-                        # rewrites `-lgraphite2` into that absolute path and the
-                        # link dies (chafa; ffmpeg's own build system never reads
-                        # a `.la`).
+                        # Everywhere else graphite2 is the only one: its recipe
+                        # asks for `python3.withPackages`, which resolves to the
+                        # HOST python, a whole static CPython with fonttools.
+                        # The fix hands it the build machine's python; darwin
+                        # gets the same fix from the list above.
                         else pkgs.pkgsStatic.extend (_f: p: {
                           graphite2 = nativeFixes.graphite2 p;
                         })).extend (_f: p:
