@@ -1083,6 +1083,133 @@ EOF
                 export UNPIN_CAPTURE_LINKS=1
                 export UNPIN_LINK_DIR="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-links"
               '');
+            # The BUILD-machine compiler, and the assertion that the build
+            # believed it. Two halves of one invariant, in one hook: they share a
+            # gate and must never drift apart.
+            #
+            # (1) THE DEFECT. Nothing in a cross engine build sets CC_FOR_BUILD,
+            # so a configure that wants a build-machine compiler looks one up by
+            # NAME — and `cc`/`gcc`/`c++` in ccUnwrapped's bin/ are bare with a
+            # baked `-target <triple>` (see the ccUnwrapped mk() above), put on
+            # PATH unconditionally by the cc-wrapper's own setup hook. The TARGET
+            # clang is then taken for the builder's compiler. meson labels the
+            # build machine from that compiler's own defines and its cross-sizeof
+            # shortcut `_cross_compute_int` (clike.py:462-474) COMPILES AND RUNS a
+            # probe with it.
+            #
+            # (1b) THE SAME DEFECT WEARS THREE AUTOTOOLS NAMES, and they do not
+            # share a variable. `AX_PROG_CC_FOR_BUILD` (audit, flex) reads
+            # CC_FOR_BUILD; gnulib's `gl_BUILD_CC` (coreutils, coreutils-full,
+            # gzip), e2fsprogs' own `AC_CHECK_PROGS(BUILD_CC,[gcc cc])` and
+            # Dickey's `CF_BUILD_CC` (mawk, ncurses) all read BUILD_CC. All three
+            # end in the SAME autoconf expansion, whose search is short-circuited
+            # by a preset value — verified in the generated scripts, not inferred:
+            # coreutils' configure wraps the whole probe in
+            # `if test $cross_compiling = yes; then if test -z "$BUILD_CC"`, and
+            # both it and ncurses-6.6/configure:5562 carry autoconf's
+            # `ac_cv_prog_BUILD_CC="$BUILD_CC" # Let the user override the test.`
+            # So presetting BUILD_CC makes `checking for gcc... gcc` — the line
+            # that means a target clang just became the build compiler — stop
+            # happening at all, instead of being answered wrongly.
+            #
+            # (2) WHERE IT CAN LAND, which is why this gate is the HOST cpu and
+            # not "is cross". `detect_cpu_family` (envconfig.py:600-627) starts
+            # from the BUILDER's own platform.machine() and only ever DEMOTES it:
+            # x86_64 -> x86 on __i386__, aarch64 -> arm on __arm__. There is no
+            # x86_64 -> aarch64 entry and never was an aarch64 -> arm tolerance.
+            # So of our six cross configurations exactly TWO can be mislabelled:
+            #   aarch64 builder -> armv7l   LOUD. machine_info_can_run
+            #     (envconfig.py:745-763) tolerates only x86_64 -> x86 and
+            #     mips64 -> mips, so running the probe raises CrossNoRunException
+            #     (compilers.py:438 — a SIBLING of EnvironmentException, so
+            #     clike.py's `except` does not swallow it) and configure dies.
+            #     This is the armv7l CI failure that the curated
+            #     `mesonBuildCcPkgs` list used to chase package by package.
+            #   x86_64 builder -> i686      SILENT. x86_64 -> x86 IS tolerated, so
+            #     the probe compiles, runs, and answers — with a 32-bit compiler
+            #     standing in for a 64-bit builder. Measured 2026-09-20 over the
+            #     local build logs: 24 of 32 meson packages on i686 report
+            #     `Build machine cpu family: x86`. Green, and wrong, for months.
+            # Every other cross (aarch64/ppc64le/riscv64/armv7l from x86_64) is
+            # immune BY CONSTRUCTION — which is also why this x86_64 box could
+            # never reproduce the armv7l symptom. Widening the gate would rehash
+            # the catalog on nine platforms to assert something meson's own source
+            # makes unfalsifiable; if a nixpkgs bump adds a demotion entry, widen
+            # the gate with it.
+            #
+            # (3) EVERY EXPORT IS `:=`, NEVER AN OVERWRITE. A cc-wrapper sitting
+            # in depsBuildBuild already exports a correct CC_FOR_BUILD (that is how
+            # fribidi, bash, perl and friends have always been fine), and three
+            # packages set their own in preConfigure — php, dnsutils, fastfetch,
+            # all darwin-gated, so outside this gate anyway. A package's own
+            # preConfigure ATTR runs BEFORE preConfigureHooks (runHook does
+            # `_callImplicitHook` first), so an unconditional export here would
+            # silently win over a deliberate choice. Filling a gap is additive;
+            # overruling a decision is not.
+            #
+            # (4) THE ASSERT IS THE HALF THAT CANNOT ROT. It reads meson's OWN
+            # verdict out of meson-logs/meson-log.txt — present even on a native
+            # build, where the line is never echoed to stdout — and compares it
+            # with the builder we already know at eval time. Two independent
+            # sources, so this is not another of the project's tautological
+            # guards, and it has a red case before it is even deployed (the i686
+            # 24). It also catches what a "the hook is attached" check cannot: a
+            # meson bump that stops honouring *_FOR_BUILD would go RED here
+            # instead of regressing in silence. And because it lives IN the drv,
+            # cachix cannot hide it the way it hid at-spi2-core for months — a
+            # cached output is necessarily one that passed.
+            buildCcForBuild = pkgs.pkgsBuildBuild.stdenv.cc;
+            buildCpuName = pkgs.stdenv.buildPlatform.parsed.cpu.name;
+            mesonCanMislabelBuildCpu =
+              let h = hostPkgs.stdenv.hostPlatform; in
+              (h.isAarch32 or false) || (h.isx86_32 or false);
+            buildCcHook = pkgs.makeSetupHook { name = "unpin-build-cc"; }
+              (pkgs.writeText "unpin-build-cc.sh" ''
+                _unpinsBuildCC() {
+                  : "''${CC_FOR_BUILD:=${buildCcForBuild}/bin/cc}"
+                  : "''${CXX_FOR_BUILD:=${buildCcForBuild}/bin/c++}"
+                  : "''${BUILD_CC:=${buildCcForBuild}/bin/cc}"
+                  export CC_FOR_BUILD CXX_FOR_BUILD BUILD_CC
+                }
+                preConfigureHooks+=(_unpinsBuildCC)
+
+                _unpinsAssertMesonBuildCpu() {
+                  # mesonConfigurePhase cd's INTO the build dir before running
+                  # postConfigure, so the log is normally right here — but a
+                  # package's own postConfigure ATTR runs BEFORE this hook and
+                  # may cd back to the source root, so also look one level in.
+                  # A guard that false-positives gets deleted, not fixed.
+                  local log=
+                  local c
+                  for c in meson-logs/meson-log.txt \
+                           "''${mesonBuildDir:-build}/meson-logs/meson-log.txt"; do
+                    if [ -f "$c" ]; then log=$c; break; fi
+                  done
+                  if [ -z "$log" ]; then
+                    # Not a meson configure, so there is nothing to assert. But
+                    # when meson OWNS the phase the log MUST exist: skipping
+                    # silently is exactly how a guard becomes vacuous.
+                    if [ "''${configurePhase:-}" = mesonConfigurePhase ]; then
+                      echo "unpins: mesonConfigurePhase left no meson-log.txt (cwd $PWD)" >&2
+                      exit 1
+                    fi
+                    return 0
+                  fi
+                  # One sed, no pipeline: `set -o pipefail` plus a `head` that
+                  # closes the pipe early can hand SIGPIPE back as the status and
+                  # `set -e` would then kill the build for a race, not a defect.
+                  # `s//` reuses the address regex; `q` stops at the first match.
+                  local got
+                  got=$(sed -n '/^Build machine cpu family: /{s///p;q;}' "$log")
+                  if [ "$got" != "${buildCpuName}" ]; then
+                    echo "unpins: meson calls the BUILD machine '$got'; this builder is '${buildCpuName}'." >&2
+                    echo "unpins: a ${target} compiler is standing in for the build-machine compiler." >&2
+                    echo "unpins: CC_FOR_BUILD=''${CC_FOR_BUILD:-<unset>}" >&2
+                    exit 1
+                  fi
+                }
+                postConfigureHooks+=(_unpinsAssertMesonBuildCpu)
+              '');
             # nixpkgs' makeStaticDarwin adapter appends `-static-libgcc` to
             # NIX_CFLAGS_LINK whenever `stdenv.cc.isGNU` — and the engine cc claims
             # GNU on purpose (see (1) in the header). The adapter re-reads
@@ -1160,6 +1287,7 @@ EOF
             ((pkgs.overrideCC hostPkgs.stdenv cc).override (old: {
               extraNativeBuildInputs = (old.extraNativeBuildInputs or [ ]) ++ [ seedHook ]
                 ++ nixpkgs.lib.optional captureLinks captureHook
+                ++ nixpkgs.lib.optional mesonCanMislabelBuildCpu buildCcHook
                 ++ nixpkgs.lib.optional isDarwinTarget dropStaticLibgccHook;
               # The darwin stdenv bakes `apple-sdk` into `extraBuildInputs`, so
               # every mkDerivation pulls the SDK's setup hooks (re-export SDKROOT,
@@ -1526,51 +1654,6 @@ EOF
             grep -qF -- '${flags}' "$pc" || sed -i 's|^Cflags:|Cflags: ${flags}|' "$pc"
           done
         '';
-
-        # armv7l (aarch32) engine cross: nothing sets CC_FOR_BUILD, so meson
-        # auto-detects the engine's unprefixed `cc` (an arm-TARGETING clang) as
-        # the BUILD-machine compiler too (CI log: "C compiler for the build
-        # machine: cc (clang 21.1.8)" + "Build machine cpu family: arm"). meson's
-        # cross-sizeof shortcut `_cross_compute_int` then COMPILES a probe with
-        # that build compiler and RUNS it (clike.py:469) — an armv7l binary. On
-        # the aarch64 CI runner there is no arm binfmt, so run() raises
-        # CrossNoRunException "Can not run test applications" (compilers.py:690;
-        # NOT an EnvironmentException, so clike.py's `except` does not swallow it)
-        # → configure dies. glib's `cc.sizeof('char')` is the first to hit it, so
-        # EVERY engine meson package on armv7l is affected. It only "passes"
-        # locally because this x86_64 box has qemu-arm binfmt with the fix-binary
-        # (F) flag that leaks into the sandbox — the in-build qemu we forbid.
-        #
-        # Fix: export CC_FOR_BUILD/CXX_FOR_BUILD = the REAL builder's native
-        # compiler (pkgsBuildBuild.stdenv.cc — aarch64 gcc in CI, x86_64 gcc under
-        # the local helper). meson reads *_FOR_BUILD for the build-machine
-        # compiler (environment.py:65), so the probe is compiled AND run with a
-        # builder-native compiler → runs natively, never qemu; it also makes meson
-        # detect the build cpu as the builder's, so need_exe_wrapper(BUILD) is
-        # False. Only armv7l trips this — it is the sole cross built on a
-        # foreign-arch (aarch64) runner; the x86_64-hosted crosses (i686/ppc64le/
-        # riscv64) already keep a builder-native build compiler.
-        #
-        # Attach per-package via nativeBuildInputs — NEVER touch the global meson
-        # drv (re-hashes the world, see withDarwinMesonObjc above). Gated to
-        # aarch32 cross by its enginePkgsStatic call site → strict no-op
-        # (byte-identical) on every other arch and non-meson package.
-        withMesonBuildCC = pkgs: drv:
-          let
-            bp = pkgs.buildPackages;
-            buildCC = pkgs.pkgsBuildBuild.stdenv.cc;
-            hook = bp.makeSetupHook { name = "meson-buildcc-hook"; }
-              (bp.writeText "meson-buildcc-hook.sh" ''
-                _unpinsMesonBuildCC() {
-                  export CC_FOR_BUILD=${buildCC}/bin/cc
-                  export CXX_FOR_BUILD=${buildCC}/bin/c++
-                }
-                preConfigureHooks+=(_unpinsMesonBuildCC)
-              '');
-          in
-          drv.overrideAttrs (oa: {
-            nativeBuildInputs = (oa.nativeBuildInputs or [ ]) ++ [ hook ];
-          });
 
         # DNS fallback (linux-static). A tiny C archive providing
         # __wrap_getaddrinfo / __wrap_freeaddrinfo. musl's resolver can't reach
@@ -4728,56 +4811,12 @@ CBODY
                 } acc)
               withBashFix
               (builtins.attrNames autoWiredFixes);
-            # See withMesonBuildCC above. armv7l is the only cross built on a
-            # foreign-arch runner, so it is the only host where meson's build-
-            # machine compiler must be pinned to the native builder. Curated list
-            # of the engine meson packages (same by-name style as autoWiredFixes);
-            # add new meson deps here as the catalog grows. Gated to aarch32 CROSS
-            # → identity overlay (byte-identical) on every other arch; the
-            # `prev ? ${n}` guard skips names absent from a given set, and the
-            # whole branch is lazy so non-aarch32 never forces these attrs.
-            #
-            # A curated list is a per-closure whack-a-mole, so enumerate BEFORE
-            # pushing a migration, not after a red CI: instantiate the package's
-            # armv7l target, then walk its `-static-armv7l` requisite .drv files
-            # for one that names `-meson-<ver>.drv` but NOT `meson-buildcc-hook`.
-            # Each miss costs a full CI round. Membership is a property of the
-            # closure, not of the engine, so a package can sit here wrong for
-            # months while cachix serves the old output and hides it.
-            mesonBuildCcPkgs = [
-              "glib"
-              "cairo"
-              "pixman"
-              "pango"
-              "dav1d"
-              "librsvg"
-              "libopus"
-              "librist"
-              "libbluray"
-              "rubberband"
-              "dbus"
-              "libdrm"
-              "libgudev"
-              "libsysprof-capture"
-              "xorgproto"
-              "harfbuzz"
-              "libvmaf"
-              "at-spi2-core"
-              "gdk-pixbuf"
-            ];
-            withMesonBuildCcFix = engineLayer {
-              gate = prev:
-                prev.stdenv.hostPlatform.isAarch32
-                && prev.stdenv.buildPlatform != prev.stdenv.hostPlatform;
-              names = mesonBuildCcPkgs;
-              fix = withMesonBuildCC;
-            } withDepFixes;
             # Swap libjpeg-turbo to the lto=false engine stdenv set-wide (see
             # engStdenvNoLto above). nixpkgs' `libjpeg` aliases `libjpeg_turbo`;
             # override the concrete attr and re-point the alias so consumers of
             # either name get the no-LTO build. Gated isMusl||isStatic like the
             # other set-wide engine fixes; identity on non-engine hosts.
-            withLibjpegNoLto = withMesonBuildCcFix.extend
+            withLibjpegNoLto = withDepFixes.extend
               (_final: prev:
                 if isEngineScope prev && (prev ? libjpeg_turbo || prev ? libjpeg)
                 then
