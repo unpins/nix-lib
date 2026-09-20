@@ -4736,6 +4736,14 @@ CBODY
             # → identity overlay (byte-identical) on every other arch; the
             # `prev ? ${n}` guard skips names absent from a given set, and the
             # whole branch is lazy so non-aarch32 never forces these attrs.
+            #
+            # A curated list is a per-closure whack-a-mole, so enumerate BEFORE
+            # pushing a migration, not after a red CI: instantiate the package's
+            # armv7l target, then walk its `-static-armv7l` requisite .drv files
+            # for one that names `-meson-<ver>.drv` but NOT `meson-buildcc-hook`.
+            # Each miss costs a full CI round. Membership is a property of the
+            # closure, not of the engine, so a package can sit here wrong for
+            # months while cachix serves the old output and hides it.
             mesonBuildCcPkgs = [
               "glib"
               "cairo"
@@ -4754,6 +4762,8 @@ CBODY
               "xorgproto"
               "harfbuzz"
               "libvmaf"
+              "at-spi2-core"
+              "gdk-pixbuf"
             ];
             withMesonBuildCcFix = engineLayer {
               gate = prev:
