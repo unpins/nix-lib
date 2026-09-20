@@ -740,9 +740,15 @@
             # Give darwin its face the day dnsFallback reaches it.
             engineLldRSafe = pkgs.runCommand "unpin-engine-lld-rsafe-${target}" { } ''
               mkdir -p $out/bin
-              cp ${rSafeLd pkgs "${toolchain}/bin/llvm ld.lld"} $out/bin/ld.lld
+              cp ${engineLd pkgs "${toolchain}/bin/llvm ld.lld"} $out/bin/ld.lld
               chmod +x $out/bin/ld.lld
             '';
+            # The `ld` a build execs directly (bintoolsUnwrapped): the Linux
+            # engine links a bitcode musl, so it gets engineLd too.
+            directLd =
+              if !isDarwinTarget && !isWinTarget
+              then engineLd pkgs "${toolchain}/bin/llvm ld.lld"
+              else rSafeLd pkgs "${toolchain}/bin/llvm ld.lld";
             engineRSafeLdFlag = nixpkgs.lib.optionalString
               (!isDarwinTarget && !isWinTarget) "-B${engineLldRSafe}/bin ";
             # `version` is what nixpkgs' version-gated cc branches read
@@ -848,8 +854,8 @@
               # wrapper in front of it appends NIX_LDFLAGS unconditionally, so the
               # partial link sees flags meant for the final one. `-B`-based lld
               # wrapping never covers this path — the wrapper execs us by path.
-              cp ${rSafeLd pkgs "${toolchain}/bin/llvm ld.lld"} "$out/bin/${target}-ld"
-              cp ${rSafeLd pkgs "${toolchain}/bin/llvm ld.lld"} "$out/bin/${target}-ld.lld"
+              cp ${directLd} "$out/bin/${target}-ld"
+              cp ${directLd} "$out/bin/${target}-ld.lld"
               chmod +x "$out/bin/${target}-ld" "$out/bin/${target}-ld.lld"
               # windres: the Windows resource compiler (.rc → .res COFF). mingw
               # autotools packages (libiconv, …) compile a version-info resource via
@@ -1389,6 +1395,21 @@ EOF
         rSafeLd = wpkgs: real: wpkgs.writeScript "unpin-ld-rsafe" ''
           #!/bin/sh
           ${rSafeStrip}
+          exec ${real} "$@"
+        '';
+
+        # rSafeLd for the Linux engine, plus `-u malloc` on every full link.
+        # musl's `malloc` is a weak alias, and a full-LTO link against a bitcode
+        # libc can drop it while calls to it survive: `undefined symbol:
+        # malloc`, lld noting calloc IS defined in the same `.lto.o`. Tiny
+        # programs never hit it; linking libcairo.a does, so pango's cairo-ft
+        # probe failed and cairo's own tools, krb5kdc and the multicall link
+        # (bitcodeLibcForce) all died on it. `-u` pins the symbol through LTO.
+        # Not on `-r`: a partial link must not pull libc members.
+        engineLd = wpkgs: real: wpkgs.writeScript "unpin-engine-ld" ''
+          #!/bin/sh
+          ${rSafeStrip}
+          [ "$__reloc" = 1 ] || set -- "$@" -u malloc
           exec ${real} "$@"
         '';
 
