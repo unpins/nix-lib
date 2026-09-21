@@ -1531,9 +1531,15 @@ EOF
         # libc can drop it while calls to it survive: `undefined symbol:
         # malloc`, lld noting calloc IS defined in the same `.lto.o`. Tiny
         # programs never hit it; linking libcairo.a does, so pango's cairo-ft
-        # probe failed and cairo's own tools, krb5kdc and the multicall link
-        # (bitcodeLibcForce) all died on it. `-u` pins the symbol through LTO.
+        # probe failed and cairo's own tools, krb5kdc and the multicall link all
+        # died on it. `-u` pins the symbol through LTO.
         # Not on `-r`: a partial link must not pull libc members.
+        # This is also the ONLY source of that `-u` now. The multicall link used
+        # to paste its own `-Wl,-u,malloc`, from back when only that link was
+        # known to need it; the flag is baked into the cc wrapper here
+        # (engineRSafeLdFlag, and directLd for an ld a build execs itself), so
+        # every full link on a Linux engine target already carries it and the
+        # pasted copy was a duplicate of this one.
         engineLd = wpkgs: real: wpkgs.writeScript "unpin-engine-ld" ''
           #!/bin/sh
           ${rSafeStrip}
@@ -4233,18 +4239,6 @@ CBODY
             # darwin drops the groups and swaps `-Wl,-s`→`-Wl,-x`. No-op off darwin.
             isDarwinHost = pkgs.stdenv.hostPlatform.isDarwin or false;
             stripLinkFlag = if isDarwinHost then "-Wl,-x" else "-Wl,-s";
-            # Bitcode libc: musl's `malloc` is a WEAK alias of the strong
-            # `__libc_malloc`. NATIVE objects in the link — the asm/SIMD sidecars
-            # the bitcode hook rescues — reference `malloc` invisibly to the
-            # `-flto` link's LTO, so it internalizes/drops the weak `malloc` from
-            # the codegen'd libc → `undefined symbol: malloc` at final resolution.
-            # `-u malloc` both pulls the defining object AND adds `malloc` to the LTO
-            # preserve set so it survives into the output for the native objects to
-            # bind. Gate on a linux host (every linux engine mega links the bitcode
-            # libc); exclude darwin/windows (libSystem/mingw, no weak-musl-malloc).
-            bitcodeLibcForce = nixpkgs.lib.optionalString
-              (!isDarwinHost && !pkgs.stdenv.hostPlatform.isWindows)
-              "-Wl,-u,malloc ";
             # A group is needed when there is more than one archive to back-ref
             # across — explicit depArchives OR auto-derived dirs both count. Never on
             # darwin (ld64 has no --start-group and doesn't need it).
@@ -4291,8 +4285,6 @@ CBODY
                   lto = anyBitcode;
                 };
                 prelude = winSidecarPrelude;
-                # `bitcodeLibcForce` carries a trailing space and pastes straight
-                # onto `-o` — keep the concatenation exact.
                 linkLine = ''
                   # stripLinkFlag (-Wl,-s on ELF/PE, -Wl,-x on Mach-O) strips at link
                   # (after LTO codegen bound the entries) — the entries are dead in the
@@ -4300,7 +4292,7 @@ CBODY
                   # UNPIN_META ZIP is embedded post-link by withAliases, so it survives
                   # the strip. Explicit depArchives + auto-derived (autodeps) ride in
                   # one group (empty on darwin — ld64 resolves back-refs multi-pass).
-                  ${face} -fuse-ld=lld ${stripLinkFlag} ${bitcodeLibcForce}-o ${binFile} \
+                  ${face} -fuse-ld=lld ${stripLinkFlag} -o ${binFile} \
                     multicall/dispatcher.c \
                     ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
                     ${groupOpen} ${nixpkgs.lib.concatStringsSep " " nativeArchives} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose} \
