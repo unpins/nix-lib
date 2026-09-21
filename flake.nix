@@ -5579,6 +5579,14 @@ CBODY
             # programs it folded, and which scope resolves a `pkgs:` option — so it
             # is written once: two copies let an option declared on `multicall`
             # reach one target and silently skip the other.
+            # `pkgs` is the TARGET scope (see the two call sites). The options it
+            # resolves have to be written for that: `depArchives` names archives
+            # of the target, which is exactly what a target scope answers, while
+            # `runtimeDataRoot` stages host-independent DATA and must reach for
+            # its tools through `pkgs.buildPackages` — bare `pkgs.<tool>` there
+            # would cross-compile the tool. file, nano and tcc all spell it
+            # `buildPackages` and are byte-identical under either scope; that is
+            # the property to keep, not a coincidence to rely on.
             bitcodeManifest = { drv, programs, pkgs }: {
               package = name;
               # ONE module.bc, with internalArchives already folded in.
@@ -5625,7 +5633,18 @@ CBODY
               # byte-identical.
               removeReferences = multicall.removeReferences or [ ];
             };
-            rawBuild = pkgs:
+            # The scope a package's own `build` sees, and the ONLY set that may
+            # resolve a `pkgs:`-valued option. The engine scope differs from the
+            # base one in a single attribute — `pkgsStatic` — and that is exactly
+            # where every engine dep fix lives (the RAWCPP redirect, the musl
+            # libm stub, the no-LTO libjpeg, …). Handing the base set to an
+            # option that names a dep therefore does not fail: it silently
+            # returns a SECOND, unfixed build of that dep, and the package links
+            # an archive from a closure its own build never saw. Measured on
+            # vorbis-tools, whose `depArchives` named libpulse's nested
+            # libpulsecommon.a: two libpulseaudio, two dbus and two libx11 in
+            # one closure, one set fixed and one not.
+            engineScopeFor = pkgs:
               let
                 useEngine = isEngineHost pkgs.stdenv.hostPlatform;
                 # SET-LEVEL stdenv swap so the top package AND its whole link
@@ -5654,15 +5673,20 @@ CBODY
                     inherit pkgs;
                     toolchain = tc pkgs.stdenv.buildPlatform.system;
                   };
-                enginePkgs = pkgs // { pkgsStatic = enginePkgsStatic; };
               in
-              if build != null
-              then build (if useEngine then enginePkgs else pkgs)
-              else if useEngine
-              then defaultRawBuild enginePkgs
-              else defaultRawBuild pkgs;
+              if useEngine then pkgs // { pkgsStatic = enginePkgsStatic; } else pkgs;
+            # `pkgs` here is ALREADY `engineScopeFor`'s result — `stripped` binds
+            # it once so the heaviest fixpoint is evaluated a single time and the
+            # build and the manifest cannot drift onto different sets.
+            rawBuild = pkgs:
+              if build != null then build pkgs else defaultRawBuild pkgs;
             stripped = pkgs:
               let
+                # Bound ONCE: the package's `build`, the module hook's input and
+                # the bitcode manifest all read this same set, so a `pkgs:`
+                # option can never name a dep from a different scope than the
+                # one the build linked. See engineScopeFor.
+                engPkgs = engineScopeFor pkgs;
                 # multicall MODULE opt-in. The hook adds a `module` output by
                 # post-processing the objects the build already compiled (no
                 # recompile), riding the same builder as the shipped binary.
@@ -5702,8 +5726,8 @@ CBODY
                       machoAsm = pkgs.stdenv.hostPlatform.isDarwin or false;
                       llvm = "${tc pkgs.stdenv.buildPlatform.system}/bin/llvm";
                     }
-                    (rawBuild pkgs)
-                  else rawBuild pkgs;
+                    (rawBuild engPkgs)
+                  else rawBuild engPkgs;
                 # iconv: Apple libiconv-113's STATIC build fails through the engine
                 # (cross: meson/static-modules.gperf; native: atf self-test
                 # miscompiles). Drop Apple libiconv, append GNU libiconvReal (clean
@@ -5840,7 +5864,13 @@ CBODY
                   // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux { stackSize = linuxThreadStack; }
                   // nixpkgs.lib.optionalAttrs (binName != name) { compatLinks = [ name ]; }
                   // nixpkgs.lib.optionalAttrs (declaredAliases != [ ]) { aliases = declaredAliases; }
-                  // (if runtimeEmbedNative != null then runtimeEmbedNative pkgs base else { });
+                  # engPkgs, not the base set: this is a PACKAGE callback, and it
+                  # must see the same scope the package's own `build` saw. vim
+                  # reads `pkgs.pkgsStatic.vim` here to harvest its runtime tree
+                  # and xxd's man page; off the engine scope that is a second,
+                  # separately-built vim — same parallel-closure shape the
+                  # depArchives fix removed from vorbis-tools.
+                  // (if runtimeEmbedNative != null then runtimeEmbedNative engPkgs base else { });
                 # Legacy in-build man embed, retained ONLY for un-migrated
                 # unpinEmbedsMan flakes during the migration (deleted once all 9 VFS
                 # flakes declare runtimeEmbed). withMan FORKS the build — the
@@ -5915,7 +5945,9 @@ CBODY
                 multicallManifest = bitcodeManifest {
                   drv = moduleSource;
                   programs = mcPrograms;
-                  inherit pkgs;
+                  # The ENGINE scope, not the base one — the windows half below
+                  # already passes `windowsEnginePkgs`; this is its native twin.
+                  pkgs = engPkgs;
                 };
               in
               if wantModule then result // { multicallModule = multicallManifest; } else result;
@@ -6168,7 +6200,25 @@ CBODY
                 ++ (if multicall == null then [ ] else multicall.removeReferences or [ ]);
             } // nixpkgs.lib.optionalAttrs (binName != name) { compatLinks = [ name ]; }
               // nixpkgs.lib.optionalAttrs (windowsDeclaredAliases != [ ]) { aliases = windowsDeclaredAliases; }
-              // (if runtimeEmbedWindows != null then runtimeEmbedWindows windowsPkgs windowsForEmbed else { });
+              # windowsEnginePkgs, the exact windows twin of the native
+              # `runtimeEmbedNative engPkgs`: the BUILD-HOST root, with only the
+              # target sub-scope (`pkgsCross.mingwW64`) swapped to the engine's
+              # where a windows module is emitted. NOT the mingw scope itself —
+              # unlike `depArchives`, which names artifacts of the target, an
+              # embed callback stages files with tools of the BUILDER, and
+              # handing it the cross set cross-compiles those tools: measured, it
+              # put a mingw coreutils and a mingw bash into biber's closure
+              # (+166 drvs).
+              #
+              # Against `windowsPkgs` this is a no-op on all 12 runtimeEmbed
+              # flakes today (measured): the only one that reads
+              # `pkgs.pkgsCross.mingwW64` from here is gvim, which emits no
+              # windows module, so the two roots are the same set for it. It is
+              # here so a flake that DOES emit one reads the same cross its
+              # binary was built by, instead of the vanilla one.
+              // (if runtimeEmbedWindows != null
+                  then runtimeEmbedWindows windowsEnginePkgs windowsForEmbed
+                  else { });
             # `windowsDeclaredAliases` announces every windowsPrograms name when
             # `wantWindowsModule`, which is only honest if nix-lib actually folds
             # them. This cannot fire as written — it restates windowsSelfFold —
@@ -6205,7 +6255,13 @@ CBODY
                 moduleObjs = "${windowsForEmbed.module}/objs";
                 appletDir = "${windowsForEmbed.module}/applet";
                 gnulibDir = "${windowsForEmbed.module}/gnulib";
-                depArchives = inScope windowsPkgs (multicallCosmo.depArchives or [ ]);
+                # The COSMO scope, for the same reason the mingw manifest takes
+                # the mingw one: a `pkgs:` option must read the target it is
+                # building for, on every target. `pkgsCross.cosmo` from inside
+                # the cosmo set is that same set, so the one package that spells
+                # the target out (bash) is byte-identical either way — measured.
+                depArchives = inScope (cosmoStaticCross windowsPkgs)
+                  (multicallCosmo.depArchives or [ ]);
                 # Auto-derived from the cosmo cross build's input closure
                 # (e.g. bash → cosmo readline/ncurses); globbed at build time.
                 depInputDirs = multicallExternalDepDirs windowsForEmbed;
@@ -6217,7 +6273,19 @@ CBODY
             windowsMulticallManifest = bitcodeManifest {
               drv = windowsForEmbed;
               programs = windowsPrograms;
-              pkgs = windowsEnginePkgs;
+              # The MINGW scope, not the linux root that hosts it. A `pkgs:`
+              # option reads `stdenv.hostPlatform` to ask what it is building
+              # for, and on every other target it gets the answer: the native
+              # and cross attrs pass a set whose host IS the target, darwin
+              # included. Passing `windowsEnginePkgs` here answered
+              # "x86_64-linux" for a Windows build, so a gate as ordinary as
+              # `optional pkgs.stdenv.hostPlatform.isLinux` fired on the .exe —
+              # measured on vorbis-tools, which put a linux-musl
+              # libpulsecommon.a on the mingw link line. bitcodeManifest is
+              # written once precisely so an option cannot reach one target and
+              # silently skip (or here, wrongly hit) another; the argument has
+              # to keep that promise too.
+              pkgs = mingwStaticCross windowsEnginePkgs;
             };
             # SELF-FOLD, windows half — symmetric to `selfFold` on the native
             # side. Without it `multicall.windows = true` only EMITTED a module
