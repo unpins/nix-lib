@@ -4097,13 +4097,15 @@ CBODY
             # archive, on the linux-static link only. The archive trails the
             # command line so the module's __wrap_* references resolve from it and
             # its __real_* from the libc the face appends. Empty otherwise, which
-            # leaves every other mega's link line byte-identical.
+            # leaves every other mega's link line byte-identical. The archive is
+            # compiled by the stdenv that performs this link, not by the base
+            # pkgsStatic, whose compiler is nixpkgs' gcc.
             anyDns = builtins.any (m: m.requires.dnsFallback or false) modules;
             dnsHost = pkgs.pkgsStatic.stdenv.hostPlatform;
             dnsLinkFlags =
               if anyDns && dnsHost.isLinux && (dnsHost.isStatic or false)
               then " -Wl,--wrap=getaddrinfo -Wl,--wrap=freeaddrinfo -Wl,--wrap=gethostbyname"
-                + " ${dnsFallbackLib pkgs.pkgsStatic}/lib/libunpindns.a"
+                + " ${dnsFallbackLib { inherit (engines."unpin-llvm") stdenv; }}/lib/libunpindns.a"
               else "";
             moduleArchives = map (m: m.moduleArchive) modules;
             # Native (asm/SIMD) sidecars rescued by the bitcode hook — one per
@@ -5830,9 +5832,11 @@ CBODY
                   else withDarwinIconv pkgs drv;
                 core = darwinIconvFixed (dropSharedLibs (filterEnableStaticOnDarwin (applyOptSsp rawHooked)));
                 # DNS fallback linux-only for now; the Rust tools opt into
-                # darwin/windows via withDnsFallback directly.
+                # darwin/windows via withDnsFallback directly. The archive comes
+                # from the engine scope, so the compiler that built the binary
+                # builds it too.
                 base = if dnsFallback && pkgs.stdenv.hostPlatform.isLinux
-                       then withDnsFallback pkgs.pkgsStatic core else core;
+                       then withDnsFallback engPkgs.pkgsStatic core else core;
                 # Ship by embedding man/aliases/runtime into the PRISTINE base in a
                 # post-build runCommand (unpinEmbedWrap): the base build is then
                 # shared byte-for-byte with library consumers, so there is ONE
@@ -5900,7 +5904,7 @@ CBODY
                 # binName, which resolves to null — the dispatcher lists — unless
                 # the binary is itself one of the programs. That fallback IS the
                 # naming rule; declaring the option is the exception.
-                selfFold = wantModule && builtins.length mcPrograms > 1;
+                selfFold = wantModule && needsSelfFold mcPrograms;
                 selfFoldDefault =
                   let
                     declared = multicall.defaultProgram or null;
@@ -6016,6 +6020,21 @@ CBODY
             announcedNamesOf = progs:
               let all = nixpkgs.lib.concatMap (p: [ p.name ] ++ (p.aliases or [ ])) progs;
               in if all == [ binName ] then [ ] else all;
+            # Whether a package needs the fold to ship as ONE binary named
+            # binName. The decision reads what the package DECLARES, not what a
+            # single target builds: usbutils declares lsusb + usbhid-dump and its
+            # `.exe` carries only lsusb (mingw has no sigaction/SIGUSR1), yet it
+            # must still answer `--unpin-program=lsusb` like every other target.
+            # `target` is that target's own list — empty means nothing to fold.
+            #
+            # A package that declares ONE program IS that binary everywhere and
+            # gains nothing from a dispatcher, whichever of the two names is the
+            # real file: netcat installs `nc` with a `netcat` symlink, svt-av1
+            # `svt-av1` with a `SvtAv1EncApp` one. Keying on the name would fold
+            # the second and not the first, over a difference users never see.
+            needsSelfFold = target:
+              builtins.length (if multicall == null then [ ] else multicall.programs) > 1
+              && target != [ ];
             # What a BESPOKE `windowsBuild` folds, declared by the flake from the
             # very `lib.multicallTable` its generator renders the dispatcher
             # from. Nothing in eval can look inside that build to find out —
@@ -6295,7 +6314,7 @@ CBODY
             # `bzip2recover` and leaked `--unpin-program=` to the applet. It went
             # unseen because every package migrated so far (file, grep, sed) has
             # exactly ONE program, where "no dispatcher" and "correct" look alike.
-            windowsSelfFold = wantWindowsModule && builtins.length windowsPrograms > 1;
+            windowsSelfFold = wantWindowsModule && needsSelfFold windowsPrograms;
             windowsSelfFoldDefault =
               let
                 declared = multicall.defaultProgram or null;
