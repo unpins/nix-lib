@@ -1077,8 +1077,31 @@ EOF
                 echo "-L${winImportLibs}/lib" >> $out/nix-support/cc-ldflags
                 echo "${nixpkgs.lib.concatMapStringsSep " " (l: "-l${l}") winGapLibs}" >> $out/nix-support/cc-ldflags
               '';
+            # nixpkgs' bintools-wrapper derives its targetPrefix from (host !=
+            # target) and copies `$bintools/bin/<prefix>ar` and friends under that
+            # prefix. Every set the engine normally wraps is cross-SHAPED —
+            # pkgsStatic differs from the build platform even when the config
+            # string matches — so the prefixed names above are the ones it finds.
+            # A NATIVE-shaped host set (xvfb/xvnc wrap the dynamic darwin stdenv,
+            # which macOS forces on them for want of a static libSystem) gives an
+            # EMPTY prefix: the wrapper looks for a bare `ar`/`ranlib`/`nm`,
+            # bintoolsUnwrapped carries none, and the setup hook leaves
+            # RANLIB/AR/NM unset — where the first sign is fixupPhase dying on
+            # "stripDirs: Ranlib command is empty", long after the link succeeded.
+            # Link the bare names in for that shape only, so no cross target's
+            # wrapper (i.e. no catalog derivation) changes. ld stays out: the
+            # unprefixed one would be the UNWRAPPED directLd, and a recipe that
+            # links through `$LD` should not silently lose NIX_LDFLAGS.
+            nativeToolAliases = nixpkgs.lib.optionalString
+              (hostPkgs.stdenv.hostPlatform == hostPkgs.stdenv.buildPlatform) ''
+                for t in ar ranlib nm strip objcopy objdump; do
+                  [ -e "$out/bin/$t" ] || \
+                    ln -s ${bintoolsUnwrapped}/bin/${target}-$t "$out/bin/$t"
+                done
+              '';
             bintools = staticBuild.wrapBintoolsWith ({
-              bintools = bintoolsUnwrapped; libc = null; extraBuildCommands = unprefixAliases;
+              bintools = bintoolsUnwrapped; libc = null;
+              extraBuildCommands = unprefixAliases + nativeToolAliases;
             } // appleSdkOverride);
             cc = staticBuild.wrapCCWith ({
               inherit bintools; cc = ccUnwrapped; libc = null; extraPackages = [ ];
