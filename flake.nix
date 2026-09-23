@@ -186,6 +186,13 @@
             inherit unpinPackTool;
           };
 
+        # The engine's LLVM multicall driver (`llvm ar`, `llvm opt`,
+        # `llvm llvm-strip`, …) for the BUILD machine, as a path. A package
+        # needs it wherever the binutils shims cannot do the job: the objects
+        # are bitcode (perl, biber) or the target is a PE the host tools only
+        # half-understand (python strips its `.exe` with it).
+        llvmMultitool = system: "${unpinToolchain system}/bin/llvm";
+
         # Alternate spellings a libc file op can carry, shared by BOTH binding
         # back-ends below (the IR rename and the Mach-O objcopy map) so the
         # fix-prone part has exactly one home. darwin's SDK asm-labels the
@@ -5406,7 +5413,7 @@ CBODY
             # forced on the returned outputs, so it holds for every target.
             knownOpts = {
               optimize       = [ "lto" "opt" "ssp" "gc" ];
-              multicall      = [ "programs" "darwinPrograms" "defaultProgram"
+              multicall      = [ "programs" "darwinPrograms" "defaultProgram" "module"
                                  "depArchives" "internalArchives" "keepAutoArchives"
                                  "inferLinkInputs" "foldSharedArchives"
                                  "removeReferences" "requires" "runtimeDataRoot"
@@ -5715,7 +5722,8 @@ CBODY
                 # darwin opt-out: a darwin build that genuinely ships fewer
                 # applets narrows the list with `darwinPrograms` above, which
                 # keeps the fold and fixes the cause.
-                wantModule = multicall != null && isEngineHost pkgs.stdenv.hostPlatform;
+                wantModule = multicall != null && (multicall.module or true)
+                         && isEngineHost pkgs.stdenv.hostPlatform;
                 rawHooked =
                   if wantModule
                   then multicallModuleHookLTO
@@ -6004,6 +6012,16 @@ CBODY
             wantWindowsModule =
               engine == "unpin-llvm" && multicall != null && (multicall.windows or false)
               && multicallCosmo == null && windowsEnabled;
+            # `multicall.module = false` keeps the engine cross set and drops
+            # only the module. For a package whose binary it does not LINK there
+            # is no link to capture and nothing to fold: python's builds COPY the
+            # interpreter nixpkgs' python3 produced, so the hook died on "no link
+            # sidecar for python" while the engine was wanted for the compiler
+            # all along. Default true — every package that does its own link
+            # keeps emitting a module. The native half folds the same flag into
+            # `wantModule` itself, where nothing but the module depends on it.
+            wantWindowsModuleHook =
+              wantWindowsModule && (multicall.module or true);
             # Lifted to lib-level thunks (windowsEnginePkgsShared, built on
             # windowsEngineStdenvShared) so a catalog mega's refolds share one
             # evaluation. The per-package gate (wantWindowsModule) stays here; the
@@ -6084,7 +6102,7 @@ CBODY
                   gnulibArchives = multicallCosmo.gnulibArchives or [ ];
                 }
                 (windowsRawBuild pkgs)
-              else if wantWindowsModule
+              else if wantWindowsModuleHook
               then multicallModuleHookLTO
                 {
                   package = name;
