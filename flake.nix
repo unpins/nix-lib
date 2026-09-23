@@ -6264,8 +6264,15 @@ CBODY
             # shipping links that fall through to the default applet. It is NOT
             # the check that catches a missing dispatcher; nothing in eval can
             # see that. That one is a smoke that invokes each announced applet.
+            # `multicall.windowsTable` is the other honest answer: the flake's own
+            # windowsBuild folds them and says so with the very table its
+            # dispatcher is rendered from (php's three sapis), which the
+            # `windowsTable` binding above has already cross-checked against the
+            # naming rule. Only a package that announces programs and can point
+            # at NEITHER fold is the bug this guards.
             windowsAnnounceOk =
-              !wantWindowsModule || builtins.length windowsPrograms < 2 || windowsSelfFold;
+              !wantWindowsModule || builtins.length windowsPrograms < 2
+              || windowsSelfFold || windowsTable != null;
             windowsPkg0 = withMetaPins (
               if !windowsAnnounceOk then
                 throw ''
@@ -6332,7 +6339,7 @@ CBODY
             # `bzip2recover` and leaked `--unpin-program=` to the applet. It went
             # unseen because every package migrated so far (file, grep, sed) has
             # exactly ONE program, where "no dispatcher" and "correct" look alike.
-            windowsSelfFold = wantWindowsModule && needsSelfFold windowsPrograms;
+            windowsSelfFold = wantWindowsModuleHook && needsSelfFold windowsPrograms;
             windowsSelfFoldDefault =
               let
                 declared = multicall.defaultProgram or null;
@@ -6380,7 +6387,7 @@ CBODY
             windowsPkg =
               if wantCosmoModule
               then windowsPkg0 // { cosmoMulticallModule = cosmoMulticallManifest; }
-              else if wantWindowsModule
+              else if wantWindowsModuleHook
               then windowsPkg0 // { windowsMulticallModule = windowsMulticallManifest; }
               else windowsPkg0;
 
