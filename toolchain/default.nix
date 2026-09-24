@@ -38,6 +38,27 @@
             name = "musl-${origPkgs.musl.version}-patched-source";
             inherit (origPkgs.musl) src patches;
           };
+          # musl ships no BSD compat headers. nixpkgs' musl installs Alpine's
+          # three from postInstall under `useBSDCompatHeaders ? true`, a step
+          # building from source skips — so <sys/queue.h> resolves against
+          # nixpkgs' musl and not against the engine, and the consumer ends up
+          # carrying its own -I for it. Same Alpine pin nixpkgs uses; re-check
+          # when pkgs/by-name/mu/musl moves.
+          bsdCdefsH = origPkgs.fetchurl {
+            name = "sys-cdefs.h";
+            url = "https://git.alpinelinux.org/aports/plain/main/libc-dev/sys-cdefs.h?id=7ca0ed62d4c0d713d9c7dd5b9a077fba78bce578";
+            sha256 = "16l3dqnfq0f20rzbkhc38v74nqcsh9n3f343bpczqq8b1rz6vfrh";
+          };
+          bsdQueueH = origPkgs.fetchurl {
+            name = "sys-queue.h";
+            url = "http://git.alpinelinux.org/aports/plain/main/libc-dev/sys-queue.h?id=7ca0ed62d4c0d713d9c7dd5b9a077fba78bce578";
+            sha256 = "12qm82id7zys92a1qh2l1qf2wqgq6jr4qlbjmqyfffz3s3nhfd61";
+          };
+          bsdTreeH = origPkgs.fetchurl {
+            name = "sys-tree.h";
+            url = "http://git.alpinelinux.org/aports/plain/main/libc-dev/sys-tree.h?id=7ca0ed62d4c0d713d9c7dd5b9a077fba78bce578";
+            sha256 = "14igk6k00bnpfw660qhswagyhvr0gfqg4q55dxvaaq7ikfkrir71";
+          };
           # Same story for mingw: zig's lib/libc/mingw is a PRUNED copy of the
           # mingw-w64 CRT, and what it prunes includes every 80-bit `long double`
           # math routine (sqrtl/floorl/fmodl/frexpl/hypotl/sinl/…). Those are not
@@ -145,6 +166,14 @@
               done
               rm -rf "$__up"
               cp -r "${zigLibc}/include/generic-musl" "$__stage/libc/include/generic-musl"
+              # The three BSD compat headers nixpkgs' musl installs and a
+              # from-source build does not (useBSDCompatHeaders). generic-musl
+              # is the tree the driver puts on -isystem, and its sys/ has 67
+              # headers and none of these.
+              chmod u+w "$__stage/libc/include/generic-musl/sys"
+              install -m644 "${bsdQueueH}" "$__stage/libc/include/generic-musl/sys/queue.h"
+              install -m644 "${bsdCdefsH}" "$__stage/libc/include/generic-musl/sys/cdefs.h"
+              install -m644 "${bsdTreeH}"  "$__stage/libc/include/generic-musl/sys/tree.h"
               # Header arch tokens are zig's std.zig.target names (headerArchName in
               # unpin_musl.cpp): 32-bit x86 is "x86" (not musl's "i386"); arm and
               # powerpc64 match the musl folder name.
@@ -158,6 +187,12 @@
               for __k in x86-linux-any aarch64-linux-any arm-linux-any riscv-linux-any powerpc-linux-any any-linux-any; do
                 cp -r "${zigLibc}/include/$__k" "$__stage/libc/include/$__k"
               done
+              # The eight netfilter headers zig prunes, in a tree of their own —
+              # each is the uppercase twin of one zig keeps, and a pair cannot
+              # share a directory on a case-insensitive builder (macOS stages
+              # this in /private/tmp). See uapi-uc/README.md.
+              mkdir -p "$__stage/libc/include/any-linux-any-uc"
+              cp -r ${./uapi-uc}/linux "$__stage/libc/include/any-linux-any-uc/linux"
 
               # M3 — the compiler-rt builtins source tree (compiled on demand per
               # target into libclang_rt.builtins.a: soft-float TF/XF, int128,

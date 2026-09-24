@@ -857,6 +857,11 @@ void addCxxBaseArgs(std::vector<std::string> &a, const std::string &muslArch,
   a.push_back(libcRoot() + "/include/" + kernelArchName(muslArch) + "-linux-any");
   a.push_back("-isystem");
   a.push_back(libcRoot() + "/include/any-linux-any");
+  // The eight netfilter headers zig prunes, kept in a tree of their own because
+  // each is the uppercase twin of one above and the pair cannot coexist on a
+  // case-insensitive builder. Last, so a lowercase lookup never reaches it.
+  a.push_back("-isystem");
+  a.push_back(libcRoot() + "/include/any-linux-any-uc");
 }
 
 // Compile a batch of clang jobs (each a full argv ending at "-c <src>") in
@@ -2065,6 +2070,9 @@ void frontRewriteMusl(SmallVectorImpl<const char *> &Args, StringSaver &Saver) {
   add(Twine(libcRoot()) + "/include/" + kernelArchName(muslArch) + "-linux-any");
   add("-isystem");
   add(Twine(libcRoot()) + "/include/any-linux-any");
+  // Uppercase-twin netfilter headers; see addKernelIncludes above.
+  add("-isystem");
+  add(Twine(libcRoot()) + "/include/any-linux-any-uc");
 
   if (!isLinkStep(Args)) return;
 
