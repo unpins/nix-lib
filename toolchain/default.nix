@@ -23,12 +23,21 @@
           #   * zig 0.16's lib/libc = the GENERATED per-arch musl headers
           #     (alltypes.h/syscall.h/version.h in include/<triple>) + the Linux
           #     kernel UAPI headers — the hard-to-regenerate parts.
-          #   * upstream musl 1.2.5 tarball = the COMPLETE committed musl tree
+          #   * nixpkgs' patched musl source = the COMPLETE committed musl tree
           #     (src/arch/crt/include/compat), overlaid UPSTREAM-WINS below so the
           #     on-demand libc is full (malloc/thread/… not just printf-class).
           # buildLibc selects by replicating musl's Makefile.
           zigLibc = "${origPkgs.zig_0_16.src}/lib/libc";
-          muslTar = origPkgs.musl.src;
+          # PATCHED source, not the raw tarball: nixpkgs closes musl CVEs by
+          # backporting patches onto a pinned 1.2.5 (iconv OOB write
+          # CVE-2025-26519 ×2, CVE-2026-6042, CVE-2026-40200), so `.src` alone
+          # hands the engine a libc whose version string looks current and whose
+          # code is not. `postPatch` there only rewrites `configure`, which this
+          # payload never runs.
+          muslSrc = origPkgs.applyPatches {
+            name = "musl-${origPkgs.musl.version}-patched-source";
+            inherit (origPkgs.musl) src patches;
+          };
           # Same story for mingw: zig's lib/libc/mingw is a PRUNED copy of the
           # mingw-w64 CRT, and what it prunes includes every 80-bit `long double`
           # math routine (sqrtl/floorl/fmodl/frexpl/hypotl/sinl/…). Those are not
@@ -74,7 +83,7 @@
           # cache, which is what the split costs.
           #
           # The decoupling is complete: the on-demand cache stamp is computed here
-          # and served from the payload (`cache-tag`), so zigLibc, muslTar,
+          # and served from the payload (`cache-tag`), so zigLibc, muslSrc,
           # mingwCrtTar and the __config_site headers no longer reach the compile
           # at all.
           #
@@ -121,7 +130,8 @@
               # GENERATED headers (libc/include/<triple>, generic-musl —
               # alltypes.h/syscall.h/version.h) live outside musl/ and stay zig's.
               __up=$(mktemp -d)
-              tar xf "${muslTar}" -C "$__up" --strip-components=1
+              cp -r "${muslSrc}"/. "$__up"/
+              chmod -R u+w "$__up"
               for __sub in src arch crt include compat; do
                 [ -d "$__up/$__sub" ] || continue
                 ( cd "$__up/$__sub" && find . -type f \
