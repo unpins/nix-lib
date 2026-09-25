@@ -5,8 +5,20 @@
   # Override via `inputs.unpins-lib.inputs.nixpkgs.follows = "nixpkgs"`.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
-  outputs = { self, nixpkgs }:
+  # One rustc for the whole catalog, bumped in the same wave as nixpkgs.
+  # mkRustCrate used to take this from each consumer, and the two that declared
+  # it drifted apart — cfonts on rustc 1.96.0, unpin on 1.95.0, neither reached
+  # by a nixpkgs bump.
+  inputs.rust-overlay = {
+    url = "github:oxalica/rust-overlay";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { self, nixpkgs, rust-overlay }:
     let
+      # Aliased so mkRustCrate's `rust-overlay ? ...` default can name it: inside
+      # an argument set the parameter shadows the input.
+      defaultRustOverlay = rust-overlay;
       lib = rec {
         # Canonical native targets. Editing here propagates to every unpins/* consumer.
         # forAllNative is pure nix (no nixpkgs.lib dep) so nix-lib stays standalone.
@@ -6747,12 +6759,12 @@ CBODY
         #
         # dnsFallback is forced off (its unsalted NIX_LDFLAGS leaks the
         # arch-specific libunpindns.a into crate build-script links); asking for it
-        # here is an eval-time error. The consumer passes its own `rust-overlay`
-        # input, so nix-lib takes no new input and the C lock files are untouched.
+        # here is an eval-time error. `rust-overlay` defaults to the one nix-lib
+        # pins; a consumer only passes its own to test a different rustc.
         mkRustCrate =
           { self
           , name
-          , rust-overlay
+          , rust-overlay ? defaultRustOverlay
           , pkgsAttr ? name
           # Own-source crate (the project's own Rust tools — unpin-man,
           # unpin-readme): pass all three of src / version / cargoLock (path
