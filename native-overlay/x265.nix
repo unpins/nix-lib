@@ -1,4 +1,4 @@
-# x265 in pkgsStatic needs four surgical patches:
+# x265 in pkgsStatic needs five surgical patches:
 #
 # 1. `multibitdepthSupport = true` emits three archives — 8-bit main +
 #    `libx265-10.a` + `libx265-12.a` — with the main referencing the siblings
@@ -26,6 +26,16 @@
 #    `-static-libgcc`. Rewrite the whole line to static-libgcc form
 #    (supersedes #3 on mingw). In `postFixup` since (2) emptied `postInstall`.
 #    See [[mingw-pc-libgcc-s-probe-trap]].
+#
+# 5. The test harness benchmarks the deblocking filters out of bounds. Those
+#    kernels write the four lines ABOVE the pointer they are handed: the
+#    correctness checks pass `+ 4 * offset`, so the writes land inside the
+#    buffer, but the four `REPORT_SPEEDUP` calls pass `pbuf1` raw and scribble
+#    256 bytes in front of it. Open upstream since 2020 (x265_git #531), and
+#    harmless only for as long as the linker happens to leave that space dead.
+#    Here it no longer is: `pbuf1` now follows musl's stdio globals, the run
+#    overwrites `__stdout_used`, and the already-finished TestBench segfaults
+#    in `__stdio_exit`.
 { lib }:
 pkgs:
 let
@@ -41,6 +51,16 @@ let
     else "-lstdc++ -lgcc -lgcc_eh -lmcfgthread -lntdll";
 in
 pkgs.x265.overrideAttrs (oa: {
+  # Fix #5: give the four benchmark calls the same margin the correctness
+  # checks already use.
+  postPatch = (oa.postPatch or "") + ''
+    substituteInPlace test/pixelharness.cpp \
+      --replace-fail 'ref.pelFilterLumaStrong[0], pbuf1, STRIDE, 1,' 'ref.pelFilterLumaStrong[0], pbuf1 + 4, STRIDE, 1,' \
+      --replace-fail 'ref.pelFilterLumaStrong[1], pbuf1, 1, STRIDE,' 'ref.pelFilterLumaStrong[1], pbuf1 + 4 * STRIDE, 1, STRIDE,' \
+      --replace-fail 'ref.pelFilterChroma[0], pbuf1, STRIDE, 1,' 'ref.pelFilterChroma[0], pbuf1 + 4, STRIDE, 1,' \
+      --replace-fail 'ref.pelFilterChroma[1], pbuf1, 1, STRIDE,' 'ref.pelFilterChroma[1], pbuf1 + 4 * STRIDE, 1, STRIDE,'
+  '';
+
   # Merge in postInstall, NOT postBuild: the installPhase's `make install`
   # re-links libx265.a from the 8-bit objects only, overwriting anything a
   # postBuild step wrote. Operate on the INSTALLED archive using the still-
