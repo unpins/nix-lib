@@ -5235,11 +5235,6 @@ CBODY
           , windows ? false
           , windowsCosmo ? false
           , linuxOnly ? false
-          # No companion data tarball by default. Runtime data is embedded in
-          # the binary (file's magic, vim/gvim's VFS runtime) and man pages go
-          # in the embedded ZIP (embedMan), so `share/` is redundant.
-          # Set true only for a package that genuinely needs a side asset.
-          , package_data ? false
           , own_software ? false
           # Embed the package's own man pages into the binary via `withMan`
           # (as `unpin/man/*` ZIP entries), so `unpin man <pkg>` works offline with
@@ -6590,7 +6585,7 @@ CBODY
 
             # Read by unpins/action-build to drive CI config.
             manifest = {
-              inherit name package_data own_software nativeBuild;
+              inherit name own_software nativeBuild;
               # null unless the caller opted in; otherwise a list of CLI args,
               # JSON-encoded so build.yml runs `<bin> <args>` after each build.
               inherit smoke;

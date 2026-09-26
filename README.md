@@ -62,7 +62,6 @@ mkStandaloneFlake {
 | `windows`          | `false`    | Opt in to the mingw output without a custom `windowsBuild`.  |
 | `nativeBuild`      | `true`     | Set `false` for windows-only packages (gvim).                |
 | `binName`          | `name`     | Override when the produced bin name ≠ `name`.                |
-| `package_data`     | `true`     | Forwarded into `manifest` for action-build CI.               |
 | `bootstrap_naming` | `false`    | Forwarded into `manifest`.                                   |
 | `own_software`     | `false`    | Forwarded into `manifest`.                                   |
 
