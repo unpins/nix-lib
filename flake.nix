@@ -1942,6 +1942,19 @@ EOF
           '';
         };
 
+        # GNU libiconv, the engine's darwin iconv (see darwinIconvConverge),
+        # lacks Apple's UTF-8-MAC, which the system iconv it replaces has: git's
+        # precompose_utf8 dies on any non-ASCII path (`iconv_open(UTF-8,UTF-8-MAC)
+        # failed`). Every darwin libiconvReal must carry it — they meet in one
+        # link, and the first archive answering `libiconv_open` wins.
+        # Idempotent: a copy read off the converged scope already has it.
+        withUtf8Mac = d: d.overrideAttrs (o: {
+          patches = (o.patches or [ ])
+            ++ nixpkgs.lib.optional
+              (!builtins.elem ./libiconv-utf8mac.patch (o.patches or [ ]))
+              ./libiconv-utf8mac.patch;
+        });
+
         # Canonical libarchive for the catalog: ONE derivation shared by every
         # unpin that links libarchive (tar ships bsdtar over it; e2fsprogs uses
         # it for `mke2fs -d <archive>`). Because both consumers link this exact
@@ -1995,7 +2008,7 @@ EOF
           (static.libarchive.override { xarSupport = false; }).overrideAttrs (oa: {
             doCheck = false;
             buildInputs = noOpenssl (oa.buildInputs or [ ])
-              ++ nixpkgs.lib.optional isDarwin static.libiconvReal;
+              ++ nixpkgs.lib.optional isDarwin (withUtf8Mac static.libiconvReal);
             # mbedtls is PROPAGATED (not a plain buildInput) so every consumer's
             # link environment carries its -L: e2fsprogs' configure copies
             # libarchive's `-lmbedcrypto` into its own Makefiles (it doesn't read
@@ -4714,7 +4727,7 @@ CBODY
               else
                 let
                   l = nixpkgs.lib;
-                  real = scope.libiconvReal;
+                  real = withUtf8Mac scope.libiconvReal;
                   # Both spellings carry pname "libiconv", so drop every one and
                   # add GNU back — same idiom as darwinIconvFixed's `noIconv`.
                   noIconv = l.filter (x: (x.pname or "") != "libiconv");
@@ -4753,7 +4766,9 @@ CBODY
                   then { }
                   else
                     l.genAttrs (l.filter (n: prev ? ${n}) users)
-                      (n: swap prev.${n}));
+                      (n: swap prev.${n})
+                    # Reached directly too (libunistring propagates it).
+                    // { libiconvReal = real; });
             # Is this scope the engine set? The guard is LOAD-BEARING, not a
             # tidiness check: these overlays also reach `buildPackages`, and an
             # unguarded swap forces the engine onto the BUILD host, which trips
@@ -5832,12 +5847,12 @@ CBODY
                       # archives coexist untouched. It also spares every consumer
                       # the flag.
                       iconvCompat =
-                        (pkgs.pkgsStatic.libiconvReal.override {
+                        (withUtf8Mac (pkgs.pkgsStatic.libiconvReal.override {
                           stdenv = engineStdenv {
                             inherit pkgs;
                             toolchain = tc pkgs.stdenv.buildPlatform.system;
                           };
-                        }).overrideAttrs (o: {
+                        })).overrideAttrs (o: {
                           postInstall = (o.postInstall or "") + ''
                             cat > compat.c <<'EOF'
                             #include <stddef.h>
