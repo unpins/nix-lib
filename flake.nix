@@ -458,7 +458,8 @@
         #     -B/-L, poisoning clang's self-contained VFS sysroot. unpin-llvm
         #     brings its own compiler-rt/libc++/musl. Same trick cosmocc uses.
         #  2. The shims append ${optClass} after "$@" (route-A parity) so the opt
-        #     class is one value across a build, not whatever each recipe passes.
+        #     class is one value across a build, not whatever each recipe passes —
+        #     except an explicit trailing -O0, which a source may need to be correct.
         #  3. `sysrootSeedHook` — a generic recipe can still use flag combos the
         #     bake didn't cover (its own -march=, a different opt class), so the
         #     cache has to be writable. `lto` is forwarded to `unpinSysroot` so
@@ -802,6 +803,11 @@
               # darwin, 32-bit UCS-4 wchar_t), keeping the engine a drop-in for
               # gcc-built sources. \`isoWcharFlag\` withholds it on mingw, whose
               # wchar_t is 16-bit UTF-16.
+              #
+              # \`-O0\` as the call's last opt flag suppresses the appended opt
+              # class: some sources require it for correctness, not speed
+              # (libgcrypt's jitterentropy \`#error\`s under __OPTIMIZE__, since the
+              # timing jitter it harvests is what an optimiser removes).
               mk() {
                 cat > "$out/bin/$1" <<EOF
               #!/bin/sh
@@ -817,6 +823,10 @@
                 done
               fi
               __lto="${ltoArg}"
+              __opt="${optClass}"
+              __lasto=""
+              for __a in "\$@"; do case "\$__a" in -O*) __lasto=\$__a;; esac; done
+              [ "\$__lasto" = "-O0" ] && __opt=""
               __isconf=0
               for __a in "\$@"; do case "\$__a" in *conftest*) __isconf=1;; esac; done
               if [ "\$__isconf" = 1 ]; then
@@ -828,7 +838,7 @@
                   set -- "\$@" "\$__a"
                 done
               fi
-              ${uniqNamesProbe}${darwinEnvSetup}exec ${toolchain}/bin/llvm $2 -target ${target}${isoWcharFlag}${darwinStubFlag} "\$@" ${engineRSafeLdFlag}${optClass}${winFortifyOff}\$__lto${uniqNamesArg}
+              ${uniqNamesProbe}${darwinEnvSetup}exec ${toolchain}/bin/llvm $2 -target ${target}${isoWcharFlag}${darwinStubFlag} "\$@" ${engineRSafeLdFlag}\$__opt${winFortifyOff}\$__lto${uniqNamesArg}
               EOF
                 chmod +x "$out/bin/$1"
               }
