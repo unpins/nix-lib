@@ -33,10 +33,12 @@
           # CVE-2025-26519 ×2, CVE-2026-6042, CVE-2026-40200), so `.src` alone
           # hands the engine a libc whose version string looks current and whose
           # code is not. `postPatch` there only rewrites `configure`, which this
-          # payload never runs.
+          # payload never runs. `unpin-sqfs.patch` is the squashfs layer: inert
+          # until a binary carries an image footer.
           muslSrc = origPkgs.applyPatches {
             name = "musl-${origPkgs.musl.version}-patched-source";
-            inherit (origPkgs.musl) src patches;
+            inherit (origPkgs.musl) src;
+            patches = origPkgs.musl.patches ++ [ ./unpin-sqfs.patch ];
           };
           # musl ships no BSD compat headers. nixpkgs' musl installs Alpine's
           # three from postInstall under `useBSDCompatHeaders ? true`, a step
