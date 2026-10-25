@@ -52,7 +52,11 @@ let
     inherit version;
 
     src = pkgs.fetchurl {
-      url = "https://cosmo.zip/pub/cosmocc/cosmocc-${version}.zip";
+      # cosmo.zip went unreachable (2026-10-25); the release asset is the same file.
+      urls = [
+        "https://github.com/jart/cosmopolitan/releases/download/${version}/cosmocc-${version}.zip"
+        "https://cosmo.zip/pub/cosmocc/cosmocc-${version}.zip"
+      ];
       hash = "sha256-hbjDekBthi5latTsFL6fbOR0wbQ2uWFekaVSCKztP0Q=";
     };
 
