@@ -39,6 +39,14 @@
  * when it can't reach one and the user opted in — so on a normal host the OS
  * answers and the fallback never runs.
  *
+ * One exception, Linux only: a host with NO /etc/resolv.conf at all. musl then
+ * asks 127.0.0.1:53 and waits out its full timeout (2 x 2.5 s per name) before
+ * failing, so "real resolver first" cost every lookup ~5 s on Android before the
+ * fallback could answer. There, when the user opted in and the name is not in
+ * /etc/hosts, the fallback asks FIRST (see skip_system_resolver); if it gets no
+ * answer, the real resolver still runs exactly as before. Without the opt-in
+ * nothing changes: the fallback returns at once and musl takes over.
+ *
  * How it is interposed (per toolchain)
  * ------------------------------------
  * The same C, three link mechanisms, selected by #ifdef:
@@ -126,6 +134,8 @@
 #  include <arpa/inet.h>
 #  include <poll.h>
 #  include <unistd.h>
+#  include <errno.h>
+#  include <strings.h>
 #  if defined(UNPIN_MACOS)
 #    include <dlfcn.h>
 #  endif
@@ -385,6 +395,45 @@ static int want_fallback(const char *node)
     if (inet_pton(AF_INET6, node, &a6) == 1)   return 0;
     return 1;                                   /* a real hostname */
 }
+
+#if defined(UNPIN_LINUX)
+/* Is `node` a name /etc/hosts lists? Static files beat DNS in musl, so a name
+ * listed there (localhost, a hosts-file blocklist, a LAN alias) must still go
+ * to the real resolver, which answers it from the file without any DNS. */
+static int in_etc_hosts(const char *node)
+{
+    FILE *f = fopen("/etc/hosts", "re");
+    if (!f) return 0;
+    char line[512];
+    int found = 0, cont = 0;
+    while (!found && fgets(line, sizeof line, f)) {
+        size_t n = strlen(line);
+        int partial = n > 0 && line[n - 1] != '\n';  /* line longer than buf */
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+        char *save = NULL;
+        /* the first field of a line is the address; a continuation chunk of
+         * an over-long line has none, only names */
+        char *tok = strtok_r(line, " \t\r\n", &save);
+        if (tok && !cont) tok = strtok_r(NULL, " \t\r\n", &save);
+        for (; tok; tok = strtok_r(NULL, " \t\r\n", &save))
+            if (strcasecmp(tok, node) == 0) { found = 1; break; }
+        cont = partial;
+    }
+    fclose(f);
+    return found;
+}
+
+/* Should the fallback be asked before the system resolver? Only when there is
+ * no system resolver to ask: no /etc/resolv.conf (Android, a barebones
+ * container), where musl's only target is 127.0.0.1:53 and a miss there costs
+ * its whole timeout. A name in /etc/hosts still goes to the real resolver. */
+static int skip_system_resolver(const char *node)
+{
+    if (access("/etc/resolv.conf", F_OK) == 0 || errno != ENOENT) return 0;
+    return !in_etc_hosts(node);
+}
+#endif
 
 static int parse_port(const char *service, const struct addrinfo *hints)
 {
@@ -680,14 +729,29 @@ static int unpin_dns_fallback(const char *node, const char *service,
 int ENTRY_GETADDRINFO(const char *node, const char *service,
                       const struct addrinfo *hints, struct addrinfo **res)
 {
-    /* Always try the system resolver first — identical path on every platform. */
+    int flags = hints ? hints->ai_flags : 0;
+    int tried = 0;      /* the fallback already ran and had no answer */
+
+#if defined(UNPIN_LINUX)
+    /* No /etc/resolv.conf: ask the opted-in fallback first rather than wait
+     * out musl's 127.0.0.1 timeout (see skip_system_resolver). Anything short
+     * of an answer — no opt-in, no reply — goes on to the system resolver,
+     * and the fallback is not asked a second time after it. */
+    if (!(flags & AI_NUMERICHOST) && want_fallback(node) &&
+        skip_system_resolver(node)) {
+        if (unpin_dns_fallback(node, service, hints, res, EAI_AGAIN) == 0)
+            return 0;
+        tried = 1;
+    }
+#endif
+
+    /* Otherwise the system resolver first — identical path on every platform. */
     int rc = real_getaddrinfo(node, service, hints, res);
 
     /* Take over only when it could not REACH a resolver (the reach_failure
      * whitelist — EAI_NONAME and the caller errors pass through untouched, see
      * its comment); numeric literals / AI_NUMERICHOST need no DNS. */
-    int flags = hints ? hints->ai_flags : 0;
-    if (!reach_failure(rc) ||
+    if (tried || !reach_failure(rc) ||
         (flags & AI_NUMERICHOST) || !want_fallback(node))
         return rc;
 
@@ -723,21 +787,27 @@ void ENTRY_FREEADDRINFO(struct addrinfo *res);   /* defined just below */
 
 struct hostent *__wrap_gethostbyname(const char *name)
 {
-    struct hostent *he = __real_gethostbyname(name);
-    if (he) return he;
-    if (h_errno != TRY_AGAIN && h_errno != NO_RECOVERY) return NULL;
-    if (!want_fallback(name)) return NULL;
-
     struct addrinfo hints;
     memset(&hints, 0, sizeof hints);
     hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-
     struct addrinfo *res = NULL;
-    /* rc = -1: any non-zero sentinel; unpin_dns_fallback returns it verbatim
-     * when it cannot answer, and we only test against 0. */
-    if (unpin_dns_fallback(name, NULL, &hints, &res, -1) != 0 || !res)
-        return NULL;
+
+    /* Same order as ENTRY_GETADDRINFO: with no /etc/resolv.conf the opted-in
+     * fallback goes first; rc = -1 is any non-zero sentinel, returned verbatim
+     * when it cannot answer — we only test against 0. */
+    int tried = want_fallback(name) && skip_system_resolver(name);
+    int early = tried &&
+                unpin_dns_fallback(name, NULL, &hints, &res, -1) == 0 && res;
+    if (!early) {
+        struct hostent *he = __real_gethostbyname(name);
+        if (he) return he;
+        if (h_errno != TRY_AGAIN && h_errno != NO_RECOVERY) return NULL;
+        if (tried || !want_fallback(name)) return NULL;
+        res = NULL;
+        if (unpin_dns_fallback(name, NULL, &hints, &res, -1) != 0 || !res)
+            return NULL;
+    }
 
     static struct hostent hb;
     static char           hb_name[256];
