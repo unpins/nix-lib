@@ -192,7 +192,12 @@
         # vendored toolchain is byte-identical to the catalog `unpin-llvm` it was
         # validated as (same .drv, no rebuild) — the toolchain pulls those scoped
         # pkgsStatic.{zlib,zstd} as buildInputs.
-        unpinToolchain = system:
+        # Memoized per system: every call used to re-import a whole nixpkgs
+        # (`mkPkgsGC`), and ~15 sites ask for it.
+        unpinToolchain = system: unpinToolchains.${system} or (mkUnpinToolchain system);
+        unpinToolchains = nixpkgs.lib.genAttrs
+          [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] mkUnpinToolchain;
+        mkUnpinToolchain = system:
           import ./toolchain {
             origPkgs = mkPkgsGC { inherit system; ssp = true; opt = null; pkgName = "llvm"; };
             inherit unpinPackTool;
@@ -4792,18 +4797,19 @@ CBODY
             # a curated list of attribute names, and a `pkgs: drv -> drv` fix.
             # `prev ? ${n}` skips names a given set lacks, and a false gate leaves
             # the identity overlay — byte-identical where the layer doesn't apply.
-            engineLayer = { gate, names, fix }: scope:
-              scope.extend (_final: prev:
+            engineLayerOverlay = { gate, names, fix }:
+              (_final: prev:
                 if !(gate prev) then { }
                 else nixpkgs.lib.genAttrs
                   (nixpkgs.lib.filter (n: prev ? ${n}) names)
                   (n: fix prev prev.${n}));
+            engineLayer = args: scope: scope.extend (engineLayerOverlay args);
             # Base (pre-swap) gnu static-musl stdenv — pins pkg-config off the
             # engine (below). Captured from the pristine pkgs so the pin is an
             # absolute value the pkgsStatic splice can't re-resolve to engStdenv.
             baseStaticStdenv = pkgs.pkgsStatic.stdenv;
             engineBashAttrs = [ "bash" "bashInteractive" "bashNonInteractive" ];
-            withEngineStdenv = pkgs.pkgsStatic.extend
+            engineStdenvOverlay =
               (_final: prev:
                 if isEngineScope prev
                 then {
@@ -4850,17 +4856,17 @@ CBODY
                 // nixpkgs.lib.optionalAttrs (prev ? libtheora)
                   { libtheora = prev.libtheora.override { stdenv = engStdenvNoLto; }; }
                 else { });
-            withBashFix = engineLayer {
+            bashFixOverlay = engineLayerOverlay {
               gate = isEngineScope;
               names = engineBashAttrs;
               fix = unpinBashBuildFix;
-            } withEngineStdenv;
+            };
             # Each autoWired fix carries its OWN gate — a dep that only breaks
             # under `pkgsStatic` declares `autoWire = "static"`, the rest musl.
-            withDepFixes = builtins.foldl'
-              (acc: name:
+            depFixOverlays = map
+              (name:
                 let entry = autoWiredFixes.${name}; in
-                engineLayer {
+                engineLayerOverlay {
                   gate = prev:
                     if entry.autoWire == "static"
                     then (prev.stdenv.hostPlatform.isStatic or false)
@@ -4869,15 +4875,14 @@ CBODY
                   # The fix rebuilds the attr from the scope, so the current drv
                   # is not an input.
                   fix = prev: _drv: entry.apply prev;
-                } acc)
-              withBashFix
+                })
               (builtins.attrNames autoWiredFixes);
             # Swap libjpeg-turbo to the lto=false engine stdenv set-wide (see
             # engStdenvNoLto above). nixpkgs' `libjpeg` aliases `libjpeg_turbo`;
             # override the concrete attr and re-point the alias so consumers of
             # either name get the no-LTO build. Gated isMusl||isStatic like the
             # other set-wide engine fixes; identity on non-engine hosts.
-            withLibjpegNoLto = withDepFixes.extend
+            libjpegNoLtoOverlay =
               (_final: prev:
                 if isEngineScope prev && (prev ? libjpeg_turbo || prev ? libjpeg)
                 then
@@ -4906,7 +4911,7 @@ CBODY
             # the injected attr directly — re-applying them against the engine scope
             # would splice engine libunwind/pango into a pristine build. Gated like
             # the other set-wide engine fixes; identity where librsvg is absent.
-            withRustDeps = withLibjpegNoLto.extend
+            rustDepsOverlay =
               (_final: prev:
                 if isEngineScope prev && prev ? librsvg
                 then {
@@ -4965,9 +4970,11 @@ CBODY
                       # the bootstrap, but it leaves the copy `shared-mime-info`
                       # pulls unfixed (measured, both linux and darwin); the
                       # gated attr covers the whole chain.
-                      base = ((
-                        if pkgs.pkgsStatic.stdenv.hostPlatform.isDarwin or false
-                        then pkgs.pkgsStatic.extend (_f: p: {
+                      # One appendOverlays, not chained `.extend`s: each extend
+                      # re-instantiates nixpkgs for the same resulting set.
+                      scope = pkgs.pkgsStatic.appendOverlays ([
+                        (if pkgs.pkgsStatic.stdenv.hostPlatform.isDarwin or false
+                        then (_f: p: {
                           glib       = nativeFixes.glib       p;
                           graphite2  = nativeFixes.graphite2  p;
                           fontconfig = nativeFixes.fontconfig p;
@@ -4980,20 +4987,26 @@ CBODY
                         # HOST python, a whole static CPython with fonttools.
                         # The fix hands it the build machine's python; darwin
                         # gets the same fix from the list above.
-                        else pkgs.pkgsStatic.extend (_f: p: {
+                        else (_f: p: {
                           graphite2 = nativeFixes.graphite2 p;
-                        })).extend (_f: p:
+                        }))
+                        (_f: p:
                           if !(p.stdenv.hostPlatform.isStatic or false) then { }
-                          else { libxml2 = nativeFixes.libxml2 p; }));
+                          else { libxml2 = nativeFixes.libxml2 p; })
+                      ] ++ nixpkgs.lib.optional
+                        (pkgs.pkgsStatic.stdenv.hostPlatform.isRiscV or false)
+                        (_f: p:
+                          let lj = dropJpegSimdcov p.libjpeg_turbo;
+                          in { libjpeg = lj; libjpeg_turbo = lj; }));
                     in
-                    nativeFixes.librsvg (
-                      if pkgs.pkgsStatic.stdenv.hostPlatform.isRiscV or false
-                      then base.extend (_f: p:
-                        let lj = dropJpegSimdcov p.libjpeg_turbo;
-                        in { libjpeg = lj; libjpeg_turbo = lj; })
-                      else base);
+                    nativeFixes.librsvg scope;
                 }
                 else { });
+            # One nixpkgsFun for the whole chain: each `.extend` re-instantiates
+            # nixpkgs (every bootstrap stage) and the result is the same set.
+            withRustDeps = pkgs.pkgsStatic.appendOverlays
+              ([ engineStdenvOverlay bashFixOverlay ] ++ depFixOverlays
+               ++ [ libjpegNoLtoOverlay rustDepsOverlay ]);
             withDarwinIconvDeps = darwinIconvConverge withRustDeps;
           in
           withDarwinIconvDeps;
