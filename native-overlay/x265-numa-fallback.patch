@@ -1,0 +1,89 @@
+x265: with libnuma linked in, run as a non-NUMA build when libnuma is unusable.
+
+libnuma can be present at link time yet unusable at run time: get_mempolicy
+filtered by seccomp (Docker's default profile without CAP_SYS_NICE) makes
+numa_available() fail, and a missing /sys/devices/system/node (a sandbox
+without sysfs) makes numa_node_to_cpus fail. Upstream then counts CPUs only
+through libnuma, every node reports 0, and x265 encodes with no thread pool
+("No thread pool allocated, --wpp disabled"); with seccomp it also logs
+"unable to set thread affinity" once per worker thread.
+
+Decide once whether libnuma is usable; when it is not, count CPUs and bind
+nothing, exactly as a build without libnuma does.
+
+--- a/common/threadpool.cpp
++++ b/common/threadpool.cpp
+@@ -66,6 +66,21 @@
+ #endif
+ #if HAVE_LIBNUMA
+ #include <numa.h>
++#include <unistd.h>
++
++/* libnuma can be linked in yet unusable at run time: get_mempolicy filtered
++ * by seccomp (numa_available() < 0), or no /sys/devices/system/node to read
++ * the node CPUs from. Either way every node would report 0 CPUs and no thread
++ * pool would be created, so treat libnuma as absent: count CPUs, bind
++ * nothing, as a build without it does. Decided once, before any pool. */
++static bool numaUsable()
++{
++    static int usable = -1;
++    if (usable < 0)
++        usable = numa_available() >= 0
++            && access("/sys/devices/system/node", F_OK) == 0;
++    return usable;
++}
+ #endif
+ #if defined(_MSC_VER)
+ # define strcasecmp _stricmp
+@@ -265,7 +280,7 @@
+ #if defined(_WIN32_WINNT) && _WIN32_WINNT >= _WIN32_WINNT_WIN7 
+     bNumaSupport = true;
+ #elif HAVE_LIBNUMA
+-    bNumaSupport = numa_available() >= 0;
++    bNumaSupport = numaUsable();
+ #endif
+ 
+ 
+@@ -291,6 +306,8 @@
+         }
+         numa_free_cpumask(bitMask);
+     }
++    else
++        cpusPerNode[0] = getCpuCount();
+ #else // NUMA not supported
+     cpusPerNode[0] = getCpuCount();
+ #endif
+@@ -486,7 +503,7 @@
+     }
+     m_numaMask = &m_groupAffinity.Mask;
+ #elif HAVE_LIBNUMA
+-    if (numa_available() >= 0)
++    if (numaUsable())
+     {
+         struct bitmask* nodemask = numa_allocate_nodemask();
+         if (nodemask)
+@@ -580,14 +597,12 @@
+     else
+         x265_log(NULL, X265_LOG_ERROR, "unable to set thread affinity for NUMA node mask\n");
+ #elif HAVE_LIBNUMA
+-    if (numa_available() >= 0)
++    if (numaUsable() && numaMask)
+     {
+         numa_run_on_node_mask((struct bitmask*)numaMask);
+         numa_set_interleave_mask((struct bitmask*)numaMask);
+         numa_set_localalloc();
+-        return;
+     }
+-    x265_log(NULL, X265_LOG_ERROR, "unable to set thread affinity for NUMA node mask\n");
+ #else
+     (void)numaMask;
+ #endif
+@@ -603,7 +618,7 @@
+         num++;
+     return (int)num;
+ #elif HAVE_LIBNUMA
+-    if (numa_available() >= 0)
++    if (numaUsable())
+         return numa_max_node() + 1;
+     else
+         return 1;

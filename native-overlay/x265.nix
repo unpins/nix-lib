@@ -1,4 +1,4 @@
-# x265 in pkgsStatic needs five surgical patches:
+# x265 in pkgsStatic needs seven surgical patches:
 #
 # 1. `multibitdepthSupport = true` emits three archives — 8-bit main +
 #    `libx265-10.a` + `libx265-12.a` — with the main referencing the siblings
@@ -36,11 +36,27 @@
 #    Here it no longer is: `pbuf1` now follows musl's stdio globals, the run
 #    overwrites `__stdout_used`, and the already-finished TestBench segfaults
 #    in `__stdio_exit`.
+#
+# 6. NUMA. nixpkgs turns `numaSupport` on for Linux x86/aarch64 but lists
+#    `numactl` in nativeBuildInputs, so a static or cross build only sees the
+#    build machine's copy and cmake prints `Could NOT find NUMA`: the threads
+#    were never grouped by NUMA node. Give it the target's numactl, on the
+#    same platforms nixpkgs enables it, and fold libnuma.a's members into
+#    libx265.a: libheif finds x265 with a bare find_library and never reads
+#    x265.pc, so a `-lnuma` there would not reach heif-enc's link.
+#
+# 7. With libnuma linked in, upstream counts CPUs only through it, so when
+#    libnuma is unusable at run time — get_mempolicy filtered by seccomp
+#    (Docker's default profile without CAP_SYS_NICE) or no
+#    /sys/devices/system/node — every node reports 0 CPUs and x265 runs with
+#    no thread pool at all. `x265-numa-fallback.patch` runs it as a non-NUMA
+#    build in that case. Applied only where #6 links libnuma.
 { lib }:
 pkgs:
 let
   isMinGW = pkgs.stdenv.hostPlatform.isMinGW or false;
   onEngine = lib.hasInfix "unpin-cc" (pkgs.stdenv.cc.name or "");
+  withNuma = with pkgs.stdenv.hostPlatform; isLinux && (isx86 || isAarch64);
   # The C++ EH sequence, under the names the toolchain actually ships. gcc's
   # libgcc/libgcc_eh have no counterpart on the engine — the builtins ride in as
   # libclang_rt.builtins, which the driver already puts on every link — and
@@ -51,6 +67,8 @@ let
     else "-lstdc++ -lgcc -lgcc_eh -lmcfgthread -lntdll";
 in
 pkgs.x265.overrideAttrs (oa: {
+  buildInputs = (oa.buildInputs or [ ]) ++ lib.optional withNuma pkgs.numactl;
+  patches = (oa.patches or [ ]) ++ lib.optional withNuma ./x265-numa-fallback.patch;
   # Fix #5: give the four benchmark calls the same margin the correctness
   # checks already use.
   postPatch = (oa.postPatch or "") + ''
@@ -110,11 +128,21 @@ pkgs.x265.overrideAttrs (oa: {
     fi
   '';
   postFixup = (oa.postFixup or "") + ''
-    # Fix #3: absolute libstdc++.a → -lstdc++ (no-op on darwin/mingw).
+    # Fix #3: absolute libstdc++.a → -lstdc++ (no-op on darwin/mingw). Fix #6:
+    # -lnuma goes, libnuma is already inside libx265.a.
     for pc in $out/lib/pkgconfig/x265.pc $dev/lib/pkgconfig/x265.pc; do
       [ -f "$pc" ] || continue
-      sed -i -E 's|[^ ]*/libstdc\+\+\.a|-lstdc++|g' "$pc"
+      sed -i -E -e 's|[^ ]*/libstdc\+\+\.a|-lstdc++|g' -e 's| -lnuma||' "$pc"
     done
+  '' + lib.optionalString withNuma ''
+    # Fix #6: libnuma rides inside libx265.a (prefixed: `syscall.o` is
+    # generic). In postFixup, not postInstall: heif replaces postInstall to
+    # rebuild the archive from scratch, and would drop it.
+    m=$NIX_BUILD_TOP/numa-merge && rm -rf $m && mkdir $m
+    ( cd $m && $AR x ${lib.getLib pkgs.numactl}/lib/libnuma.a
+      for f in *.o; do mv "$f" "numa_$f"; done )
+    $AR rs "$out/lib/libx265.a" $m/numa_*
+    rm -rf $m
   '' + lib.optionalString isMinGW ''
     for pc in $out/lib/pkgconfig/x265.pc $dev/lib/pkgconfig/x265.pc; do
       [ -f "$pc" ] || continue
