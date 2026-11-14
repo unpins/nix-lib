@@ -3099,6 +3099,26 @@ static void strip_argv0_decorations(int argc, char **argv) {
     s = strrchr(p, '\\'); if (s) p = s + 1;
     if (strncmp(p, "lt-", 3) == 0) memmove(p, p + 3, strlen(p + 3) + 1);
 }
+/* libc fixed the program name from the ORIGINAL argv[0] at startup, so an
+   applet run through --unpin-program would still read the binary's name there:
+   procps-ng picks pgrep/pkill/pidwait from program_invocation_short_name, and
+   err()/warn() prefix their messages with it. Point it at the applet. */
+#if defined(__APPLE__)
+#include <stdlib.h>
+static void set_progname(char *name) { setprogname(name); }
+#elif defined(__linux__) && !defined(__COSMOPOLITAN__)
+#ifdef __cplusplus
+extern "C"
+#else
+extern
+#endif
+char *program_invocation_name, *program_invocation_short_name;
+static void set_progname(char *name) {
+    program_invocation_name = program_invocation_short_name = name;
+}
+#else
+static void set_progname(char *name) { (void)name; }
+#endif
 CBODY
 ${winCmdlineFixDecl}        cat <<CBODY
 static void list_programs(FILE *out) {
@@ -3126,6 +3146,7 @@ int main(int argc, char **argv) {
         for (const struct applet *a = applets; a->name; a++)
             if (strcmp(sel, a->name) == 0) {
                 argv[1] = (char *)sel;   /* applet's argv[0]=NAME, args follow */
+                set_progname(argv[1]);
 ${winCmdlineFixCall}                return a->fn(argc - 1, argv + 1, environ);
             }
         fprintf(stderr, "${name}: no program '%s'\n", sel);
