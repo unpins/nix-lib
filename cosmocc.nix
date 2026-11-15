@@ -29,6 +29,13 @@ let
     hash = "sha256-9Jrq1zbZtw7oYlyKoJg1NYDFQsje0rt4LRTuY6ClgB8=";
   };
 
+  # Upstream PATH search. Gets the `.com`/`.exe` retry on Windows; see
+  # cosmocc-path-ext-fix/.
+  cosmoCommandvSrc = pkgs.fetchurl {
+    url = "https://raw.githubusercontent.com/jart/cosmopolitan/${version}/libc/calls/commandv.c";
+    hash = "sha256-REmrFsQCgMspD+JXxpqOUIgYgNTlJsxNQby/35Lje1k=";
+  };
+
   # Upstream third_party/tz sources. localtime.c gets the Windows
   # system-timezone fix (see cosmocc-tz-fix/); the headers are its quoted
   # includes, which cosmocc.zip doesn't ship.
@@ -131,6 +138,20 @@ let
         $out/x86_64-linux-cosmo/lib/libcosmo.a $TMPDIR/scanfbuild/vcscanf.o
       $out/bin/aarch64-linux-cosmo-ar r \
         $out/aarch64-linux-cosmo/lib/libcosmo.a $TMPDIR/scanfbuild/.aarch64/vcscanf.o
+
+      # And commandv.o: on Windows, execvp/posix_spawnp never found `where`,
+      # only `where.exe`. See cosmocc-path-ext-fix/.
+      mkdir -p $TMPDIR/cosmosrc/libc/calls $TMPDIR/pathbuild/.aarch64
+      cp ${cosmoCommandvSrc} $TMPDIR/cosmosrc/libc/calls/commandv.c
+      chmod u+w $TMPDIR/cosmosrc/libc/calls/commandv.c
+      patch -p1 -d $TMPDIR/cosmosrc < ${./cosmocc-path-ext-fix/commandv-windows-exe.patch}
+      ( cd $TMPDIR/pathbuild && $out/bin/cosmocc -U__COSMOCC__ -D_COSMO_SOURCE \
+          -O2 -ffunction-sections -fdata-sections \
+          -c -o commandv.o $TMPDIR/cosmosrc/libc/calls/commandv.c )
+      $out/bin/x86_64-linux-cosmo-ar r \
+        $out/x86_64-linux-cosmo/lib/libcosmo.a $TMPDIR/pathbuild/commandv.o
+      $out/bin/aarch64-linux-cosmo-ar r \
+        $out/aarch64-linux-cosmo/lib/libcosmo.a $TMPDIR/pathbuild/.aarch64/commandv.o
 
       runHook postUnpack
     '';

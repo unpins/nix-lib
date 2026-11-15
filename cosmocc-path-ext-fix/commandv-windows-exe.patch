@@ -1,0 +1,99 @@
+Find a program on PATH on Windows when it is named without `.exe`.
+
+cosmo 4.0.2's commandv() (behind execvp, execlp, execvpe, posix_spawnp)
+tries each PATH directory with the name exactly as given and nothing
+else. A Windows program is a file called `where.exe`, so `where`, `cmd`
+or `git` are never found: ENOENT before CreateProcess is reached. That is
+how findutils' `xargs where` failed on Windows, and why `xargs` with no
+command could not run `echo`.
+
+Upstream removed its extension guessing in c88f95a89 (2023), reasoning
+that CreateProcess appends `.exe` itself. It does, but commandv() first
+checks access() on the bare path, which does not exist, so the search
+never gets that far.
+
+On Windows, a name whose last component has no dot is now also tried
+with `.com` and `.exe`, in that order, in each directory (cmd.exe's
+default PATHEXT, minus `.bat`/`.cmd`, which CreateProcess cannot run).
+Other platforms, and names that already have an extension, are
+untouched.
+
+Verified on a Windows 10 VM: `where`, `cmd`, `notepad` resolve to
+`/C/Windows/system32/<name>.exe`, `posix_spawnp("where")` and
+`execlp("hostname")` run, `nosuch` and `foo.bar` stay ENOENT; on Linux
+`sh` and `ls` resolve as before.
+
+--- a/libc/calls/commandv.c
++++ b/libc/calls/commandv.c
+@@ -18,6 +18,7 @@
+ ╚─────────────────────────────────────────────────────────────────────────────*/
+ #include "libc/calls/calls.h"
+ #include "libc/calls/struct/stat.h"
++#include "libc/dce.h"
+ #include "libc/errno.h"
+ #include "libc/intrin/strace.h"
+ #include "libc/paths.h"
+@@ -53,6 +54,15 @@
+     syspath = _PATH_DEFPATH;
+   }
+ 
++  // on windows, a name whose last component has no dot is also tried
++  // with .com and .exe, in that order, in each directory: cmd.exe's
++  // default PATHEXT minus the scripts CreateProcess can't run. without
++  // it `where`, `echo` or `git` are never found, only `where.exe`.
++  static const char kExts[][5] = {"", ".com", ".exe"};
++  const char *base = memrchr(name, '/', namelen);
++  base = base ? base + 1 : name;
++  int nexts = IsWindows() && !strchr(base, '.') ? 3 : 1;
++
+   // iterate through directories
+   int old_errno = errno;
+   bool seen_eacces = false;
+@@ -61,25 +71,30 @@
+   do {
+     b = strchrnul(a, ':');
+     size_t dirlen = b - a;
+-    if (dirlen + 1 + namelen < pathbufsz) {
+-      if (dirlen) {
+-        memcpy(pathbuf, a, dirlen);
+-        pathbuf[dirlen] = '/';
+-        memcpy(pathbuf + dirlen + 1, name, namelen + 1);
+-      } else {
+-        memcpy(pathbuf, name, namelen + 1);
+-      }
+-      if (!access(pathbuf, X_OK)) {
+-        struct stat st;
+-        if (!stat(pathbuf, &st) && S_ISREG(st.st_mode)) {
+-          errno = old_errno;
+-          return pathbuf;
++    for (int i = 0; i < nexts; ++i) {
++      size_t extlen = strlen(kExts[i]);
++      if (dirlen + 1 + namelen + extlen < pathbufsz) {
++        if (dirlen) {
++          memcpy(pathbuf, a, dirlen);
++          pathbuf[dirlen] = '/';
++          memcpy(pathbuf + dirlen + 1, name, namelen);
++          memcpy(pathbuf + dirlen + 1 + namelen, kExts[i], extlen + 1);
++        } else {
++          memcpy(pathbuf, name, namelen);
++          memcpy(pathbuf + namelen, kExts[i], extlen + 1);
+         }
+-      } else if (errno == EACCES) {
+-        seen_eacces = true;
++        if (!access(pathbuf, X_OK)) {
++          struct stat st;
++          if (!stat(pathbuf, &st) && S_ISREG(st.st_mode)) {
++            errno = old_errno;
++            return pathbuf;
++          }
++        } else if (errno == EACCES) {
++          seen_eacces = true;
++        }
++      } else {
++        enametoolong();
+       }
+-    } else {
+-      enametoolong();
+     }
+     a = b + 1;
+   } while (*b);
