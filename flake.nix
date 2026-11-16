@@ -4321,11 +4321,31 @@ CBODY
                         | awk '$1=="STOREA" && $2 ~ /-unpin-win-implibs-/ {print $2}' \
                         | awk '!seen[$0]++')
               echo "multicall(mega): ''${#winimplibs[@]} import stubs off the capture sidecars"
+            '' + nixpkgs.lib.optionalString (isWin && nativeArchives != [ ]) ''
+              # Compiled .rc resources (a manifest, version info) ride in the
+              # native archives, where nothing pulls them: a resource object
+              # defines no symbol. Hand them to the link as objects. One .exe
+              # holds one resource per type/name/language, and two programs can
+              # each bring theirs (pciutils' lspci and setpci): the first wins.
+              winrsrc=()
+              __rd="''${NIX_BUILD_TOP:-$TMPDIR}/.unpin-rsrc"; __rn=0
+              for __na in ${nixpkgs.lib.concatStringsSep " " nativeArchives}; do
+                __rn=$((__rn+1)); mkdir -p "$__rd/$__rn"
+                ( cd "$__rd/$__rn" && ${toolchain}/bin/llvm llvm-ar x "$__na" ) || continue
+                for __m in "$__rd/$__rn"/*; do
+                  if [ -f "$__m" ] && ${toolchain}/bin/llvm llvm-objdump -h "$__m" 2>/dev/null | grep -q '[.]rsrc'; then
+                    winrsrc+=("$__m")
+                  fi
+                done
+              done
+              echo "multicall(mega): ''${#winrsrc[@]} resource object(s) off the native archives"
             '';
             # Same gate as the prelude — the flag must never name an array the
             # prelude did not declare.
             winSidecarFlags = nixpkgs.lib.optionalString (isWin && linksDirs != [ ])
               " \"\${winimplibs[@]}\"";
+            winRsrcFlags = nixpkgs.lib.optionalString (isWin && nativeArchives != [ ])
+              " -Wl,-Xlink=-force:multipleres \"\${winrsrc[@]}\"";
             # darwin (Mach-O) mega: ld64 rejects the GNU flags the ELF/PE path
             # uses — `--start-group`/`--end-group` (ld64 resolves back-refs
             # multi-pass, no group needed) and `-s` (ld64's spelling is `-x`). So
@@ -4389,7 +4409,7 @@ CBODY
                     multicall/dispatcher.c \
                     ${nixpkgs.lib.concatStringsSep " " moduleArchives} \
                     ${groupOpen} ${nixpkgs.lib.concatStringsSep " " nativeArchives} ${nixpkgs.lib.concatStringsSep " " depArchives} "''${autodeps[@]}" ${groupClose} \
-                    ${darwinFrameworkFlags}${winForceFlags}${winSidecarFlags}${dnsLinkFlags}
+                    ${darwinFrameworkFlags}${winForceFlags}${winSidecarFlags}${winRsrcFlags}${dnsLinkFlags}
                 '';
                 postLink = "";
                 install = ''
