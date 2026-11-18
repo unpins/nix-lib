@@ -1028,8 +1028,8 @@ EOF
             # Windows: the engine resolves default CRT import libs from its VFS,
             # but EXTRA `-l<dll>` libs (bcrypt, ws2_32) are synthesized in-memory
             # from VFS .def files and that synthesis FAILS in the build sandbox
-            # ("unable to find library"). nixpkgs' mingw-w64 ships them as real
-            # ABI-neutral import stubs, so they come off disk instead.
+            # ("unable to find library"). mingw-w64's crt build ships them as real
+            # ABI-neutral import stubs, so they come off disk instead (`winCrt`).
             #
             # THREE roles, deliberately different sets. This search PATH carries
             # every stub: a dep names whatever Win32 API it uses on its own link
@@ -1051,9 +1051,49 @@ EOF
             # on the CMake side, so nothing here can escape to a foreign libm.
             #
             # libmingwex.a STAYS on the path — and is force-linked (winGapLibs).
+            #
+            # mingw-w64's crt, from the release nixpkgs' `windows.mingw_w64` builds,
+            # with the same configure, but compiled by the engine's clang and its
+            # import libs written by llvm-dlltool: nixpkgs builds it with the
+            # mingw gcc, whose code would then ship in every .exe (mingwex, uuid).
+            # Same 938 archives and the same exported symbols as the gcc build,
+            # minus gcc's own `.refptr.*` stubs and its out-of-line `__rdtsc`.
+            winCrt = pkgs.buildPackages.stdenvNoCC.mkDerivation {
+              pname = "unpin-mingw-w64-crt";
+              inherit (pkgs.windows.mingw_w64_headers) version src;
+              dontConfigure = true;
+              enableParallelBuilding = true;
+              buildPhase = ''
+                runHook preBuild
+                export XDG_CACHE_HOME=$TMPDIR/cache
+                mkdir -p $TMPDIR/shim $TMPDIR/b
+                for t in gcc cc; do
+                  printf '#! %s\nexec %s clang -target x86_64-w64-windows-gnu -isystem %s "$@"\n' \
+                    ${pkgs.buildPackages.runtimeShell} ${toolchain}/bin/llvm \
+                    ${pkgs.windows.mingw_w64_headers}/include > $TMPDIR/shim/x86_64-w64-mingw32-$t
+                done
+                for p in ar:llvm-ar ranlib:llvm-ranlib dlltool:llvm-dlltool nm:llvm-nm strip:llvm-strip; do
+                  printf '#! %s\nexec %s %s "$@"\n' ${pkgs.buildPackages.runtimeShell} \
+                    ${toolchain}/bin/llvm ''${p#*:} > $TMPDIR/shim/x86_64-w64-mingw32-''${p%%:*}
+                done
+                chmod +x $TMPDIR/shim/*
+                export PATH=$TMPDIR/shim:$PATH
+                cd $TMPDIR/b
+                $NIX_BUILD_TOP/$sourceRoot/mingw-w64-crt/configure --host=x86_64-w64-mingw32 \
+                  --prefix=$out --enable-idl --enable-secure-api --with-default-msvcrt=msvcrt \
+                  --disable-lib32 --enable-lib64 --disable-libarm32 --disable-libarm64
+                make -j$NIX_BUILD_CORES
+                runHook postBuild
+              '';
+              installPhase = ''
+                runHook preInstall
+                make -j$NIX_BUILD_CORES install
+                runHook postInstall
+              '';
+            };
             winImportLibs = pkgs.runCommand "unpin-win-implibs-${target}" { } ''
               mkdir -p $out/lib
-              for f in ${pkgs.windows.mingw_w64}/lib/lib*.a; do
+              for f in ${winCrt}/lib/lib*.a; do
                 case "$(basename "$f")" in
                   libkernel32.a|libmingw32.a|libmingwthrd.a|libmoldname.a|libmsvcr*|libucrt*) continue ;;
                 esac

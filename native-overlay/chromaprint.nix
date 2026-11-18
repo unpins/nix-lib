@@ -7,7 +7,8 @@
 # 2. `buildInputs = [ ]` (zlib was for fpcalc); on mingw propagate
 #    windows.mcfgthreads — libstdc++ refs `_MCF_*` (mingw gcc is
 #    `--enable-threads=mcf`). Both `.dev` (the `.pc`) and `.out`
-#    (`libmcfgthread.a`); a bare ref only splices `.dev`.
+#    (`libmcfgthread.a`); a bare ref only splices `.dev`. Not on the engine:
+#    libc++ never calls `_MCF_*`, and mcfgthread is a gcc build.
 #
 # 3. `.pc Libs.private` append. `libchromaprint.a` is C++ → static link probes
 #    fail with `__cxa_*`/`cosf` undef. Darwin's `FFT_LIB=vdsp` also refs the
@@ -44,7 +45,7 @@ in
   withExamples = false;
 }).overrideAttrs (oa: {
   buildInputs = [ ];
-  propagatedBuildInputs = lib.optionals isMinGW [
+  propagatedBuildInputs = lib.optionals (isMinGW && !onEngine) [
     pkgs.windows.mcfgthreads
     pkgs.windows.mcfgthreads.out
   ];
