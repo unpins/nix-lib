@@ -2125,6 +2125,47 @@ EOF
         # in the catalog. 400 KB duplicated here keeps that re-hash from happening.
         vfsCore = ./vfs;
 
+        # The target musl's include dir, laid out like nixpkgs' `musl.dev` (the
+        # musl headers, the kernel headers linked in, the three BSD compat
+        # headers), but made by `make install-headers`, which runs no compiler.
+        # A package that names `musl` for a header path makes a cross build
+        # bootstrap the target's gcc just to compile a libc the engine never
+        # links; this is what such a path should point at instead.
+        muslHeaders = pkgs:
+          let
+            p = pkgs.stdenv.hostPlatform;
+            b = p.parsed.cpu.bits;
+            arch = {
+              x86 = if b == 64 then "x86_64" else "i386";
+              arm = if b == 64 then "aarch64" else "arm";
+              power = if b == 64 then "powerpc64" else "powerpc";
+              riscv = "riscv${toString b}";
+              mips = if b == 64 then "mips64" else "mips";
+              s390 = "s390x";
+              loongarch = "loongarch64";
+              m68k = "m68k";
+            }.${p.parsed.cpu.family};
+            # Same pins as nixpkgs' musl, so they are the same store paths.
+            bsd = name: sha256: pkgs.fetchurl {
+              name = "sys-${name}";
+              url = "https://git.alpinelinux.org/aports/plain/main/libc-dev/sys-${name}?id=7ca0ed62d4c0d713d9c7dd5b9a077fba78bce578";
+              inherit sha256;
+            };
+          in
+          pkgs.stdenvNoCC.mkDerivation {
+            pname = "unpin-musl-headers";
+            inherit (pkgs.musl) version src patches;
+            dontConfigure = true;
+            dontBuild = true;
+            installPhase = ''
+              make ARCH=${arch} prefix=/ includedir=/include DESTDIR=$out install-headers
+              (cd $out/include && ln -s $(ls -d ${pkgs.linuxHeaders}/include/* | grep -v "scsi$") .)
+              install -D ${bsd "queue.h" "12qm82id7zys92a1qh2l1qf2wqgq6jr4qlbjmqyfffz3s3nhfd61"} $out/include/sys/queue.h
+              install -D ${bsd "cdefs.h" "16l3dqnfq0f20rzbkhc38v74nqcsh9n3f343bpczqq8b1rz6vfrh"} $out/include/sys/cdefs.h
+              install -D ${bsd "tree.h" "14igk6k00bnpfw660qhswagyhvr0gfqg4q55dxvaaq7ikfkrir71"} $out/include/sys/tree.h
+            '';
+          };
+
         # Build-host-native tool that packs a staging `unpin/` tree into a
         # zstd-in-zip (ZIP method 93) overlay — the format withMan/withAliases use.
         # Shipped binaries decode method 93 with unpin's pure-Rust ruzstd reader
@@ -4870,6 +4911,17 @@ CBODY
                   # idiom as the bash/meson/dep fixes below.
                   pkg-config-unwrapped =
                     prev.pkg-config-unwrapped.override { stdenv = baseStaticStdenv; };
+                  # ...and freetype no longer reaches it. Built by that gnu stdenv,
+                  # the host pkg-config made every Linux cross bootstrap a cross
+                  # gcc for one script no shipped binary runs. Without the
+                  # postInstall, freetype-config keeps the BUILD pkg-config it was
+                  # configured with, which is the one a consumer's build can run.
+                  freetype = prev.freetype.overrideAttrs (o: {
+                    nativeBuildInputs = builtins.filter
+                      (x: (x.name or "") != "make-shell-wrapper-hook")
+                      (o.nativeBuildInputs or [ ]);
+                    postInstall = "";
+                  });
                   # x264 is assembly-dominated (its whole reason for being), so LTO
                   # buys it nothing — and its `base.o` forces the LLVM module flag
                   # `override-stack-alignment=64` (AVX needs a 64-byte-aligned
@@ -4896,6 +4948,17 @@ CBODY
                 # different ABI problem, fixed in the mingw scope below.)
                 // nixpkgs.lib.optionalAttrs (prev ? libtheora)
                   { libtheora = prev.libtheora.override { stdenv = engStdenvNoLto; }; }
+                # nixpkgs' musl libiconv is a symlink to iconv.h in `libc`, the
+                # musl the TARGET gcc compiles, so every iconv consumer on a
+                # Linux cross bootstrapped that gcc for one header.
+                // nixpkgs.lib.optionalAttrs (prev.stdenv.hostPlatform.isMusl or false)
+                  (let headers = muslHeaders prev; in {
+                    unpinMuslHeaders = headers;
+                    libiconv = prev.runCommand "musl-iconv-${prev.musl.version}" { strictDeps = true; } ''
+                      mkdir -p $out/include
+                      ln -sv ${headers}/include/iconv.h $out/include
+                    '';
+                  })
                 else { });
             bashFixOverlay = engineLayerOverlay {
               gate = isEngineScope;

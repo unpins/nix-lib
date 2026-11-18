@@ -25,8 +25,12 @@ pkgs:
 let
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
   isEngine = lib.isUnpinEngine pkgs;
+  # Suffix, not equality: the wrapper's pname carries the target prefix
+  # (`armv7l-unknown-linux-musleabihf-gfortran-wrapper`, and even
+  # `x86_64-unknown-linux-musl-gfortran-wrapper` under pkgsStatic), so an exact
+  # match never fired on Linux.
   stripGfortran = oa: builtins.filter
-    (d: !(d.pname or null == "gfortran-wrapper"))
+    (d: !(lib.hasSuffix "gfortran-wrapper" (d.pname or "")))
     (oa.nativeBuildInputs or [ ]);
 in
 if isDarwin || isEngine
