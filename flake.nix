@@ -7140,9 +7140,16 @@ CBODY
         (_: v: builtins.isAttrs v && v ? autoWire)
         rawNativeFixes;
       mingwOverlayFixes = import ./mingw-overlay { lib = fixLibBase; };
+      # `ps: libao` with the static alsa-lib and libpulse it is built on in
+      # passthru (`alsaStatic`, `libpulse`). See audio.nix.
+      unpinAudio = import ./audio.nix { lib = fixLibBase; };
     in
     {
-      lib = lib // { inherit nativeFixes; };
+      lib = lib // {
+        inherit nativeFixes;
+        unpinFfmpeg = import ./ffmpeg.nix { lib = fixLibBase // { inherit nativeFixes unpinAudio; }; };
+        inherit unpinAudio;
+      };
       # The toolchain builds themselves, by build host. Consumers reach the
       # toolchain through `lib.unpinToolchain`, which is lazy and has no attr of
       # its own — so without these there is no way to build or cache it directly,

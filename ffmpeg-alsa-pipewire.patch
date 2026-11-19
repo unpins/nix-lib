@@ -1,0 +1,15 @@
+--- a/libavdevice/alsa.c
++++ b/libavdevice/alsa.c
+@@ -414,3 +414,12 @@
+     snd_device_name_free_hint(hints);
+     return ret;
+ }
++
++/* unpins: the static libasound carries a `pipewire`/`pulse` PCM plugin
++ * (nix-lib audio.nix), registered by a constructor in its own object. Nothing
++ * else references that object, so name it here or the linker leaves it out
++ * and `default` (routed to pipewire on most desktops) fails to open. `used`
++ * keeps the reference through LTO. */
++extern int _snd_pcm_pipewire_open(void);
++static void *const unpin_force_pipewire __attribute__((used)) =
++    (void *)&_snd_pcm_pipewire_open;
