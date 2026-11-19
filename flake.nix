@@ -2022,8 +2022,9 @@ EOF
         #   * --without-openssl always: nixpkgs keeps openssl an unconditional
         #     buildInput AND names it in preFixup, so under the engine cc OpenSSL
         #     would build with -flto (tens of minutes/arch) for a lib nothing
-        #     links — filter it out and rewrite preFixup to keep only the lzo .la
-        #     fixup. libarchive's crypto (encrypted ZIP/7z, mtree digests) instead
+        #     links — filter it out and replace nixpkgs' preFixup. lzo goes too:
+        #     libarchive's --with-lzo2 is opt-in and nixpkgs doesn't pass it, so
+        #     the input is never linked. libarchive's crypto (encrypted ZIP/7z, mtree digests) instead
         #     comes from **mbedtls on linux** (~500 KB, not OpenSSL 3.x's ~4 MB).
         #   * The crypto backend does NOT force itself on every consumer, because
         #     `archive_read_support_format_all()` is explicit calls (not ctors) and
@@ -2058,11 +2059,11 @@ EOF
             isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
             isLinux = pkgs.stdenv.hostPlatform.isLinux;
             static = pkgs.pkgsStatic;
-            noOpenssl = nixpkgs.lib.filter (d: !(nixpkgs.lib.hasInfix "openssl" (d.name or "")));
+            unused = nixpkgs.lib.filter (d: !(nixpkgs.lib.any (n: nixpkgs.lib.hasInfix n (d.name or "")) [ "openssl" "lzo" ]));
           in
           (static.libarchive.override { xarSupport = false; }).overrideAttrs (oa: {
             doCheck = false;
-            buildInputs = noOpenssl (oa.buildInputs or [ ])
+            buildInputs = unused (oa.buildInputs or [ ])
               ++ nixpkgs.lib.optional isDarwin (withUtf8Mac static.libiconvReal);
             # mbedtls is PROPAGATED (not a plain buildInput) so every consumer's
             # link environment carries its -L: e2fsprogs' configure copies
@@ -2071,7 +2072,7 @@ EOF
             # way. Propagation also lands mbedcrypto.a in each consumer's manifest
             # depInputDirs, so the mega has it available — tar's applet references
             # it (pulled), e2fsprogs' format_tar-only applet does not (left out).
-            propagatedBuildInputs = noOpenssl (oa.propagatedBuildInputs or [ ])
+            propagatedBuildInputs = unused (oa.propagatedBuildInputs or [ ])
               ++ nixpkgs.lib.optional isLinux static.mbedtls;
             configureFlags = (oa.configureFlags or [ ]) ++ [ "--without-openssl" ]
               ++ [ (if isLinux then "--with-mbedtls" else "--without-mbedtls") ];
@@ -2083,10 +2084,7 @@ EOF
             # self-contained for every consumer. mbedcrypto only on linux (the
             # only place --with-mbedtls added it; gating the interpolation keeps
             # darwin from realising pkgsStatic.mbedtls, which doesn't build there).
-            preFixup = ''
-              sed -i $lib/lib/libarchive.la \
-                -e 's|-llzo2|-L${static.lzo}/lib -llzo2|'
-            '' + nixpkgs.lib.optionalString isLinux ''
+            preFixup = nixpkgs.lib.optionalString isLinux ''
               sed -i $lib/lib/libarchive.la \
                 -e 's|-lmbedcrypto|-L${nixpkgs.lib.getLib static.mbedtls}/lib -lmbedcrypto|'
             '';
