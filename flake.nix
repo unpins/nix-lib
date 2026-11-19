@@ -3306,7 +3306,7 @@ CBODY
         # of its aliases another row at that program. Most bespoke windows folds
         # dispatch exactly what their native half does, and this is how they say
         # so with the SAME list rather than a second copy of it. A fold that
-        # ships a subset (usbutils drops usbhid-dump, moreutils drops ifdata)
+        # ships a subset (moreutils drops ifdata)
         # writes its own `applets` instead — the subset is the point there.
         #
         # A `{ name; supportedTarget; }` alias has no answer here — this table is
@@ -5396,7 +5396,7 @@ CBODY
         # `name` is the user-facing id. `pkgsAttr` overrides the nixpkgs/nativeFixes
         # lookup when the nixpkgs attribute differs (nixpkgs `links2` → we ship
         # `links`). `binName` overrides when bin name ≠ name. `nativeBuild = false`
-        # → windows-only (gvim). `linuxOnly = true` → suppresses every darwin attr,
+        # → windows-only. `linuxOnly = true` → suppresses every darwin attr,
         # for Linux-kernel-only tools (kmod, util-linux, shadow, procps-ng).
         mkStandaloneFlake = args@
           { self
@@ -6215,10 +6215,8 @@ CBODY
             # NOT implied by windowsBuild: deps must cross-build cleanly through the
             # engine for mingw first (file's zlib uses a gcc-only win32/Makefile.gcc).
             # Every catalog package that used to carry a bespoke mingw fold is on
-            # this path now; what remains off it are the four cosmo folds (which
-            # multicallCosmo already excludes) and usbutils, whose fold rewrites
-            # meson.build to emit ONE executable — declaring two programs there
-            # would announce an applet that does not exist.
+            # this path now; what remains off it are the cosmo folds, which
+            # multicallCosmo already excludes.
             wantWindowsModule =
               engine == "unpin-llvm" && multicall != null && (multicall.windows or false)
               && multicallCosmo == null && windowsEnabled;
@@ -6396,9 +6394,8 @@ CBODY
             # which is filtered against the NATIVE host.
             #
             # Otherwise the binary comes from the flake's own `windowsBuild`, whose
-            # applet set is NOT `multicall.programs` — usbutils folds lsusb alone
-            # (usbhid-dump needs sigaction), less folds nothing. Two rules keep the
-            # shipped list honest there:
+            # applet set is NOT `multicall.programs` — less folds nothing. Two
+            # rules keep the shipped list honest there:
             #
             #   1. only the PRIMARY program's aliases. An alias is a second name
             #      for the same binary, not a second applet, so it holds whatever
@@ -6457,12 +6454,10 @@ CBODY
               # put a mingw coreutils and a mingw bash into biber's closure
               # (+166 drvs).
               #
-              # Against `windowsPkgs` this is a no-op on all 12 runtimeEmbed
-              # flakes today (measured): the only one that reads
-              # `pkgs.pkgsCross.mingwW64` from here is gvim, which emits no
-              # windows module, so the two roots are the same set for it. It is
-              # here so a flake that DOES emit one reads the same cross its
-              # binary was built by, instead of the vanilla one.
+              # The only runtimeEmbed flake that reads `pkgs.pkgsCross.mingwW64`
+              # from here is gvim. This makes a flake that emits a windows
+              # module read the same cross its binary was built by, instead of
+              # the vanilla one.
               // (if runtimeEmbedWindows != null
                   then runtimeEmbedWindows windowsEnginePkgs windowsForEmbed
                   else { });
@@ -6875,9 +6870,8 @@ CBODY
                     in
                     # A bespoke windowsBuild's own table wins here, and it is the
                     # whole entry rather than a patch on one: its programs are not
-                    # `multicall.programs` either (usbutils folds lsusb alone, and
-                    # a declaration of two would name an applet the .exe hasn't
-                    # got). This used to fall through to `dispatcher = false`,
+                    # `multicall.programs` either (a declaration of more would
+                    # name an applet the .exe hasn't got). This used to fall through to `dispatcher = false`,
                     # which reads as "nothing to check" and switched off the ONE
                     # check that sees a missing dispatcher — the negative control.
                     if platform.isWindows && windowsTable != null
