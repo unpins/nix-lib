@@ -664,11 +664,11 @@ rec {
   # build-config string, alsa-lib's and libpulse's plugin and helper dirs. A
   # static binary never loads modules or ships those files, so the paths are
   # dead; scrub them (removeReferences). FFmpeg's own configuration string
-  # (`-version`) carries the cross builds' `--host-cc`, the build machine's
-  # gcc-wrapper, which would otherwise pull a whole gcc into the closure.
+  # (`-version`) carries `--host-cc`, the build machine's compiler wrapper,
+  # which on a cross build would pull that whole compiler into the closure.
   deadRefs = [
     "glib-" "gdk-pixbuf-" "pango-" "fontconfig-" "libthai-" "zvbi-" "libvpx-"
-    "alsa-lib-" "libpulseaudio-" "gettext-" "gcc-wrapper-"
+    "alsa-lib-" "libpulseaudio-" "gettext-" "gcc-wrapper-" "clang-wrapper-"
   ];
 
   # Linux: libpulse's internal archive sits in lib/pulseaudio/, where the
