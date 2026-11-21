@@ -58,27 +58,79 @@
 #    libresolv for its HEADERS only — its note that "the res_* symbols are in
 #    libSystem" does not hold for this link — so the search path has to travel
 #    with the archive that carries the references.
+#
+# 8. Engine Linux (`pkgs ? unpinRustBin`, see rustDepsOverlay in flake.nix):
+#    rust-overlay's prebuilt rustc instead of nixpkgs' cross rustc, which
+#    can't live in the engine set. Linked like `mkEngineRust`: engine c++
+#    (the musl link only finds libunwind for C++), the engine's crt and libc
+#    instead of rust's self-contained ones, and not PIE (the engine starts a
+#    `-static-pie` image with crt1.o and it segfaults). Fixes #1, #3 and #5
+#    go: the engine link always carries its compiler-rt builtins, and its
+#    LLVM libunwind (nixpkgs' nongnu one would shadow it) is only on a C++
+#    link — `-lc++` is what marks one. So the unwinder rustc reports
+#    (`unwind`, `gcc_s` on riscv64) becomes `-lc++`: meson's C probe can't
+#    find it otherwise, and it is what Libs.private must hand a consumer.
+#    The archive also loses rust's `compiler_builtins`: the engine link's
+#    compiler-rt and libc define everything it serves, while a copy here
+#    resolves libcalls LTO emits after the bitcode libc is compiled, so the
+#    std it drags in finds no `close` or `strlen` (ffmpeg's checkasm).
 { lib }:
 pkgs:
 let
   host = pkgs.stdenv.hostPlatform;
   isMinGW = host.isMinGW or false;
-  needsClearCache = host.isLinux && !isMinGW && !host.isx86;
+  engineRust = !isMinGW && pkgs ? unpinRustBin;
+  needsClearCache = host.isLinux && !isMinGW && !host.isx86 && !engineRust;
   isRiscV = host.isRiscV or false;
   isPower64 = host.isPower64 or false;
+  rb = pkgs.unpinRustBin;
+  triple = host.rust.rustcTarget;
+  upper = t: lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] t);
+  cc = pkgs.stdenv.cc;
+  bcc = pkgs.buildPackages.stdenv.cc;
 in
-pkgs.librsvg.overrideAttrs (oa: {
+(if engineRust
+ then pkgs.librsvg.override {
+   rustc = rb;
+   rustPlatform = pkgs.buildPackages.makeRustPlatform { rustc = rb; cargo = rb; };
+   cargo-auditable-cargo-wrapper =
+     pkgs.buildPackages.cargo-auditable-cargo-wrapper.override { cargo = rb; };
+ }
+ else pkgs.librsvg).overrideAttrs (oa: {
   buildInputs = (oa.buildInputs or [ ])
-    ++ lib.optionals (!isMinGW) [ pkgs.libunwind ];
+    ++ lib.optionals (!isMinGW && !engineRust) [ pkgs.libunwind ];
   # See fix #7 below for libresolv.
   propagatedBuildInputs = (oa.propagatedBuildInputs or [ ]) ++ [ pkgs.pango ]
     ++ lib.optional (host.isDarwin or false) pkgs.darwin.libresolv;
+
+  # See fix #8 above.
+  postPatch = (oa.postPatch or "") + lib.optionalString engineRust ''
+    substituteInPlace meson.build --replace-fail \
+      "private_libraries += cc.find_library(i," \
+      "private_libraries += i in ['unwind', 'gcc_s'] ? declare_dependency(link_args: '-lc++') : cc.find_library(i,"
+  '';
 
   # See fix #3 / #3b above.
   preBuild = (oa.preBuild or "")
     + lib.optionalString needsClearCache ''
       cfg=$(grep -rl --include=config.toml '"rustflags"' "$NIX_BUILD_TOP" | head -1)
       sed -i 's|"rustflags" = \[|"rustflags" = [ "-Clink-arg=-lgcc",|g' "$cfg"
+    ''
+    + lib.optionalString engineRust ''
+      # The build scripts link with the build cc, which reads the unsalted
+      # NIX_* flags meant for the engine cc; link them with those unset.
+      printf '%s\n' '#!${pkgs.buildPackages.runtimeShell}' \
+        'unset NIX_LDFLAGS NIX_CFLAGS_COMPILE NIX_CFLAGS_LINK' \
+        'exec ${bcc}/bin/${bcc.targetPrefix}cc "$@"' > "$TMPDIR/build-cc"
+      chmod +x "$TMPDIR/build-cc"
+      export CARGO_TARGET_${upper pkgs.stdenv.buildPlatform.rust.rustcTarget}_LINKER="$TMPDIR/build-cc"
+      export CARGO_TARGET_${upper triple}_LINKER=${cc}/bin/${cc.targetPrefix}c++
+      export CC_${builtins.replaceStrings [ "-" ] [ "_" ] triple}=${cc}/bin/${cc.targetPrefix}cc
+      cfg=$(grep -rl --include=config.toml '"rustflags"' "$NIX_BUILD_TOP" | head -1)
+      sed -i '/\[target\."${triple}"\]/,/"rustflags"/ s|"rustflags" = \[|"rustflags" = [ "-Clink-self-contained=no", "-Crelocation-model=static",|' "$cfg"
+      # Doctests link through rustdoc, which reads RUSTDOCFLAGS and not the
+      # target's rustflags.
+      export RUSTDOCFLAGS="-Clink-self-contained=no -Crelocation-model=static"
     ''
     + lib.optionalString isMinGW ''
       cfg=$(grep -rl --include=config.toml '"rustflags"' "$NIX_BUILD_TOP" | head -1)
@@ -87,12 +139,17 @@ pkgs.librsvg.overrideAttrs (oa: {
 
   # See fix #5 above. Must be preConfigure: meson's find_library('gcc_s')
   # probe runs during the configure phase, before preBuild.
-  preConfigure = (oa.preConfigure or "") + lib.optionalString isRiscV ''
+  preConfigure = (oa.preConfigure or "") + lib.optionalString (isRiscV && !engineRust) ''
     mkdir -p "$TMPDIR/gcc_s-shim"
     eh=$($CC -print-file-name=libgcc_eh.a)
     [ -f "$eh" ] || eh=$($CC -print-file-name=libgcc.a)
     ln -sf "$eh" "$TMPDIR/gcc_s-shim/libgcc_s.a"
     export NIX_LDFLAGS="''${NIX_LDFLAGS:-} -L$TMPDIR/gcc_s-shim"
+  '';
+
+  postInstall = (oa.postInstall or "") + lib.optionalString engineRust ''
+    $AR t "$out/lib/librsvg-2.a" | grep '^compiler_builtins-' \
+      | xargs $AR d "$out/lib/librsvg-2.a"
   '';
 
   # See fix #4 above.

@@ -4816,8 +4816,7 @@ CBODY
             # declaration. Drop the (unused, lib-untouched) helper. Same fix as
             # native-overlay/libjpeg-turbo.nix, but as a drv→drv transform so it
             # composes with the lto=false `.override` below (a `.override` drops a
-            # lower overlay's postPatch, so the drop must ride ON the swapped drv)
-            # AND with the pristine librsvg scope, which never sees withLibjpegNoLto.
+            # lower overlay's postPatch, so the drop must ride ON the swapped drv).
             dropJpegSimdcov = drv: drv.overrideAttrs (oa: {
               postPatch = (oa.postPatch or "") + ''
                 substituteInPlace simd/CMakeLists.txt \
@@ -5036,36 +5035,49 @@ CBODY
                   in { libjpeg = lj; }
                      // nixpkgs.lib.optionalAttrs (prev ? libjpeg_turbo) { libjpeg_turbo = lj; }
                 else { });
-            # librsvg is a RUST package, and rustc can never be an engine derivation:
-            # the engine cc-wrapper carries `libc = null` (libc comes from the
-            # sysroot, not the wrapper — load-bearing), while rustc's configureFlags
-            # interpolate `musl-root=${cc.libc}`, so the set-wide stdenv swap makes
-            # every spliced rustc stage coerce null → eval dies. Rather than fight
-            # rustc's cross-splice (many stages, each re-resolving rustc-unwrapped
-            # through the swapped set), build librsvg from the PRISTINE pkgsStatic —
-            # exactly how it built before the engine migration. Its native `.a` (the
-            # rust crate's C-ABI staticlib) is folded by the engine link as a native
-            # sidecar, like SIMD asm. The C deps it SHARES with the top package
-            # (pango/cairo/glib…) still resolve to the engine set at the final link
-            # (pkg-config --static dedups each `-l` to one archive), so the pristine
-            # copies only serve librsvg's own build. The fixes are baked in here
-            # (`nativeFixes.librsvg` against the pristine scope) so the consumer uses
-            # the injected attr directly — re-applying them against the engine scope
-            # would splice engine libunwind/pango into a pristine build. Gated like
-            # the other set-wide engine fixes; identity where librsvg is absent.
+            # librsvg is a RUST package, and nixpkgs' rustc can never be an engine
+            # derivation: the engine cc-wrapper carries `libc = null` (libc comes
+            # from the sysroot, not the wrapper — load-bearing), while rustc's
+            # configureFlags interpolate `musl-root=${cc.libc}`, so the set-wide
+            # stdenv swap makes every spliced rustc stage coerce null → eval dies.
+            #
+            # Linux: librsvg builds IN the engine set with rust-overlay's prebuilt
+            # rustc (`unpinRustBin`, fix #8 of native-overlay/librsvg.nix), which
+            # never reads `cc.libc`. Its C chain (pango/cairo/glib…) is the engine
+            # one the consumer links too.
+            #
+            # Darwin: built from the PRISTINE pkgsStatic, as before the engine
+            # migration. Its native `.a` is folded by the engine link as a native
+            # sidecar; the C deps it SHARES with the top package still resolve to
+            # the engine set at the final link (pkg-config --static dedups each
+            # `-l` to one archive). The fixes are baked in here (`nativeFixes.
+            # librsvg` against the pristine scope) so the consumer uses the
+            # injected attr directly — re-applying them against the engine scope
+            # would splice engine libunwind/pango into a pristine build.
+            #
+            # Gated like the other set-wide engine fixes; identity where librsvg
+            # is absent.
             rustDepsOverlay =
               (_final: prev:
-                if isEngineScope prev && prev ? librsvg
+                if isEngineScope prev && prev ? librsvg && prev.stdenv.hostPlatform.isLinux
+                then
+                  let
+                    unpinRustBin =
+                      (import nixpkgs {
+                        system = prev.stdenv.buildPlatform.system;
+                        overlays = [ rust-overlay.overlays.default ];
+                      }).rust-bin.stable.latest.minimal.override {
+                        targets = [ prev.stdenv.hostPlatform.rust.rustcTarget ];
+                      };
+                  in {
+                    inherit unpinRustBin;
+                    librsvg = nativeFixes.librsvg (prev // { inherit unpinRustBin; });
+                  }
+                else if isEngineScope prev && prev ? librsvg
                 then {
-                  # librsvg pulls libjpeg_turbo transitively (gdk-pixbuf/libtiff/
-                  # libwebp) from this PRISTINE scope, which never passes through
-                  # withLibjpegNoLto — so the riscv64 simdcoverage drop must be
-                  # applied here too, or librsvg's own build fails. Assign to both
-                  # attrs from the concrete drv (going via the `libjpeg` alias would
-                  # cycle through nixpkgs' `libjpeg = libjpeg_turbo`).
                   librsvg =
                     let
-                      # …and darwin: librsvg drags its OWN pango/cairo/glib/
+                      # librsvg drags its OWN pango/cairo/glib/
                       # gdk-pixbuf chain out of this pristine scope, so every
                       # darwin structural fix the consuming flake applies to the
                       # engine scope has to be applied here too — the pristine
@@ -5075,7 +5087,6 @@ CBODY
                       # ipc_rmid_deferred_release darwin lookup, dav1d's
                       # cpu_family='arm64' asm dispatch. Same
                       # set `rsvg-convert` uses to build this chain standalone.
-                      # Darwin-gated, so every other host keeps its hash.
                       # NOT iconv-converged, deliberately. This chain is not
                       # private to librsvg's own build the way the note above
                       # suggests: librsvg is a Rust `staticlib`, so librsvg-2.a
@@ -5115,8 +5126,7 @@ CBODY
                       # One appendOverlays, not chained `.extend`s: each extend
                       # re-instantiates nixpkgs for the same resulting set.
                       scope = pkgs.pkgsStatic.appendOverlays ([
-                        (if pkgs.pkgsStatic.stdenv.hostPlatform.isDarwin or false
-                        then (_f: p: {
+                        (_f: p: {
                           glib       = nativeFixes.glib       p;
                           graphite2  = nativeFixes.graphite2  p;
                           fontconfig = nativeFixes.fontconfig p;
@@ -5124,22 +5134,10 @@ CBODY
                           cairo      = nativeFixes.cairo      p;
                           dav1d      = nativeFixes.dav1d      p;
                         })
-                        # Everywhere else graphite2 is the only one: its recipe
-                        # asks for `python3.withPackages`, which resolves to the
-                        # HOST python, a whole static CPython with fonttools.
-                        # The fix hands it the build machine's python; darwin
-                        # gets the same fix from the list above.
-                        else (_f: p: {
-                          graphite2 = nativeFixes.graphite2 p;
-                        }))
                         (_f: p:
                           if !(p.stdenv.hostPlatform.isStatic or false) then { }
                           else { libxml2 = nativeFixes.libxml2 p; })
-                      ] ++ nixpkgs.lib.optional
-                        (pkgs.pkgsStatic.stdenv.hostPlatform.isRiscV or false)
-                        (_f: p:
-                          let lj = dropJpegSimdcov p.libjpeg_turbo;
-                          in { libjpeg = lj; libjpeg_turbo = lj; }));
+                      ]);
                     in
                     nativeFixes.librsvg scope;
                 }
@@ -5274,6 +5272,17 @@ CBODY
                   # because the reason above stands on its own.
                   mcfgthreads = _wp.mcfgthreads.override { stdenv = _wp.crossThreadsStdenv; };
                 });
+                # rust for this scope's Rust packages (librsvg): rust-overlay's
+                # prebuilt rustc + `-gnullvm` std. nixpkgs' cross rustc compiles
+                # that std itself, linking through a bintools wrapper whose libc
+                # is nixpkgs' mingw-w64 CRT, built by the mingw nolibc gcc.
+                unpinRustBin =
+                  ((import nixpkgs {
+                    system = p.stdenv.buildPlatform.system;
+                    overlays = [ rust-overlay.overlays.default ];
+                  }).rust-bin.stable.latest.minimal.override {
+                    targets = [ p.stdenv.hostPlatform.rust.rustcTarget ];
+                  });
               }
               // nixpkgs.lib.optionalAttrs
                 ((p.stdenv.hostPlatform.isMinGW or false) && p ? x264)
@@ -6910,21 +6919,130 @@ CBODY
             inherit unpinRecipe;
           };
 
+        # A Rust package for a Linux (every arch) or Windows target with no gcc
+        # anywhere: rust-overlay's prebuilt rustc + the target's std, cargo driven
+        # directly, linked by the ENGINE cc against the engine libc, and the cc
+        # crate's C (vendored C) compiled by that same cc (CC_/AR_<triple>).
+        # nixpkgs' rustc for a musl or mingw host would be built, std and all, by
+        # that target's gcc, and its cargoBuildHook puts that gcc back as linker
+        # and CC on cargo's own command line.
+        #
+        # The derivation's stdenv is the build machine's: its gnu cc only links
+        # the build scripts and proc-macros, and the engine cc is never a build
+        # input, so its unsalted NIX_LDFLAGS/NIX_CFLAGS_* stay out of those links.
+        #
+        # `bins`: the cargo binaries to install (`.exe` added on windows). Every
+        # other attribute is the mkDerivation's (src, cargoDeps, phases, checks);
+        # `env` merges over the toolchain's, and an `env.RUSTFLAGS` is appended.
+        # `passthru.rustTarget` is the cargo target triple (target/<triple>/…).
+        # `dnsFallback`: withDnsFallback's archive (built by the engine cc) and
+        # `--wrap`s, on the rustc link line. `auditable`: cargo-auditable's
+        # dependency list in the binary; off on windows, where it overflowed a
+        # mingw 32-bit relocation (unpin precedent).
+        mkEngineRust = pkgs:
+          { windows ? false, rust-overlay ? defaultRustOverlay, bins, env ? { }
+          , nativeBuildInputs ? [ ], cargoBuildFlags ? [ ]
+          , dnsFallback ? false, auditable ? !windows, ... }@a:
+          let
+            lib' = nixpkgs.lib;
+            system = pkgs.stdenv.buildPlatform.system;
+            npkgs = import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
+            tg =
+              if windows then {
+                # The `-gnullvm` std: no gcc runtime in it (libgcc, mcfgthread).
+                triple = "x86_64-pc-windows-gnullvm";
+                stdenv = windowsEngineStdenvSharedNoLto;
+                # libunpindns.a's socket, process and CRT calls.
+                dnsLibs = [ "-lws2_32" "-lkernel32" ];
+                dnsWraps = [ "getaddrinfo" "freeaddrinfo" ];
+                linker = "cc";
+                rustflags = "";
+                exe = ".exe";
+              } else {
+                triple = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTarget;
+                stdenv = engineStdenv {
+                  inherit pkgs;
+                  toolchain = unpinToolchain system;
+                  lto = false;
+                };
+                # The libc again AFTER the archive (it calls back into musl).
+                dnsLibs = [ "-lc" ];
+                # musl answers gethostbyname without getaddrinfo; see withDnsFallback.
+                dnsWraps = [ "getaddrinfo" "freeaddrinfo" "gethostbyname" ];
+                # Linked as C++: the engine's musl link only builds and searches
+                # its libunwind for C++ (rust's `-lunwind` alone is unresolved);
+                # libc++/libc++abi are archives, so nothing of them lands unless
+                # referenced.
+                linker = "c++";
+                # `link-self-contained=no`: rust-std's own musl libc.a/crt (gcc-
+                # built upstream) stay out; libc, crt and libunwind come from the
+                # engine sysroot. Not PIE: rustc asks for `-static-pie`, which the
+                # engine's link doesn't read as PIE — it starts the image with the
+                # non-relocating crt1.o and the binary segfaults before main.
+                rustflags = "-C link-self-contained=no -C relocation-model=static";
+                exe = "";
+              };
+            rust = npkgs.rust-bin.stable.latest.default.override { targets = [ tg.triple ]; };
+            cc = tg.stdenv.cc;
+            # cargo reads CARGO_TARGET_<TRIPLE>_*; the cc crate CC_<triple>.
+            tl = builtins.replaceStrings [ "-" ] [ "_" ] tg.triple;
+            t = lib'.toUpper tl;
+            c = "${cc}/bin/${cc.targetPrefix}";
+            linkArgs = map (x: "-C link-arg=${x}");
+            dns = lib'.optionals dnsFallback (linkArgs (
+              map (w: "-Wl,--wrap=${w}") tg.dnsWraps
+              ++ [ "-L${dnsFallbackLib { inherit (tg) stdenv; }}/lib" "-lunpindns" ]
+              ++ tg.dnsLibs));
+            # -C strip replaces the fixup strip (can't edit a foreign-arch ELF).
+            rustflags = lib'.concatStringsSep " " ([
+              "-C target-feature=+crt-static" "-C strip=symbols" tg.rustflags
+            ] ++ dns ++ lib'.optional (env ? RUSTFLAGS) env.RUSTFLAGS);
+          in
+          npkgs.stdenv.mkDerivation (builtins.removeAttrs a
+            [ "windows" "rust-overlay" "bins" "env" "nativeBuildInputs" "cargoBuildFlags"
+              "dnsFallback" "auditable" ] // {
+            pname = "${a.pname}-${tg.triple}";
+            nativeBuildInputs = [ rust npkgs.rustPlatform.cargoSetupHook ]
+              ++ lib'.optional auditable npkgs.cargo-auditable
+              ++ nativeBuildInputs;
+            env = env // {
+              "CARGO_TARGET_${t}_LINKER" = "${c}${tg.linker}";
+              "CC_${tl}" = "${c}cc";
+              "CXX_${tl}" = "${c}c++";
+              "AR_${tl}" = "${cc.bintools.bintools}/bin/${cc.targetPrefix}ar";
+              RUSTFLAGS = rustflags;
+            };
+            # The engine cc reads the build stdenv's unsalted NIX_HARDENING_ENABLE:
+            # give it the engine stdenv's posture, stackprotector only (fortify
+            # off — the engine libc has no __*_chk).
+            hardeningDisable = lib'.remove "stackprotector" cc.defaultHardeningFlags;
+            dontStrip = true;
+            buildPhase = a.buildPhase or ''
+              runHook preBuild
+              cargo ${lib'.optionalString auditable "auditable "}build --release --offline --target ${tg.triple} ${lib'.escapeShellArgs cargoBuildFlags}
+              runHook postBuild
+            '';
+            installPhase = a.installPhase or ''
+              runHook preInstall
+              ${lib'.concatMapStrings (b: ''
+                install -Dm755 target/${tg.triple}/release/${b}${tg.exe} $out/bin/${b}${tg.exe}
+              '') bins}
+              runHook postInstall
+            '';
+            passthru = (a.passthru or { }) // { rustTarget = tg.triple; };
+          });
+
         # Rust-crate flake template. A thin wrapper over mkStandaloneFlake
         # supplying Rust-aware build closures. Two source modes (nixpkgs attr vs
-        # own-source, see `src`) × two dep shapes (pure Rust vs vendored C, see
-        # `vendoredC`). Crates with real external C/TLS deps (ring, openssl-sys)
-        # are out of scope — see unpins/unpin.
+        # own-source, see `src`). Vendored C (the cc crate) needs nothing extra;
+        # crates with real external C/TLS deps (ring, openssl-sys) are out of
+        # scope — see unpins/unpin.
         #
-        #   native linux/darwin → pkgs.pkgsStatic.<pkgsAttr> (recipe as-is).
-        #   cross-musl (i686/armv7l/ppc64le/riscv64/aarch64) → pure Rust: NO C
-        #     cross toolchain — rustup's rust-std for *-musl bundles musl's
-        #     libc.a + crt and the host ld.lld links any ELF arch; rustc/cargo run
-        #     native. With vendoredC, the C catalog's cached scopes supply the C
-        #     compiler/linker instead.
-        #   cross darwin → nixpkgs cross rustPlatform + the pkgsStatic.libiconv pin
-        #     + a build-arch -L for proc-macro dylib links.
-        #   windows → pkgs.pkgsCross.mingwW64.<pkgsAttr>.
+        #   linux (every arch) and windows → `mkEngineRust`: rust-overlay's
+        #     prebuilt rustc + the target's std, linked by the engine cc against
+        #     the engine libc; vendored C compiles with the same cc. No gcc.
+        #   native darwin → pkgs.pkgsStatic.<pkgsAttr> (recipe as-is).
+        #   cross darwin → the host's default rustPlatform.
         #
         # dnsFallback is forced off (its unsalted NIX_LDFLAGS leaks the
         # arch-specific libunpindns.a into crate build-script links); asking for it
@@ -6942,14 +7060,6 @@ CBODY
           , src ? null
           , version ? null
           , cargoLock ? null
-          # True when the crate's dep closure compiles vendored C through a
-          # build.rs (the cc crate — e.g. unpin-man's mandoc render subset).
-          # Chain-free linking is impossible then: the musl crosses build
-          # through the SAME top cross scopes the C catalog already caches
-          # (musl32, musl-power, the spelled-out riscv64/armv7l), so no new
-          # toolchain is ever built — and rust-overlay's rustc still avoids
-          # any cross-rustc source bootstrap.
-          , vendoredC ? false
           , ...
           }@args:
           let
@@ -6969,27 +7079,20 @@ CBODY
               inherit system;
               overlays = [ rust-overlay.overlays.default ];
             };
-            toolchainFor = system: triple:
-              (rustPkgsFor system).rust-bin.stable.latest.default.override {
-                targets = [ triple ];
-              };
 
-            # Chain-free cross-musl (pure Rust): rust-std bundles musl's libc.a +
-            # crt, the native ld.lld links any ELF arch; rustc/cargo run native.
-            muslCrossPure = pkgs:
+            # Linux (every arch) and windows: the engine route.
+            crate = pkgs: { windows ? false }:
               let
-                # Eval-only peek: pkgsStatic elaborates the static-musl host. No
-                # derivation from the cross scope is ever built.
-                triple = pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTarget;
                 npkgs = rustPkgsFor pkgs.stdenv.buildPlatform.system;
-                rust = toolchainFor pkgs.stdenv.buildPlatform.system triple;
                 base = if ownSource then null else npkgs.${pkgsAttr};
                 bin =
                   if ownSource then args.binName or name
                   else base.meta.mainProgram or name;
               in
-              npkgs.stdenv.mkDerivation {
-                pname = "${pkgsAttr}-${triple}";
+              mkEngineRust pkgs {
+                inherit windows rust-overlay;
+                bins = [ bin ];
+                pname = pkgsAttr;
                 version = if ownSource then version else base.version;
                 src = if ownSource then src else base.src;
                 meta = if ownSource then { mainProgram = bin; } else base.meta;
@@ -6997,56 +7100,15 @@ CBODY
                   if ownSource
                   then npkgs.rustPlatform.importCargoLock { lockFile = cargoLock; }
                   else base.cargoDeps;
-                nativeBuildInputs = [
-                  rust
-                  npkgs.rustPlatform.cargoSetupHook
-                  npkgs.lld
-                ];
-                # ld.lld by name → rustc infers the gnu-lld flavor;
-                # link-self-contained uses rust-std's bundled musl crt/libc; -C
-                # strip replaces the fixup strip (can't edit a foreign-arch ELF).
-                env.RUSTFLAGS = "-C linker=ld.lld -C link-self-contained=yes -C target-feature=+crt-static -C strip=symbols";
-                dontStrip = true;
-                buildPhase = ''
-                  runHook preBuild
-                  cargo build --release --offline --target ${triple}
-                  runHook postBuild
-                '';
-                installPhase = ''
-                  runHook preInstall
-                  install -Dm755 target/${triple}/release/${bin} $out/bin/${bin}
-                  runHook postInstall
-                '';
               };
-
-            # Cross-musl with vendored C: the scope's makeRustPlatform bakes
-            # --target + CC_<T>/CARGO_TARGET_<T>_LINKER to that scope's cached C
-            # cross toolchain; rust-overlay supplies rustc/cargo native. crt-static
-            # because rust-overlay's musl specs default it off; auditable=false (the
-            # unpin precedent).
-            muslCrossVendored = pkgs:
-              let
-                rust = toolchainFor pkgs.stdenv.buildPlatform.system
-                  pkgs.stdenv.hostPlatform.rust.rustcTarget;
-                rp = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
-              in
-              if ownSource then
-                mkOwn {
-                  rustPlatform = rp;
-                  auditable = false;
-                  env.RUSTFLAGS = "-C target-feature=+crt-static";
-                }
-              else
-                (pkgs.${pkgsAttr}.override { rustPlatform = rp; }).overrideAttrs (_: {
-                  RUSTFLAGS = "-C target-feature=+crt-static";
-                });
 
             rustBuild = pkgs:
               let
                 host = pkgs.stdenv.hostPlatform;
                 cross = host.config != pkgs.stdenv.buildPlatform.config;
               in
-              if !cross then
+              if host.isLinux then crate pkgs { }
+              else if !cross then
                 (if ownSource then
                   mkOwn {
                     rustPlatform = pkgs.pkgsStatic.rustPlatform;
@@ -7057,28 +7119,18 @@ CBODY
               # against the host's default rustPlatform. rustc's `-liconv` (target
               # and build-host links) is handled centrally by withDarwinIconv, so
               # no per-path iconv wiring here.
-              else if host.isDarwin then
+              else
                 (if ownSource then mkOwn { rustPlatform = pkgs.rustPlatform; }
-                else pkgs.${pkgsAttr})
-              else if vendoredC then muslCrossVendored pkgs
-              else muslCrossPure pkgs;
+                else pkgs.${pkgsAttr});
 
-            # auditable=false on mingw: rustc + LTO + cargo-auditable
-            # overflows mingw's 32-bit relocation limit (unpin precedent).
-            rustWindowsBuild = pkgs:
-              if ownSource then
-                mkOwn {
-                  rustPlatform = pkgs.pkgsCross.mingwW64.rustPlatform;
-                  auditable = false;
-                }
-              else pkgs.pkgsCross.mingwW64.${pkgsAttr};
+            rustWindowsBuild = pkgs: crate pkgs { windows = true; };
           in
           assert nixpkgs.lib.assertMsg (!(args.dnsFallback or false))
             "mkRustCrate: dnsFallback is unsupported for Rust crates (the unsalted NIX_LDFLAGS breaks crate build scripts) — see unpins/unpin for bespoke wiring";
           assert nixpkgs.lib.assertMsg (!ownSource || (version != null && cargoLock != null))
             "mkRustCrate: own-source mode needs all three of src / version / cargoLock";
           mkStandaloneFlake (
-            builtins.removeAttrs args [ "rust-overlay" "src" "version" "cargoLock" "vendoredC" ]
+            builtins.removeAttrs args [ "rust-overlay" "src" "version" "cargoLock" ]
             // {
               build = args.build or rustBuild;
               windowsBuild = args.windowsBuild or rustWindowsBuild;

@@ -497,10 +497,9 @@ let
       x265Static     = ulib.nativeFixes.x265           pkgsStaticScope;
       xvidStatic     = ulib.nativeFixes.xvidcore       pkgsStaticScope;
       gmeStatic      = ulib.nativeFixes.game-music-emu pkgsStaticScope;
-      # librsvg (Rust) can't be an engine derivation — rustc's configureFlags
-      # need the cc's libc, which the engine wrapper nulls out. On the native
-      # engine scopes nix-lib injects a PRISTINE, already-fixed librsvg into
-      # `pkgsStatic.librsvg`, folded as a native sidecar; use it directly.
+      # On the native engine scopes nix-lib injects an already-fixed librsvg
+      # into `pkgsStatic.librsvg` (built in the engine set on Linux, from a
+      # pristine pkgsStatic on darwin — see rustDepsOverlay); use it directly.
       # The mingw set does NOT get that injection (windowsPkgsShared is a raw
       # nixpkgs import — the withRustDeps layer only wraps the pkgsStatic
       # chain), so keep applying the fix there. It also carries the
@@ -787,9 +786,9 @@ rec {
           libopus    = ulib.nativeFixes.libopus    prev;
         } else { })
         # riscv64 libjpeg-turbo's broken RVV simdcoverage helper is dropped
-        # SET-WIDE in nix-lib now (withLibjpegNoLto for the engine scope +
-        # the librsvg pristine scope), since librsvg's transitive libjpeg
-        # never passes through this per-flake overlay. Nothing to do here.
+        # SET-WIDE in nix-lib (withLibjpegNoLto for the engine scope), since
+        # librsvg's transitive libjpeg never passes through this per-flake
+        # overlay. Nothing to do here.
       );
     };
 
