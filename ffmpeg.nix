@@ -31,6 +31,8 @@ let
       # consumer that links libav* itself (fpcalc). Without the chromaprint
       # muxer: that consumer IS chromaprint, and would get two copies of it.
     , installLibs ? false
+      # darwin engine: the iconv to link instead of Apple's (null = pkgs.libiconv).
+    , iconv ? null
     }:
     let
       stdenv = pkgs.stdenv;
@@ -332,8 +334,15 @@ let
       # pkgsStatic overlay below (so transitive consumers — e.g.
       # libsndfile → libopus — see the same patched build), vanilla
       # elsewhere.
+      # Apple's libiconv cannot stay on darwin: the engine's libxml2 is built
+      # against GNU's (darwinIconvConverge), so configure's link test of
+      # libbluray → libxml2 fails on `libiconv_open`. mkStandaloneFlake swaps
+      # it on the binary it builds (darwinIconvFixed), which misses this
+      # derivation when it is a library dep (fpcalc).
       buildInputs = (with pkgs; [
-        zlib bzip2 xz libiconv x264 libvorbis libogg lame zimg
+        zlib bzip2 xz
+        (if isDarwin && isEngine && iconv != null then iconv else libiconv)
+        x264 libvorbis libogg lame zimg
         libopus dav1d
       ]) ++ noChromaprint extraInputs;
 
@@ -886,6 +895,10 @@ rec {
         (if isDarwin then [ ] else [ "--enable-pthreads" ])
         ++ extras.flags;
       extraInputs = extras.inputs;
+      iconv = ulib.darwinIconvCompat {
+        pkgs = origPkgs;
+        toolchain = ulib.unpinToolchain origPkgs.stdenv.buildPlatform.system;
+      };
     } // opts);
 
   # mingw: force pthreads (not w32threads) to match downstream codec
