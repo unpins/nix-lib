@@ -64,8 +64,8 @@
  * getaddrinfo is not the only door: a program old enough to predate it resolves
  * through gethostbyname(), which musl answers without going through getaddrinfo,
  * so wrapping getaddrinfo alone leaves that program with an archive linked in
- * and nothing behind it. On Linux gethostbyname is wrapped too and routed
- * through the same fallback — see __wrap_gethostbyname at the bottom.
+ * and nothing behind it. On Linux gethostbyname and gethostbyname_r are
+ * wrapped too and routed through the same fallback — see the bottom.
  *
  * Second stage — DoH over HTTPS/443 (optional)
  * --------------------------------------------
@@ -835,6 +835,86 @@ struct hostent *__wrap_gethostbyname(const char *name)
     hb.h_length    = (int)sizeof(struct in_addr);
     hb.h_addr_list = hb_list;
     return &hb;
+}
+
+/* The reentrant door, same rule. PHP resolves gethostbyname()/fsockopen()
+ * through gethostbyname_r, which musl answers via gethostbyname2_r — never
+ * through either wrapper above. musl's own gethostbyname does not call
+ * gethostbyname_r, so wrapping it reroutes nothing internal. The answer goes
+ * into the caller's buffer; too small a buffer is ERANGE, and callers retry
+ * with a larger one, as they do for the real function. */
+extern int __real_gethostbyname_r(const char *name, struct hostent *h,
+                                  char *buf, size_t buflen,
+                                  struct hostent **res, int *err);
+
+int __wrap_gethostbyname_r(const char *name, struct hostent *h,
+                           char *buf, size_t buflen,
+                           struct hostent **res, int *err)
+{
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *ai = NULL;
+
+    int tried = want_fallback(name) && skip_system_resolver(name);
+    int early = tried &&
+                unpin_dns_fallback(name, NULL, &hints, &ai, -1) == 0 && ai;
+    if (!early) {
+        int rc = __real_gethostbyname_r(name, h, buf, buflen, res, err);
+        if (rc == 0 || rc == ERANGE) return rc;
+        if (*err != TRY_AGAIN && *err != NO_RECOVERY) return rc;
+        if (tried || !want_fallback(name)) return rc;
+        ai = NULL;
+        if (unpin_dns_fallback(name, NULL, &hints, &ai, -1) != 0 || !ai)
+            return rc;
+    }
+
+    int n = 0;
+    for (struct addrinfo *a = ai; a; a = a->ai_next)
+        if (a->ai_family == AF_INET && a->ai_addr && n < MAXADDR) n++;
+    *res = NULL;
+    if (n == 0) {
+        ENTRY_FREEADDRINFO(ai);
+        *err = HOST_NOT_FOUND;
+        return ENOENT;
+    }
+
+    /* Layout: h_addr_list[n+1], h_aliases[1], the addresses, the name. */
+    size_t namelen = strlen(name) + 1;
+    size_t need = (size_t)(n + 2) * sizeof(char *)
+                + (size_t)n * sizeof(struct in_addr) + namelen;
+    size_t pad = (uintptr_t)buf % sizeof(char *);
+    if (pad) pad = sizeof(char *) - pad;
+    if (buflen < pad || buflen - pad < need) {
+        ENTRY_FREEADDRINFO(ai);
+        return ERANGE;
+    }
+    char **list    = (char **)(buf + pad);
+    char **aliases = list + n + 1;
+    struct in_addr *addr = (struct in_addr *)(aliases + 1);
+    char *hname = (char *)(addr + n);
+
+    int i = 0;
+    for (struct addrinfo *a = ai; a && i < n; a = a->ai_next) {
+        if (a->ai_family != AF_INET || !a->ai_addr) continue;
+        addr[i] = ((struct sockaddr_in *)a->ai_addr)->sin_addr;
+        list[i] = (char *)&addr[i];
+        i++;
+    }
+    ENTRY_FREEADDRINFO(ai);
+    list[n] = NULL;
+    aliases[0] = NULL;
+    memcpy(hname, name, namelen);
+
+    h->h_name      = hname;
+    h->h_aliases   = aliases;
+    h->h_addrtype  = AF_INET;
+    h->h_length    = (int)sizeof(struct in_addr);
+    h->h_addr_list = list;
+    *res = h;
+    *err = 0;
+    return 0;
 }
 #endif /* UNPIN_LINUX */
 

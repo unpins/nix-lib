@@ -1819,9 +1819,10 @@ EOF
                # static-only so `-lunpindns` resolves to libunpindns.a.
                # `gethostbyname` too: musl answers it without going through
                # getaddrinfo, so a program on the legacy door (GNU netcat) got a
-               # linked archive and no fallback at all. Wrapping a symbol the
-               # binary never references is a no-op for the linker.
-               ("--wrap=getaddrinfo --wrap=freeaddrinfo --wrap=gethostbyname"
+               # linked archive and no fallback at all; `gethostbyname_r` for
+               # the same reason (PHP's door). Wrapping a symbol the binary
+               # never references is a no-op for the linker.
+               ("--wrap=getaddrinfo --wrap=freeaddrinfo --wrap=gethostbyname --wrap=gethostbyname_r"
                 + " -L${lib} -lunpindns -lc")
              else if h.isWindows
              then appendLdFlags drv
@@ -4274,7 +4275,7 @@ CBODY
             dnsHost = pkgs.pkgsStatic.stdenv.hostPlatform;
             dnsLinkFlags =
               if anyDns && dnsHost.isLinux && (dnsHost.isStatic or false)
-              then " -Wl,--wrap=getaddrinfo -Wl,--wrap=freeaddrinfo -Wl,--wrap=gethostbyname"
+              then " -Wl,--wrap=getaddrinfo -Wl,--wrap=freeaddrinfo -Wl,--wrap=gethostbyname -Wl,--wrap=gethostbyname_r"
                 + " ${dnsFallbackLib { inherit (engines."unpin-llvm") stdenv; }}/lib/libunpindns.a"
               else "";
             moduleArchives = map (m: m.moduleArchive) modules;
@@ -6974,7 +6975,7 @@ CBODY
                 # The libc again AFTER the archive (it calls back into musl).
                 dnsLibs = [ "-lc" ];
                 # musl answers gethostbyname without getaddrinfo; see withDnsFallback.
-                dnsWraps = [ "getaddrinfo" "freeaddrinfo" "gethostbyname" ];
+                dnsWraps = [ "getaddrinfo" "freeaddrinfo" "gethostbyname" "gethostbyname_r" ];
                 # Linked as C++: the engine's musl link only builds and searches
                 # its libunwind for C++ (rust's `-lunwind` alone is unresolved);
                 # libc++/libc++abi are archives, so nothing of them lands unless
