@@ -12,12 +12,18 @@
 # mingw: drop gdk-pixbuf + make-shell-wrapper-hook — the wrapper hook splices
 # to a mingw bash that can't cross-compile (no sigset_t/fork). Gated to mingw
 # to keep native/darwin's cached closure.
+#
+# gdk-pixbuf leaves buildInputs everywhere: with the loader off nothing links
+# it, and it drags glib in, which darwin's static set cannot build without
+# nix-lib's glib fix. pkgsStatic moves buildInputs into propagatedBuildInputs,
+# so both lists are filtered.
 { lib }:
 pkgs:
 let
   isMinGW = pkgs.stdenv.hostPlatform.isMinGW or false;
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
   isEngine = lib.isUnpinEngine pkgs;
+  noPixbuf = builtins.filter (x: (x.pname or x.name or "") != "gdk-pixbuf");
   dropNative = builtins.filter
     (x: !(builtins.elem (x.pname or x.name or "") [ "gdk-pixbuf" "make-shell-wrapper-hook" ]));
 in
@@ -34,6 +40,8 @@ pkgs.libavif.overrideAttrs (oa: {
     substituteInPlace cmake/Modules/merge_static_libs.cmake \
       --replace-fail 'if(APPLE)' 'if(FALSE)'
   '';
+  buildInputs = noPixbuf (oa.buildInputs or [ ]);
+  propagatedBuildInputs = noPixbuf (oa.propagatedBuildInputs or [ ]);
   nativeBuildInputs =
     if isMinGW then dropNative (oa.nativeBuildInputs or [ ]) else (oa.nativeBuildInputs or [ ]);
   cmakeFlags = [
