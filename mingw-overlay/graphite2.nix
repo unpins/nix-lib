@@ -1,4 +1,4 @@
-# graphite2 cross-mingw, five fixes:
+# graphite2 cross-mingw, six fixes:
 #
 # 1. `NIX_CFLAGS += -DGRAPHITE2_STATIC` — headers default `GR2_API` to
 #    dllimport; test exes link `libgraphite2.a` and get `__imp_gr_*` undef.
@@ -29,6 +29,10 @@
 #    `(python3.withPackages …)` resolves to the HOST (mingw) python, which
 #    nixpkgs marks broken, so nothing that reaches harfbuzz evaluated. See the
 #    fourth note in ../native-overlay/graphite2.nix.
+#
+# 6. No freetype input: only an example program uses it (the static recipe
+#    drops it), and freetype links harfbuzz, which links graphite2
+#    (freetype.nix): the input would be a dependency cycle.
 { lib }:
 self: super:
 let
@@ -40,6 +44,7 @@ lib.appendCFlags ((super.graphite2.override { python3 = super.buildPackages.pyth
     substituteInPlace CMakeLists.txt \
       --replace-fail "add_subdirectory(tests)" "# add_subdirectory(tests) — dropped for mingw static build"
   '';
+  buildInputs = builtins.filter (x: (x.pname or "") != "freetype") (oa.buildInputs or [ ]);
   doCheck = false;
   doInstallCheck = false;
   postInstall = (oa.postInstall or "")

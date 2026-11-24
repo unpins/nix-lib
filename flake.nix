@@ -2011,6 +2011,38 @@ EOF
               ./libiconv-utf8mac.patch;
         });
 
+        # Apple's `iconv`/`iconv_open`/`iconv_close` as forwarders into GNU
+        # libiconv's own `libiconv*`, inside its archive: a link that mixes
+        # objects built against either header resolves both from the one
+        # `-liconv`. Idempotent (passthru marker): a copy read off the
+        # converged scope already has them.
+        withAppleIconvNames = pkgs: d:
+          if d.passthru.unpinAppleIconvNames or false then d
+          else d.overrideAttrs (o: {
+            postInstall = (o.postInstall or "") + ''
+              cat > compat.c <<'EOF'
+              #include <stddef.h>
+              typedef void *iconv_t;
+              /* Declared by hand: including <iconv.h> would #define
+                 these names right back to the ones defined below. */
+              extern iconv_t libiconv_open(const char *, const char *);
+              extern size_t libiconv(iconv_t, char **, size_t *, char **, size_t *);
+              extern int libiconv_close(iconv_t);
+              iconv_t iconv_open(const char *t, const char *f)
+              { return libiconv_open(t, f); }
+              size_t iconv(iconv_t cd, char **in, size_t *inl, char **out, size_t *outl)
+              { return libiconv(cd, in, inl, out, outl); }
+              int iconv_close(iconv_t cd) { return libiconv_close(cd); }
+              EOF
+              $CC -c compat.c -o unpin_iconv_compat.o
+              ${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm \
+                llvm-ar r $out/lib/libiconv.a unpin_iconv_compat.o
+              ${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm \
+                llvm-ar s $out/lib/libiconv.a
+            '';
+            passthru = (o.passthru or { }) // { unpinAppleIconvNames = true; };
+          });
+
         # Canonical libarchive for the catalog: ONE derivation shared by every
         # unpin that links libarchive (tar ships bsdtar over it; e2fsprogs uses
         # it for `mke2fs -d <archive>`). Because both consumers link this exact
@@ -4797,31 +4829,9 @@ CBODY
         # library linked as a DEP, which darwinIconvFixed never sees (FFmpeg
         # under fpcalc).
         darwinIconvCompat = { pkgs, toolchain }:
-          (withUtf8Mac (pkgs.pkgsStatic.libiconvReal.override {
+          withAppleIconvNames pkgs (withUtf8Mac (pkgs.pkgsStatic.libiconvReal.override {
             stdenv = engineStdenv { inherit pkgs toolchain; };
-          })).overrideAttrs (o: {
-            postInstall = (o.postInstall or "") + ''
-              cat > compat.c <<'EOF'
-              #include <stddef.h>
-              typedef void *iconv_t;
-              /* Declared by hand: including <iconv.h> would #define
-                 these names right back to the ones defined below. */
-              extern iconv_t libiconv_open(const char *, const char *);
-              extern size_t libiconv(iconv_t, char **, size_t *, char **, size_t *);
-              extern int libiconv_close(iconv_t);
-              iconv_t iconv_open(const char *t, const char *f)
-              { return libiconv_open(t, f); }
-              size_t iconv(iconv_t cd, char **in, size_t *inl, char **out, size_t *outl)
-              { return libiconv(cd, in, inl, out, outl); }
-              int iconv_close(iconv_t cd) { return libiconv_close(cd); }
-              EOF
-              $CC -c compat.c -o unpin_iconv_compat.o
-              ${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm \
-                llvm-ar r $out/lib/libiconv.a unpin_iconv_compat.o
-              ${unpinToolchain pkgs.stdenv.buildPlatform.system}/bin/llvm \
-                llvm-ar s $out/lib/libiconv.a
-            '';
-          });
+          }));
 
         # The set-level engine stdenv swap on pkgsStatic (Layers A/B/C), as a pure
         # function of (pkgs, toolchain). This is the heaviest per-package fixpoint
@@ -4893,17 +4903,23 @@ CBODY
               else
                 let
                   l = nixpkgs.lib;
-                  real = withUtf8Mac scope.libiconvReal;
+                  real = withAppleIconvNames scope (withUtf8Mac scope.libiconvReal);
                   # Both spellings carry pname "libiconv", so drop every one and
                   # add GNU back — same idiom as darwinIconvFixed's `noIconv`.
                   noIconv = l.filter (x: (x.pname or "") != "libiconv");
                   # Propagated, not a plain buildInput: a consumer that links
                   # e.g. libxml2.a resolves `libiconv*` out of ITS own link, so
-                  # the -L has to travel with the dep.
+                  # the -L has to travel with the dep. And FIRST: glib also
+                  # propagates gettext, which carries Apple's libiconv, and a
+                  # bare `-liconv` binds the first directory that has one —
+                  # Apple's lacks `libiconv_open` (libbluray → libxml2 via
+                  # freetype → harfbuzz → glib). Found first, `real` serves
+                  # gettext's libintl too, built on Apple's header: hence its
+                  # Apple-name forwarders.
                   swap = d: d.overrideAttrs (o: {
                     buildInputs = noIconv (o.buildInputs or [ ]);
                     propagatedBuildInputs =
-                      noIconv (o.propagatedBuildInputs or [ ]) ++ [ real ];
+                      [ real ] ++ noIconv (o.propagatedBuildInputs or [ ]);
                   });
                   # gettext is deliberately NOT here, though the sweep flags its
                   # libintl/libgettextpo/libtextstyle. Two reasons, both hard:
@@ -5166,9 +5182,16 @@ CBODY
                           cairo      = nativeFixes.cairo      p;
                           dav1d      = nativeFixes.dav1d      p;
                         })
-                        (_f: p:
+                        # freetype too (harfbuzz linked in, not dlopened at run
+                        # time), gated for the same reason: ungated, the build
+                        # machine's freetype closes a cycle through fontforge.
+                        (f: p:
                           if !(p.stdenv.hostPlatform.isStatic or false) then { }
-                          else { libxml2 = nativeFixes.libxml2 p; })
+                          else {
+                            libxml2  = nativeFixes.libxml2  p;
+                            freetype = nativeFixes.freetype p;
+                            harfbuzz = f.freetype.unpinHarfbuzz;
+                          })
                       ]);
                     in
                     nativeFixes.librsvg scope;

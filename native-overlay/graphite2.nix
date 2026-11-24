@@ -30,8 +30,14 @@
   apply = pkgs:
     let
       isEngine = lib.isUnpinEngine pkgs;
+      noFreetype = builtins.filter (x: (x.pname or "") != "freetype");
     in
     (pkgs.graphite2.override { python3 = pkgs.buildPackages.python3; }).overrideAttrs (oa: {
+      # Only an example program uses freetype (the static recipe drops it),
+      # and freetype links harfbuzz, which links graphite2 (freetype.nix):
+      # the input would be a dependency cycle.
+      buildInputs = noFreetype (oa.buildInputs or [ ]);
+      propagatedBuildInputs = noFreetype (oa.propagatedBuildInputs or [ ]);
       postPatch = (oa.postPatch or "")
         + lib.optionalString isEngine ''
         substituteInPlace CMakeLists.txt \

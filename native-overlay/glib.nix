@@ -9,12 +9,20 @@
 # normal darwin stdenv pulls them via apple-sdk's setup hook, but the engine
 # drops apple-sdk (SDKROOT instead), so add libresolv explicitly. Headers only:
 # the res_*/ns_* symbols are in libSystem (allow-listed).
+#
+# Auto-wired, like graphite2: freetype links harfbuzz (freetype.nix), which
+# links glib, so every darwin static scope with freetype builds glib. The
+# marker keeps a consumer that also applies the fix by hand from doing it twice.
 { lib }:
-pkgs:
-if pkgs.stdenv.hostPlatform.isDarwin then
-  lib.withDarwinMesonObjc pkgs
-    (pkgs.glib.overrideAttrs (oa: {
-      buildInputs = (oa.buildInputs or [ ]) ++ [ pkgs.darwin.libresolv ];
-    }))
-else
-  pkgs.glib
+{
+  autoWire = "static";
+  apply = pkgs:
+    if pkgs.stdenv.hostPlatform.isDarwin && !(pkgs.glib.unpinDarwinFixed or false) then
+      lib.withDarwinMesonObjc pkgs
+        (pkgs.glib.overrideAttrs (oa: {
+          buildInputs = (oa.buildInputs or [ ]) ++ [ pkgs.darwin.libresolv ];
+          passthru = (oa.passthru or { }) // { unpinDarwinFixed = true; };
+        }))
+    else
+      pkgs.glib;
+}
