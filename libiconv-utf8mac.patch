@@ -3187,7 +3187,7 @@ diff -ruN a/lib/utf8mac.h b/lib/utf8mac.h
 +#ifdef __LITTLE_ENDIAN__
 +    flags |= UTF_REVERSE_ENDIAN;
 +#endif
-+    utf8_encodestr(ucs_string, ret, r, &len, n, 0, flags);
-+
++    if (utf8_encodestr(ucs_string, ret, r, &len, n, 0, flags) == ENAMETOOLONG)
++	return RET_TOOSMALL;	/* never emit part of a decomposed character */
 +    return (int)len;
 +}
