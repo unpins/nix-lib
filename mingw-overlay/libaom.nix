@@ -9,4 +9,12 @@ super.libaom.overrideAttrs (oa: {
     "-DENABLE_EXAMPLES=OFF"
   ];
   outputs = builtins.filter (o: o != "bin") (oa.outputs or [ "out" ]);
+  # nixpkgs moves libaom.a to $static and, when isStatic, `ln -s $static $out`
+  # to stand in for $out. Without the `bin` output $out already exists, so the
+  # link lands inside it and aom.pc's libdir ($out/lib) is left without the lib.
+  postFixup = (oa.postFixup or "") + ''
+    rm -f "$out/$(basename "$static")"
+    mkdir -p "$out/lib"
+    ln -s "$static/lib/libaom.a" "$out/lib/libaom.a"
+  '';
 })

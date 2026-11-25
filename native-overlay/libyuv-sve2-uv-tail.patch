@@ -1,0 +1,21 @@
+ARGBToUVMatrixRow_SVE2's tail loop stores with the all-true p0, so each pass
+writes VL/64 bytes of U and of V whatever is left of the row. That is exact
+at VL=128 and a heap overflow past it (256-bit SVE: Graviton3, or qemu's
+default 512): libavif's 4x4 RGBA->I420 test trips musl's free(). Store with
+p1, the width predicate the loads already use (one U/V byte per pixel pair).
+Upstream rewrote the kernel in 3d66e94 (2025-03), after the 1908 nixpkgs
+ships.
+
+--- a/source/row_sve.cc
++++ b/source/row_sve.cc
+@@ -386,8 +386,8 @@
+       "addhnb   z16.b, z16.h, z26.h                 \n"  // U
+       "addhnb   z20.b, z20.h, z26.h                 \n"  // V
+ 
+-      "st1b     {z16.d}, p0, [%[dst_u]]             \n"  // U
+-      "st1b     {z20.d}, p0, [%[dst_v]]             \n"  // V
++      "st1b     {z16.d}, p1, [%[dst_u]]             \n"  // U
++      "st1b     {z20.d}, p1, [%[dst_v]]             \n"  // V
+       "incd     %[dst_u]                            \n"
+       "incd     %[dst_v]                            \n"
+       "b.gt     3b                                  \n"
