@@ -1,0 +1,20 @@
+Engine mingw: disable inline_asm_nonlocal_labels, as upstream's own guard for
+clang + LTO + Windows does (llvm/llvm-project#76046). That guard sits under
+`enabled lto`, i.e. ffmpeg's --enable-lto; here -flto comes from the stdenv,
+so the probe passes and mlpdsp_init.c takes the address of labels defined
+inside an asm block. COFF routes the reference through a .refptr COMDAT that
+needs a global symbol, so all 14 ff_mlp_*order_* end up undefined at the link.
+--enable-lto would reach the guard too, but also flips
+inline_asm_direct_symbol_refs and symver_asm_label on every target.
+
+--- a/configure
++++ b/configure
+@@ -6532,7 +6532,7 @@
+ 
+ check_inline_asm inline_asm_labels '"1:\n"'
+ 
+-check_inline_asm inline_asm_nonlocal_labels '"Label:\n"'
++disable inline_asm_nonlocal_labels
+ 
+ if enabled aarch64; then
+     as_arch_level="armv8-a"

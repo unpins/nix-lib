@@ -224,97 +224,12 @@ let
       # ALSA's `pipewire`/`pulse` PCM plugin lives in its own object inside
       # the static libasound (audio.nix); the patch references it so the link
       # keeps it.
-      patches = pkgs.lib.optional stdenv.hostPlatform.isLinux ./ffmpeg-alsa-pipewire.patch;
-
-      # engine: make ffmpeg's inline-asm probes ASSEMBLE.
-      #
-      # `check_inline_asm` decides whether an instruction can be used
-      # UNCONDITIONALLY (ffmpeg's own words) by compiling
-      # `__asm__ volatile("<insn>")` with $CC -c. Under the engine every
-      # compile carries `-flto`, so the object is bitcode and the asm text is
-      # merely carried along — nothing assembles, every probe passes. On
-      # armv7l that turns HAVE_NEON_INLINE on for a target whose baseline is
-      # vfpv3-d16, and the NEON in libavcodec/arm/aac.h (used with no runtime
-      # check) only blows up at the LTO link, where the assembler finally runs:
-      # `ld-temp.o <inline asm>: vmul.f32 d0, d0, d1 — instruction requires:
-      # NEON`. The engine cc already drops `-flto` from anything that looks
-      # like a probe, but it recognises them by autoconf's `conftest` filename
-      # and ffmpeg names its own `ffconf.*`; the marker define opts these
-      # probes into that same escape hatch. Only `_inline` detection changes —
-      # `check_as`/`neon_external` already assemble for real, so the runtime-
-      # detected NEON in the .S files stays.
-      postPatch =
-        pkgs.lib.optionalString isEngine ''
-          substituteInPlace configure \
-            --replace-fail 'test_cc "$@" <<EOF && enable $name' \
-                           'test_cc -DUNPIN_conftest=1 "$@" <<EOF && enable $name'
-
-          # The engine's C++ runtime is libc++; no `libstdc++.a` exists to be
-          # found, and aliasing one onto `libc++.a` would only hide that.
-          # ffmpeg spells the runtime `-lstdc++` in two distinct roles, so
-          # both are renamed.
-          #
-          # As a LINKER FLAG: its own `require` probes (libgme, libopenmpt,
-          # librubberband, libsnappy) hardcode it, and a dep's `.pc`
-          # `Libs.private` can contribute it under
-          # `--pkg-config-flags=--static`. `ldflags_filter` is the single
-          # point every flag bound for the linker passes through — probe
-          # flags AND libs in `test_ld`, `add_ldflags`/`add_extralibs`, and
-          # the per-library `EXTRALIBS` finally written to config.mak — so
-          # hooking it renames the token whatever its source, with no list of
-          # producers to keep. `-lc++` is also what tells the engine driver
-          # the link is C++ (see the `--extra-libs` note above).
-          substituteInPlace configure \
-            --replace-fail 'test "$cc_type" != "$ld_type" && add_ldflags $cc_ldflags' \
-                           'test "$cc_type" != "$ld_type" && add_ldflags $cc_ldflags
-          unpin_base_ldflags_filter=$_flags_filter
-          unpin_ldflags_filter(){ $unpin_base_ldflags_filter "$@" | sed -e "s/-lstdc++/-lc++/g"; }
-          ldflags_filter=unpin_ldflags_filter'
-
-          # As a SENTINEL: `-lstdc++` anywhere in a link's args means "link
-          # this one with $(CXX)", and the token is filtered back out before
-          # the linker sees it. Rename it to match, or ffmpeg's own binaries
-          # link with the C driver and every `std::` from the C++ deps is
-          # undefined.
-          substituteInPlace ffbuild/common.mak \
-            --replace-fail '$(if $(filter -lstdc++,$(1)),$(LDXX) $(filter-out -lstdc++,$(1)),$(LD) $(1))' \
-                           '$(if $(filter -lc++,$(1)),$(LDXX) $(filter-out -lc++,$(1)),$(LD) $(1))'
-        ''
-        # riscv64: musl's <bits/syscall.h> predates the riscv_hwprobe syscall
-        # (Linux 6.4), but the cross kernel headers ship <asm/hwprobe.h>.
-        # ffmpeg's libavutil/riscv/cpu.c then includes the struct and calls
-        # syscall(__NR_riscv_hwprobe, ...) with the number undefined →
-        # "'__NR_riscv_hwprobe' undeclared". Define the canonical riscv value
-        # (258) when the libc headers lack it, after the real include so a
-        # newer musl still wins. Keeps --enable-runtime-cpudetect's
-        # V-extension probe working.
-        + pkgs.lib.optionalString (stdenv.hostPlatform.isRiscV or false) ''
-          sed -i 's|#include <sys/syscall.h>|#include <sys/syscall.h>\n#ifndef __NR_riscv_hwprobe\n#define __NR_riscv_hwprobe 258\n#endif|' libavutil/riscv/cpu.c
-        ''
-        # Engine mingw: reach upstream's OWN guard for clang + LTO + windows.
-        # configure already carries it, citing llvm/llvm-project#76046 —
-        # "Clang's LTO fails on Windows, when there are references outside of
-        # inline assembly to nonlocal labels defined within inline assembly"
-        # — but it sits inside `if enabled lto`, meaning ffmpeg's own
-        # `--enable-lto`. Here the `-flto` comes from the stdenv, so configure
-        # never knows and the probe passes: mlpdsp_init.c's `firtable`/
-        # `iirtable` then take the address of labels living inside a function's
-        # asm block, which LLVM's symbol table cannot see. ELF resolves them
-        # anyway at LTO codegen; COFF routes the reference through a `.refptr`
-        # COMDAT that needs a GLOBAL symbol, so all 14 `ff_mlp_*order_*` come
-        # out undefined at the final link.
-        #
-        # Turning on `--enable-lto` instead would reach the same guard, but it
-        # also flips `inline_asm_direct_symbol_refs` and `symver_asm_label`
-        # for every target — this changes only what is actually broken.
-        + pkgs.lib.optionalString (isEngine && isMinGW) ''
-          # Match up to the probe name only — the argument that follows is
-          # nested quoting the shell would eat; `#` comments out the rest.
-          substituteInPlace configure \
-            --replace-fail 'check_inline_asm inline_asm_nonlocal_labels' \
-                           'disable inline_asm_nonlocal_labels #'
-        ''
-        ;
+      patches = pkgs.lib.optional stdenv.hostPlatform.isLinux ./ffmpeg-alsa-pipewire.patch
+        # engine: inline-asm probes that really assemble, and -lc++ where
+        # ffmpeg says -lstdc++. Each patch header carries the why.
+        ++ pkgs.lib.optional isEngine ./ffmpeg-engine-configure.patch
+        ++ pkgs.lib.optional (stdenv.hostPlatform.isRiscV or false) ./ffmpeg-riscv-hwprobe.patch
+        ++ pkgs.lib.optional (isEngine && isMinGW) ./ffmpeg-mingw-nonlocal-labels.patch;
 
       # pkgsBuildHost is the canonical "build tools that target host"
       # scope:
@@ -768,13 +683,8 @@ rec {
         # mismatch against the rest of the link crashed every
         # `-c:a libmp3lame` encode on i686.
         // (if origPkgs.stdenv.hostPlatform.isx86_32 then {
-          # libvorbis' 32-bit-x86 CFLAGS case hardcodes `-mno-ieee-fp`, a
-          # GCC-only flag the engine clang rejects as fatal. It only relaxes
-          # IEEE FP for -ffast-math (already on); drop it.
           libvorbis = prev.libvorbis.overrideAttrs (o: {
-            postPatch = (o.postPatch or "") + ''
-              substituteInPlace configure --replace-fail ' -mno-ieee-fp' ""
-            '';
+            patches = (o.patches or [ ]) ++ [ ./libvorbis-i686-no-ieee-fp.patch ];
           });
         } else { })
         # libsndfile uses ALSA only for its sndfile-play program, yet a

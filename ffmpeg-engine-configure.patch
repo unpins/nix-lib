@@ -1,0 +1,54 @@
+Engine builds: make ffmpeg's inline-asm probes assemble, and spell the C++
+runtime -lc++.
+
+test_cc -DUNPIN_conftest=1: `check_inline_asm` decides whether an instruction
+can be used unconditionally by compiling `__asm__ volatile("<insn>")` with
+$CC -c. Under the engine every compile carries -flto, so the object is bitcode
+and nothing assembles: every probe passes. On armv7l that turned
+HAVE_NEON_INLINE on for a vfpv3-d16 baseline, and the NEON in
+libavcodec/arm/aac.h only failed at the LTO link ("instruction requires:
+NEON"). The engine cc drops -flto from probes it recognises by autoconf's
+`conftest` name; ffmpeg names its own `ffconf.*`, so the define opts these
+into the same escape hatch. check_as/neon_external already assemble for real.
+
+-lstdc++ -> -lc++: the engine's C++ runtime is libc++ and no libstdc++.a
+exists. ffmpeg uses -lstdc++ in two roles. As a linker flag (its `require`
+probes for libgme, libopenmpt, librubberband, libsnappy, and a dep's .pc
+Libs.private under --static) every flag passes through ldflags_filter, so
+hooking it renames the token whatever its source; -lc++ also tells the engine
+driver the link is C++. As a sentinel in ffbuild/common.mak (link with $(LDXX)
+and filter the token out), renamed to match, or ffmpeg's own binaries link
+with the C driver and every std:: from the C++ deps is undefined.
+
+--- a/configure
++++ b/configure
+@@ -1198,7 +1198,7 @@
+     code="$2"
+     shift 2
+     disable $name
+-    test_cc "$@" <<EOF && enable $name
++    test_cc -DUNPIN_conftest=1 "$@" <<EOF && enable $name
+ void foo(void){ __asm__ volatile($code); }
+ EOF
+ }
+@@ -5468,6 +5468,9 @@
+ ldflags_filter=$_flags_filter
+ add_ldflags $_flags $_ldflags
+ test "$cc_type" != "$ld_type" && add_ldflags $cc_ldflags
++unpin_base_ldflags_filter=$_flags_filter
++unpin_ldflags_filter(){ $unpin_base_ldflags_filter "$@" | sed -e "s/-lstdc++/-lc++/g"; }
++ldflags_filter=unpin_ldflags_filter
+ LD_O=${_ld_o-$LD_O}
+ LD_LIB=${_ld_lib-$LD_LIB}
+ LD_PATH=${_ld_path-$LD_PATH}
+--- a/ffbuild/common.mak
++++ b/ffbuild/common.mak
+@@ -17,7 +17,7 @@
+ ifeq ($(LD),$(CC))
+ ifneq ($(CXX),)
+ LDXX := $(CXX)
+-LINK = $(if $(filter -lstdc++,$(1)),$(LDXX) $(filter-out -lstdc++,$(1)),$(LD) $(1))
++LINK = $(if $(filter -lc++,$(1)),$(LDXX) $(filter-out -lc++,$(1)),$(LD) $(1))
+ endif
+ endif
+ 

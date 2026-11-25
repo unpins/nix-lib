@@ -1,0 +1,18 @@
+riscv64: musl's <bits/syscall.h> predates the riscv_hwprobe syscall (Linux
+6.4), but the cross kernel headers ship <asm/hwprobe.h>, so cpu.c calls
+syscall(__NR_riscv_hwprobe, ...) with the number undefined. Define the
+canonical value when the libc lacks it; a newer musl still wins. Keeps
+--enable-runtime-cpudetect's V-extension probe.
+
+--- a/libavutil/riscv/cpu.c
++++ b/libavutil/riscv/cpu.c
+@@ -37,6 +37,9 @@
+ #elif HAVE_ASM_HWPROBE_H
+ #include <asm/hwprobe.h>
+ #include <sys/syscall.h>
++#ifndef __NR_riscv_hwprobe
++#define __NR_riscv_hwprobe 258
++#endif
+ #include <unistd.h>
+ 
+ static int __riscv_hwprobe(struct riscv_hwprobe *pairs, size_t pair_count,
