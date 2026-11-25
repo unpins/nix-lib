@@ -5483,8 +5483,7 @@ CBODY
           # Embed the package's own man pages into the binary via `withMan`
           # (as `unpin/man/*` ZIP entries), so `unpin man <pkg>` works offline with
           # no companion asset. Default-on across the catalog: packages with no
-          # man (codec libs, coreutils/busybox) skip gracefully. Set false to
-          # opt a package out.
+          # man (codec libs) skip gracefully. Set false to opt a package out.
           , embedMan ? true
           # The one page that documents every applet, where a suite writes it
           # that way. Top-level and not a `multicall` sub-option, because the
