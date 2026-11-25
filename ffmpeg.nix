@@ -365,9 +365,6 @@ let
 
       configurePhase = ''
         runHook preConfigure
-        # ffmpeg's `require_cpp_condition` for x264 trips on the
-        # default x264.h header decoration; drop the check.
-        sed -i '/X264_API_IMPORTS/d' configure
         ./configure ${builtins.concatStringsSep " " flags}
         ${pkgs.lib.optionalString (stdenv.hostPlatform.isPower64 or false) ''
           # `maclhw`/`mullhw` (libavcodec/ppc/mathops.h `#if HAVE_PPC4XX`) are
