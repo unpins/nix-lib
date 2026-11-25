@@ -82,13 +82,8 @@ let
         # actually ships. Don't pass `--pkg-config=pkg-config`
         # or it looks for a bare `pkg-config` that isn't in PATH.
         "--pkg-config-flags=--static"
-        # Build the curated man set in-place: each target generates its own
-        # 13 pages. A single x86_64-linux `ffmpegMan` CAN'T be realized on
-        # the darwin / aarch64 / armv7l CI runners (no x86_64-linux builder),
-        # so the man must come from the per-arch build. man is reproducible
-        # roff (pod2man `--date=" "`), so it stays byte-identical across
-        # platforms. Skip html/txt/pod; `ffmpegMan` feeds only the windows
-        # mingw cross via winManRoot (that runner IS x86_64-linux).
+        # Every target, windows included, builds the curated man set in
+        # place (pod2man on the build host; reproducible roff). No html/txt/pod.
         "--disable-htmlpages" "--disable-txtpages" "--disable-podpages"
         "--disable-debug" "--disable-stripping"
         "--enable-gpl" "--enable-version3"
@@ -118,40 +113,10 @@ let
           # meaningful only with the postPatch rename, so it rides the same gate.
           ++ pkgs.lib.optional isEngine "--extra-libs=-lc++")
           else if isMinGW then [
-            # mingw single-binary policy: fold the toolchain runtime
-            # (libgcc, libstdc++, libwinpthread, libmcfgthread) into
-            # the .exe so we ship only `ffmpeg.exe` / `ffprobe.exe`,
-            # no DLLs next to them. `mingwStaticCross` covers USER
-            # libs (rewrites cc-wrapper to prefer `.a`), but the GCC
-            # driver still defaults to dynamic-libgcc/libstdc++.
-            #
-            # - `-static`: pick `.a` over `.dll.a` everywhere.
-            # - `-static-libgcc`: emit `-lgcc -lgcc_eh` instead of
-            #   `-lgcc_s -lgcc` from gcc's link spec.
-            # - `-static-libstdc++`: needed because x265/svt-av1/aom/
-            #   libwebp/libopenmpt/harfbuzz/chromaprint bring C++.
-            #
-            # Two gotchas required nix-lib companion overlays
-            # (`mingw-overlay/x265.nix` and the rust+mingw line
-            # below):
-            #
-            # 1. x265's CMake probes the toolchain for "what does
-            #    C++ EH need" and embeds the result in `x265.pc`'s
-            #    `Libs.private` — captured WITHOUT `-static-libgcc`,
-            #    so it bakes in `-lgcc_s ... -lgcc_s ...`. Every
-            #    `pkg-config --static x265 --libs` consumer
-            #    (ffmpeg's link) then re-injects `-lgcc_s` and the
-            #    linker prefers libgcc_s.dll.a (the .dll import
-            #    lib) over libgcc_eh.a. The overlay rewrites
-            #    `Libs.private` to the static-libgcc form.
-            #
-            # 2. `--allow-multiple-definition` is the canonical
-            #    rust + mingw cross workaround for librsvg-2.a
-            #    (rust) bundling `compiler_builtins` symbols
-            #    (`___chkstk_ms`, `__udivmodti4`, `__udivti3`)
-            #    that ffmpeg's own libgcc link adds again — the
-            #    COMDAT/weak marking doesn't survive the
-            #    dual-static-archive link path.
+            # One .exe, no DLLs: `-static` picks `.a` over `.dll.a`.
+            # `--allow-multiple-definition`: librsvg-2.a (Rust) bundles
+            # compiler_builtins symbols (`___chkstk_ms`, `__udivti3`, …) that
+            # the runtime archives define again.
             "--enable-static" "--disable-shared"
             "--extra-ldflags=-static"
             "--extra-ldflags=-Wl,--allow-multiple-definition"
@@ -166,6 +131,7 @@ let
             # is undefined. See the `-lc++` note on the linux branch.
             "--extra-libs=-lc++"
           ] else [
+            # off-engine (gcc) mingw: fold libgcc/libstdc++ in.
             "--extra-ldflags=-static-libgcc"
             "--extra-ldflags=-static-libstdc++"
           ])
@@ -528,16 +494,9 @@ let
           fontconfig fontconfig.dev
         ])
         ++ [ librsvgStatic librsvgStatic.dev ]
-        # nongnu libunwind was added only to satisfy the `-lunwind` rustc
-        # reports for musl Rust (librsvg). On the ENGINE that token is
-        # already served by LLVM libunwind (`--extra-libs=-lunwind` → the
-        # sysroot cxx/lib unwinder), so pulling nongnu libunwind too is
-        # redundant — and on i686 harmful: its 32-bit `_Unwind_Resume`
-        # (x86/Gos-linux.c) resumes via libc `setcontext`, absent in
-        # musl-i686, so folding its bitcode leaves setcontext undefined
-        # (x86_64 links because libunwind ships its own setcontext.S).
-        # Every target is on the engine now (mingw's unwinder is SEH anyway),
-        # so this is a guard for an off-engine build, not a live branch.
+        # Off-engine musl only: nongnu libunwind for the `-lunwind` musl Rust
+        # (librsvg) asks for. The engine links LLVM's libunwind itself, and
+        # nongnu's i686 `_Unwind_Resume` needs a libc `setcontext` musl lacks.
         ++ (if isEngineScope || (pkgsStaticScope.stdenv.hostPlatform.isMinGW or false)
             then [ ]
             else [ pkgsStaticScope.libunwind ]);
@@ -617,11 +576,6 @@ rec {
     #   aborts. Fix injects a partial cross-file pointing at
     #   `$CC`/`$CXX` (clang handles `.m`/`.mm`). Unblocks the
     #   text-rendering chain (librsvg → pango → harfbuzz, libass).
-    # - `graphite2`: cmake `nolib_test` uses
-    #   `$<TARGET_SONAME_FILE>` which CMake refuses for STATIC
-    #   libs. Upstream guards the call with `if (BUILD_SHARED_LIBS)`
-    #   in the Linux branch but forgets to do it in the Darwin
-    #   branch. Fix mirrors the guard. Pulled by harfbuzz.
     # - `fontconfig`: two upstream tests compare sysroot paths as
     #   strings; darwin's `/tmp → /private/tmp` symlink makes them
     #   disagree. Test bug, not a fontconfig defect — fix turns
@@ -675,13 +629,7 @@ rec {
           # already-overlaid `mpg123`.
           libmpg123 = ulib.nativeFixes.mpg123 prev;
         }
-        # An i686-only codec fix (the engine cross-compiles every linux
-        # target with clang, including i686). Gated to isx86_32 so every
-        # other arch keeps its cache hit. lame's i686 fix lives in nix-lib
-        # (native-overlay/lame.nix): the old one here undefined
-        # HAVE_XMMINTRIN_H but left lame's own `-march=i686`, and that
-        # mismatch against the rest of the link crashed every
-        # `-c:a libmp3lame` encode on i686.
+        # i686 only, so other arches keep their cache hit.
         // (if origPkgs.stdenv.hostPlatform.isx86_32 then {
           libvorbis = prev.libvorbis.overrideAttrs (o: {
             patches = (o.patches or [ ]) ++ [ ./libvorbis-i686-no-ieee-fp.patch ];
